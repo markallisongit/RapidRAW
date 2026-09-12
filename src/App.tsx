@@ -63,6 +63,7 @@ import { useProductivityActions } from './hooks/useProductivityActions';
 import { useAppInitialization } from './hooks/useAppInitialization';
 import { useAndroidBackHandler } from './hooks/useAndroidBackHandler';
 import './i18n';
+import { registerPublishResources } from './components/panel/right/publish/publish.i18n';
 
 import {
   Invokes,
@@ -77,6 +78,8 @@ import {
 
 import ImageProcessingManager from './components/managers/ImageProcessingManager';
 import ImageLoaderManager from './components/managers/ImageLoaderManager';
+
+registerPublishResources();
 
 const CLERK_PUBLISHABLE_KEY = 'pk_test_YnJpZWYtc2Vhc25haWwtMTIuY2xlcmsuYWNjb3VudHMuZGV2JA'; // local dev key
 

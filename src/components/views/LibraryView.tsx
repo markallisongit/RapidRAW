@@ -3,6 +3,7 @@ import { useShallow } from 'zustand/react/shallow';
 import CommunityPage from '../panel/CommunityPage';
 import MainLibrary from '../panel/MainLibrary';
 import BottomBar from '../panel/BottomBar';
+import { PublishDock } from '../panel/right/publish/PublishPanel';
 
 import { useUIStore } from '../../store/useUIStore';
 import { useLibraryStore } from '../../store/useLibraryStore';
@@ -195,6 +196,7 @@ export default function LibraryView({
           />
         )}
       </div>
+      {!isAndroid && <PublishDock />}
     </div>
   );
 }
