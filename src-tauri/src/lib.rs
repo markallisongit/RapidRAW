@@ -37,6 +37,7 @@ mod negative_conversion;
 mod panorama_stitching;
 mod panorama_utils;
 mod preset_converter;
+mod publish;
 mod raw_processing;
 mod tagging;
 mod tagging_utils;
