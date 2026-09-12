@@ -117,7 +117,13 @@ impl PublishState {
     }
 
     pub fn load(app_handle: &AppHandle, destination_id: &str) -> Result<Self, PublishError> {
-        Self::load_from(&state_path(app_handle, destination_id)?, destination_id)
+        Self::load_in(&state_dir(app_handle)?, destination_id)
+    }
+
+    /// Loads `<dir>/<destination_id>.json`, where `dir` is what [`state_dir`]
+    /// resolves to — or a temp directory under test.
+    pub fn load_in(dir: &Path, destination_id: &str) -> Result<Self, PublishError> {
+        Self::load_from(&state_file(dir, destination_id)?, destination_id)
     }
 
     /// [`Self::load`] without an `AppHandle`, so persistence is testable
@@ -167,7 +173,11 @@ impl PublishState {
     }
 
     pub fn save(&self, app_handle: &AppHandle) -> Result<(), PublishError> {
-        self.save_to(&state_path(app_handle, &self.destination)?)
+        self.save_in(&state_dir(app_handle)?)
+    }
+
+    pub fn save_in(&self, dir: &Path) -> Result<(), PublishError> {
+        self.save_to(&state_file(dir, &self.destination)?)
     }
 
     /// Atomic: writes `<path>.tmp`, flushes it to disk, then renames over the
@@ -368,12 +378,24 @@ fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
 }
 
-/// `app_data_dir/publish/<destination_id>.json`, creating the directory on
-/// demand exactly as `get_albums_path` does for albums.
-fn state_path(app_handle: &AppHandle, destination_id: &str) -> Result<PathBuf, PublishError> {
+/// `app_data_dir/publish`, creating it on demand exactly as `get_albums_path`
+/// does for albums.
+pub fn state_dir(app_handle: &AppHandle) -> Result<PathBuf, PublishError> {
+    let dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| PublishError::Io(format!("resolving the app data directory: {e}")))?
+        .join(STATE_DIR_NAME);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| PublishError::Io(format!("creating {}: {e}", dir.display())))?;
+    Ok(dir)
+}
+
+/// `<dir>/<destination_id>.json`.
+fn state_file(dir: &Path, destination_id: &str) -> Result<PathBuf, PublishError> {
     // Destination ids are `&'static str` constants today, but this path is
     // derived from one, so check rather than trust: a `../` in an id would
-    // write outside the app data directory.
+    // write outside the state directory.
     if destination_id.is_empty()
         || !destination_id
             .chars()
@@ -383,15 +405,6 @@ fn state_path(app_handle: &AppHandle, destination_id: &str) -> Result<PathBuf, P
             "destination id {destination_id:?} is not usable as a file name"
         )));
     }
-
-    let dir = app_handle
-        .path()
-        .app_data_dir()
-        .map_err(|e| PublishError::Io(format!("resolving the app data directory: {e}")))?
-        .join(STATE_DIR_NAME);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| PublishError::Io(format!("creating {}: {e}", dir.display())))?;
-
     Ok(dir.join(format!("{destination_id}.json")))
 }
 

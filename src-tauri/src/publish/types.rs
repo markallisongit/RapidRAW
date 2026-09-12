@@ -4,7 +4,7 @@
 //! service, so a session can drive any destination without special-casing on
 //! its id. Anything service-specific belongs in that destination's own module.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -83,7 +83,10 @@ pub struct ConsumerCredentials {
 
 /// Everything a destination method needs that is not specific to one image.
 pub struct PublishContext {
-    pub app_handle: tauri::AppHandle,
+    /// Where destination state files live: [`state_dir`](crate::publish::state::state_dir)
+    /// in the app. A path rather than an `AppHandle` so a destination and the
+    /// session driving it can be tested without a running Tauri app.
+    pub state_dir: PathBuf,
     /// `None` until the user has registered an application with the service.
     pub consumer: Option<ConsumerCredentials>,
     /// Set when the user cancels; checked between retries and uploads.

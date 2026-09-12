@@ -7,6 +7,7 @@
 
 pub mod oauth1;
 pub mod registry;
+pub mod session;
 pub mod smugmug;
 pub mod spool;
 pub mod state;

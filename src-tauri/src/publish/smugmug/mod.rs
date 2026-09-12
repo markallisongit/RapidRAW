@@ -48,7 +48,7 @@ impl SmugMugDestination {
     /// The nickname of the account this install last connected, which names
     /// both the keyring entry and the state file's id map.
     fn connected_nickname(ctx: &PublishContext) -> Result<Option<String>, PublishError> {
-        Ok(PublishState::load(&ctx.app_handle, DESTINATION_ID)?
+        Ok(PublishState::load_in(&ctx.state_dir, DESTINATION_ID)?
             .account()
             .map(str::to_string))
     }
@@ -160,9 +160,9 @@ impl PublishDestination for SmugMugDestination {
         // never stored would report Connected and then fail on every call.
         SmugMugAuth::store_tokens(&account_key(&nickname), &access.token, &access.token_secret)?;
 
-        let mut state = PublishState::load(&ctx.app_handle, DESTINATION_ID)?;
+        let mut state = PublishState::load_in(&ctx.state_dir, DESTINATION_ID)?;
         state.set_account(Some(nickname));
-        state.save(&ctx.app_handle)
+        state.save_in(&ctx.state_dir)
     }
 
     async fn ensure_container(
