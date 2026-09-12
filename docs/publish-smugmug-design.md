@@ -3,6 +3,8 @@
 **Design document** · 2026-09-12 · Mark Allison (with Claude)
 Target: [CyberTimon/RapidRAW](https://github.com/CyberTimon/RapidRAW) · Fork: [markallisongit/RapidRAW](https://github.com/markallisongit/RapidRAW) · Branch: `feat/publish-destinations-smugmug`
 
+**Implementation:** tracked in [#13](https://github.com/markallisongit/RapidRAW/issues/13), broken into ordered issues [#1](https://github.com/markallisongit/RapidRAW/issues/1)–[#12](https://github.com/markallisongit/RapidRAW/issues/12). Each issue carries its own task detail; this document is the rationale only.
+
 ## Summary
 
 Publish RapidRAW albums to SmugMug from inside the app — no manual export step, no user-visible
