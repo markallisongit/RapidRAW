@@ -116,17 +116,13 @@ impl PublishState {
         }
     }
 
-    pub fn load(app_handle: &AppHandle, destination_id: &str) -> Result<Self, PublishError> {
-        Self::load_in(&state_dir(app_handle)?, destination_id)
-    }
-
     /// Loads `<dir>/<destination_id>.json`, where `dir` is what [`state_dir`]
     /// resolves to — or a temp directory under test.
     pub fn load_in(dir: &Path, destination_id: &str) -> Result<Self, PublishError> {
         Self::load_from(&state_file(dir, destination_id)?, destination_id)
     }
 
-    /// [`Self::load`] without an `AppHandle`, so persistence is testable
+    /// [`Self::load_in`] with the file named directly, so persistence is testable
     /// against a plain temp directory.
     ///
     /// A missing file is an empty state — nothing has been published yet. A
@@ -170,10 +166,6 @@ impl PublishState {
                 path.display()
             ))
         })
-    }
-
-    pub fn save(&self, app_handle: &AppHandle) -> Result<(), PublishError> {
-        self.save_in(&state_dir(app_handle)?)
     }
 
     pub fn save_in(&self, dir: &Path) -> Result<(), PublishError> {
@@ -224,10 +216,6 @@ impl PublishState {
         self.account = account;
     }
 
-    pub fn container_for(&self, album_id: &str) -> Option<&ContainerRecord> {
-        self.containers.get(album_id)
-    }
-
     pub fn record_container(
         &mut self,
         album_id: &str,
@@ -244,6 +232,7 @@ impl PublishState {
         );
     }
 
+    #[cfg(test)]
     pub fn image_for(&self, virtual_path: &str) -> Option<&ImageRecord> {
         self.images.get(virtual_path)
     }

@@ -1,10 +1,5 @@
-// Nothing calls into this module yet: the session driver and the destination
-// implementations that consume this trait land in later changes. Until then
-// every item here is dead code as far as the binary is concerned, and the
-// convenience re-exports below have no callers, though the unit tests
-// exercise the rest.
-#![allow(dead_code, unused_imports)]
-
+pub mod commands;
+pub mod credential_store;
 pub mod oauth1;
 pub mod registry;
 pub mod session;
@@ -15,7 +10,7 @@ pub mod types;
 
 use async_trait::async_trait;
 
-pub use registry::{DuplicateDestinationId, PublishRegistry};
+pub use registry::PublishRegistry;
 pub use types::{
     AuthChallenge, AuthStatus, ConsumerCredentials, DestinationCapabilities, LocalContainer,
     PublishContext, PublishError, PublishItem, RemoteContainerId, RemoteImageId,

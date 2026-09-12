@@ -1775,6 +1775,7 @@ pub fn run() {
             if let Ok(cache_dir) = app_handle.path().app_cache_dir() {
                 crate::exif_processing::initialize_cache_dir(cache_dir);
             }
+            publish::commands::sweep_spool_in_background(app_handle.clone());
 
             {
                 let disks_app_handle = app_handle.clone();
@@ -2090,6 +2091,7 @@ pub fn run() {
             disks_cache: Mutex::new(None),
             disks_cache_refreshing: AtomicBool::new(false),
             camera_session: Mutex::new(camera_tethering::CameraSession::new()),
+            publish_registry: publish::PublishRegistry::new(),
         })
         .invoke_handler(tauri::generate_handler![
             apply_adjustments,
@@ -2208,6 +2210,16 @@ pub fn run() {
             camera_tethering::tether_get_preview,
             camera_tethering::tether_autofocus,
             guided_perspective::calculate_guided_perspective,
+            // --- publish ---
+            publish::commands::publish_get_destinations,
+            publish::commands::publish_get_auth_status,
+            publish::commands::publish_set_credentials,
+            publish::commands::publish_begin_auth,
+            publish::commands::publish_complete_auth,
+            publish::commands::publish_preview,
+            publish::commands::publish_album,
+            publish::commands::publish_cancel,
+            // --- end publish ---
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

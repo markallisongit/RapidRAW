@@ -1,24 +1,23 @@
-//! SmugMug as a publish destination.
-//!
-//! This change carries the authorisation half only: the destination can say
-//! whether it is connected, start the out-of-band OAuth dance and finish it.
-//! Albums and uploads follow in later changes, which is why the remaining
-//! trait methods answer with an error rather than doing anything.
+//! SmugMug as a publish destination: the trait implementation over
+//! [`auth`], [`api`] and [`upload`], which hold the protocol detail.
 
 pub mod api;
 pub mod auth;
 pub mod model;
 pub mod upload;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
+use crate::publish::oauth1::Credentials;
+use crate::publish::smugmug::api::SmugMugApi;
 use crate::publish::smugmug::auth::{
     SmugMugAuth, account_key, authorize_url, exchange_verifier, fetch_nickname,
     fetch_request_token, normalize_verifier,
 };
 use crate::publish::smugmug::model::TokenPair;
+use crate::publish::smugmug::upload::SmugMugUploader;
 use crate::publish::state::PublishState;
 use crate::publish::{
     AuthChallenge, AuthStatus, ConsumerCredentials, DestinationCapabilities, LocalContainer,
@@ -36,12 +35,25 @@ pub struct SmugMugDestination {
     /// them to the keyring would add exposure for no gain. A restart
     /// mid-dance means starting the dance again, which is the right outcome.
     pending: Mutex<Option<TokenPair>>,
+    /// The signed clients for the connected account, built on first use
+    /// rather than per call: every image would otherwise cost a state-file
+    /// read and a keyring lookup, and the uploader would lose the throughput
+    /// its timeouts are sized from.
+    connection: Mutex<Option<Arc<Connection>>>,
+}
+
+/// Signed clients for one consumer and one access token.
+struct Connection {
+    creds: Credentials,
+    api: SmugMugApi,
+    uploader: SmugMugUploader,
 }
 
 impl SmugMugDestination {
     pub fn new() -> Self {
         Self {
             pending: Mutex::new(None),
+            connection: Mutex::new(None),
         }
     }
 
@@ -51,6 +63,39 @@ impl SmugMugDestination {
         Ok(PublishState::load_in(&ctx.state_dir, DESTINATION_ID)?
             .account()
             .map(str::to_string))
+    }
+
+    /// Reuses the cached clients while the consumer credentials match. A new
+    /// access token only arrives through [`PublishDestination::complete_auth`],
+    /// which drops the cache itself.
+    fn connection(&self, ctx: &PublishContext) -> Result<Arc<Connection>, PublishError> {
+        let consumer = Self::consumer(ctx)?;
+        let mut cached = self.connection.lock().map_err(|_| poisoned())?;
+        if let Some(connection) = cached.as_ref()
+            && connection.creds.consumer_key == consumer.key
+            && connection.creds.consumer_secret == consumer.secret
+        {
+            return Ok(Arc::clone(connection));
+        }
+
+        let not_connected =
+            || PublishError::NotAuthorised("no SmugMug account is connected".into());
+        let nickname = Self::connected_nickname(ctx)?.ok_or_else(not_connected)?;
+        let (token, token_secret) =
+            SmugMugAuth::load_tokens(&account_key(&nickname))?.ok_or_else(not_connected)?;
+        let creds = Credentials {
+            consumer_key: consumer.key.clone(),
+            consumer_secret: consumer.secret.clone(),
+            token: Some(token),
+            token_secret: Some(token_secret),
+        };
+        let connection = Arc::new(Connection {
+            api: SmugMugApi::new(creds.clone())?,
+            uploader: SmugMugUploader::new(creds.clone())?,
+            creds,
+        });
+        *cached = Some(Arc::clone(&connection));
+        Ok(connection)
     }
 
     fn consumer(ctx: &PublishContext) -> Result<&ConsumerCredentials, PublishError> {
@@ -68,11 +113,20 @@ impl Default for SmugMugDestination {
     }
 }
 
-/// Albums and uploads land with the tasks that follow this one. An error
-/// rather than a `todo!()`: a panic inside a Tauri command would take the
-/// whole app down, and an unimplemented destination method is not worth that.
-fn not_yet_implemented(what: &str) -> PublishError {
-    PublishError::Rejected(format!("SmugMug {what} is not implemented yet"))
+fn poisoned() -> PublishError {
+    PublishError::Io("the SmugMug destination lock was poisoned".into())
+}
+
+/// Phase 1 does not mirror the group tree, so an album's groups are folded
+/// into its SmugMug name: "Travel" › "Iceland" publishes as "Travel - Iceland".
+fn flattened_name(local: &LocalContainer) -> String {
+    local
+        .parent_path
+        .iter()
+        .chain(std::iter::once(&local.name))
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(" - ")
 }
 
 #[async_trait]
@@ -121,11 +175,7 @@ impl PublishDestination for SmugMugDestination {
     async fn begin_auth(&self, ctx: &PublishContext) -> Result<AuthChallenge, PublishError> {
         let temporary = fetch_request_token(Self::consumer(ctx)?).await?;
         let authorize_url = authorize_url(&temporary.token);
-        *self
-            .pending
-            .lock()
-            .map_err(|_| PublishError::Io("the authorisation lock was poisoned".into()))? =
-            Some(temporary);
+        *self.pending.lock().map_err(|_| poisoned())? = Some(temporary);
 
         Ok(AuthChallenge {
             authorize_url,
@@ -145,7 +195,7 @@ impl PublishDestination for SmugMugDestination {
         let temporary = self
             .pending
             .lock()
-            .map_err(|_| PublishError::Io("the authorisation lock was poisoned".into()))?
+            .map_err(|_| poisoned())?
             .take()
             .ok_or_else(|| {
                 PublishError::NotAuthorised(
@@ -159,34 +209,65 @@ impl PublishDestination for SmugMugDestination {
         // Keyring first: a state file naming an account whose tokens were
         // never stored would report Connected and then fail on every call.
         SmugMugAuth::store_tokens(&account_key(&nickname), &access.token, &access.token_secret)?;
+        *self.connection.lock().map_err(|_| poisoned())? = None;
 
         let mut state = PublishState::load_in(&ctx.state_dir, DESTINATION_ID)?;
         state.set_account(Some(nickname));
         state.save_in(&ctx.state_dir)
     }
 
+    /// Albums go directly under the account's root node until the panel
+    /// offers a choice of folder.
     async fn ensure_container(
         &self,
-        _local: &LocalContainer,
-        _ctx: &PublishContext,
+        local: &LocalContainer,
+        ctx: &PublishContext,
     ) -> Result<RemoteContainerId, PublishError> {
-        Err(not_yet_implemented("album creation"))
+        let connection = self.connection(ctx)?;
+        let root = connection.api.auth_user().await?.node_uri;
+        connection
+            .api
+            .ensure_album(&root, &flattened_name(local))
+            .await
     }
 
     async fn publish_image(
         &self,
-        _item: &PublishItem<'_>,
-        _ctx: &PublishContext,
+        item: &PublishItem<'_>,
+        ctx: &PublishContext,
     ) -> Result<RemoteImageId, PublishError> {
-        Err(not_yet_implemented("upload"))
+        self.connection(ctx)?
+            .uploader
+            .upload(item, &ctx.cancel)
+            .await
     }
 
     async fn reconcile(
         &self,
-        _container: &RemoteContainerId,
-        _expected: &[PublishItem<'_>],
-        _ctx: &PublishContext,
+        container: &RemoteContainerId,
+        expected: &[PublishItem<'_>],
+        ctx: &PublishContext,
     ) -> Result<Vec<(String, RemoteImageId)>, PublishError> {
-        Err(not_yet_implemented("reconciliation"))
+        let connection = self.connection(ctx)?;
+        upload::reconcile(&connection.api, container, expected).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn groups_are_folded_into_the_album_name() {
+        let local = |parent_path: &[&str]| LocalContainer {
+            album_id: "a".into(),
+            name: "Iceland".into(),
+            parent_path: parent_path.iter().map(|s| s.to_string()).collect(),
+        };
+        assert_eq!(flattened_name(&local(&[])), "Iceland");
+        assert_eq!(
+            flattened_name(&local(&["Travel", "2026"])),
+            "Travel - 2026 - Iceland"
+        );
     }
 }

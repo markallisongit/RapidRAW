@@ -27,6 +27,7 @@ use tauri::{Emitter, Manager};
 use uuid::Uuid;
 
 use crate::export_processing::{ExportAdjustmentsMode, ExportSettings};
+use crate::file_management::AlbumItem;
 use crate::publish::spool::Spool;
 use crate::publish::state::{PublishAction, PublishState, RelevantExportSettings, fingerprint};
 use crate::publish::{
@@ -79,6 +80,78 @@ pub struct PublishRequest {
     pub album: LocalContainer,
     /// Virtual paths, so virtual copies publish as distinct photos.
     pub paths: Vec<String>,
+}
+
+impl PublishRequest {
+    /// The album `album_id` from the album tree, with the names of the groups
+    /// above it. `None` when no album has that id — a group's id included,
+    /// since phase 1 publishes one album at a time.
+    pub fn from_album_tree(tree: &[AlbumItem], album_id: &str) -> Option<Self> {
+        fn find(
+            items: &[AlbumItem],
+            album_id: &str,
+            parents: &mut Vec<String>,
+        ) -> Option<PublishRequest> {
+            for item in items {
+                match item {
+                    AlbumItem::Album {
+                        id, name, images, ..
+                    } if id == album_id => {
+                        return Some(PublishRequest {
+                            album: LocalContainer {
+                                album_id: id.clone(),
+                                name: name.clone(),
+                                parent_path: parents.clone(),
+                            },
+                            paths: images.clone(),
+                        });
+                    }
+                    AlbumItem::Album { .. } => {}
+                    AlbumItem::Group { name, children, .. } => {
+                        parents.push(name.clone());
+                        if let Some(found) = find(children, album_id, parents) {
+                            return Some(found);
+                        }
+                        parents.pop();
+                    }
+                }
+            }
+            None
+        }
+        find(tree, album_id, &mut Vec::new())
+    }
+}
+
+/// What publishing would do, counted without rendering or uploading.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PublishPreview {
+    pub new: usize,
+    pub update: usize,
+    pub skip: usize,
+    /// Photos that could not be fingerprinted — a missing source file, most
+    /// likely. Publishing would report each one as failed.
+    pub unreadable: usize,
+}
+
+/// Classifies every photo exactly as [`PublishSession::run`] would, at the
+/// same cost as a republish of an unchanged album: a fingerprint per photo.
+pub fn preview(
+    pipeline: &dyn RenderPipeline,
+    state: &PublishState,
+    paths: &[String],
+) -> PublishPreview {
+    let mut counts = PublishPreview::default();
+    for path in paths {
+        match pipeline.fingerprint(path) {
+            Ok(fingerprint) => match state.classify(path, &fingerprint) {
+                PublishAction::New => counts.new += 1,
+                PublishAction::Update { .. } => counts.update += 1,
+                PublishAction::Skip => counts.skip += 1,
+            },
+            Err(_) => counts.unreadable += 1,
+        }
+    }
+    counts
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1145,6 +1218,73 @@ mod tests {
 
     fn paths(range: std::ops::RangeInclusive<usize>) -> Vec<String> {
         range.map(path).collect()
+    }
+
+    #[test]
+    fn preview_counts_what_a_publish_would_do_without_rendering() {
+        let harness = Harness::new();
+        let mut pipeline = StubPipeline::new(&harness.spool_base());
+        harness.published(&pipeline, &paths(1..=3));
+        pipeline.edited = [path(2)].into();
+
+        let counts = preview(&pipeline, &harness.state(), &paths(1..=5));
+
+        assert_eq!(
+            counts,
+            PublishPreview {
+                new: 2,
+                update: 1,
+                skip: 2,
+                unreadable: 0,
+            }
+        );
+        assert_eq!(pipeline.renders.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn an_album_is_found_anywhere_in_the_tree_with_its_groups() {
+        let album = |id: &str, name: &str| AlbumItem::Album {
+            id: id.into(),
+            name: name.into(),
+            icon: None,
+            images: vec![format!("/photos/{name}.ARW")],
+        };
+        let tree = vec![
+            album("top", "Top"),
+            AlbumItem::Group {
+                id: "g1".into(),
+                name: "Travel".into(),
+                icon: None,
+                children: vec![
+                    AlbumItem::Group {
+                        id: "g2".into(),
+                        name: "Empty".into(),
+                        icon: None,
+                        children: vec![],
+                    },
+                    AlbumItem::Group {
+                        id: "g3".into(),
+                        name: "2026".into(),
+                        icon: None,
+                        children: vec![album("ice", "Iceland")],
+                    },
+                ],
+            },
+        ];
+
+        let found = PublishRequest::from_album_tree(&tree, "ice").unwrap();
+        assert_eq!(found.album.name, "Iceland");
+        assert_eq!(found.album.parent_path, vec!["Travel", "2026"]);
+        assert_eq!(found.paths, vec!["/photos/Iceland.ARW"]);
+
+        let top = PublishRequest::from_album_tree(&tree, "top").unwrap();
+        assert!(top.album.parent_path.is_empty());
+
+        assert!(
+            PublishRequest::from_album_tree(&tree, "g1").is_none(),
+            "a group is not an album"
+        );
+        assert!(PublishRequest::from_album_tree(&tree, "nope").is_none());
     }
 
     #[tokio::test]

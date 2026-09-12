@@ -8,12 +8,10 @@
 
 use std::time::Duration;
 
+use crate::publish::credential_store as store;
 use crate::publish::oauth1::{self, Credentials, parse_query, percent_encode};
 use crate::publish::smugmug::model::{TokenPair, parse_auth_user};
 use crate::publish::{ConsumerCredentials, PublishError};
-
-/// Keyring service name, matching the bundle identifier in `tauri.conf.json`.
-pub const KEYRING_SERVICE: &str = "io.github.CyberTimon.RapidRAW";
 
 const REQUEST_TOKEN_URL: &str = "https://api.smugmug.com/services/oauth/1.0a/getRequestToken";
 const AUTHORIZE_URL: &str = "https://api.smugmug.com/services/oauth/1.0a/authorize";
@@ -109,12 +107,9 @@ fn secret_blob(pair: &TokenPair) -> String {
     )
 }
 
-/// Token storage in the OS keyring.
-///
-/// There is deliberately no plaintext fallback. Where no credential store is
-/// available the user is told so: a token written to a file in the home
-/// directory is a worse outcome than an error message, and silently
-/// downgrading the guarantee is not ours to do.
+/// Token storage in the OS keyring, through the shared
+/// [`credential_store`](crate::publish::credential_store) and so with no
+/// plaintext fallback either.
 pub struct SmugMugAuth;
 
 impl SmugMugAuth {
@@ -136,86 +131,6 @@ impl SmugMugAuth {
             token_secret: secret.to_string(),
         });
         store::set(account, &blob)
-    }
-
-    /// Deleting what is already absent succeeds: disconnecting an account
-    /// whose entry the user removed by hand is not an error.
-    pub fn delete_tokens(account: &str) -> Result<(), PublishError> {
-        store::delete(account)
-    }
-}
-
-#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-mod store {
-    use super::{KEYRING_SERVICE, PublishError};
-
-    fn entry(account: &str) -> Result<keyring::Entry, PublishError> {
-        keyring::Entry::new(KEYRING_SERVICE, account).map_err(unavailable)
-    }
-
-    /// Names the platform problem rather than reporting a bare "keyring
-    /// error": on Linux the usual cause is that nothing is providing the
-    /// Secret Service, which the user can act on.
-    fn unavailable(error: keyring::Error) -> PublishError {
-        let detail = match error {
-            keyring::Error::NoDefaultStore => {
-                let hint = if cfg!(target_os = "linux") {
-                    "A Secret Service provider such as gnome-keyring or kwallet must be running."
-                } else {
-                    "The OS credential store could not be opened."
-                };
-                format!("{error}. {hint} RapidRAW will not store tokens in a plain file.")
-            }
-            keyring::Error::NoStorageAccess(_) => {
-                format!("{error}. The credential store may be locked.")
-            }
-            other => other.to_string(),
-        };
-        PublishError::CredentialStorage(detail)
-    }
-
-    pub fn get(account: &str) -> Result<Option<String>, PublishError> {
-        match entry(account)?.get_password() {
-            Ok(secret) => Ok(Some(secret)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(unavailable(error)),
-        }
-    }
-
-    pub fn set(account: &str, secret: &str) -> Result<(), PublishError> {
-        entry(account)?.set_password(secret).map_err(unavailable)
-    }
-
-    pub fn delete(account: &str) -> Result<(), PublishError> {
-        match entry(account)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(unavailable(error)),
-        }
-    }
-}
-
-/// `keyring` has no backend here, and the publish panel is desktop-only, so
-/// reaching this is a bug rather than something a user can hit.
-#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-mod store {
-    use super::PublishError;
-
-    fn unsupported() -> PublishError {
-        PublishError::CredentialStorage(
-            "this platform has no OS credential store; publishing is desktop-only".into(),
-        )
-    }
-
-    pub fn get(_account: &str) -> Result<Option<String>, PublishError> {
-        Err(unsupported())
-    }
-
-    pub fn set(_account: &str, _secret: &str) -> Result<(), PublishError> {
-        Err(unsupported())
-    }
-
-    pub fn delete(_account: &str) -> Result<(), PublishError> {
-        Err(unsupported())
     }
 }
 

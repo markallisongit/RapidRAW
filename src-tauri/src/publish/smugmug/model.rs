@@ -77,6 +77,7 @@ fn parse_envelope<T: serde::de::DeserializeOwned>(
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     pub nick_name: String,
+    #[allow(dead_code, reason = "parsed to pin the user/node distinction in tests")]
     pub uri: String,
     pub node_uri: String,
 }
@@ -128,6 +129,10 @@ pub struct ChildNode {
     #[serde(rename = "Type")]
     pub node_type: String,
     #[serde(rename = "Uri")]
+    #[allow(
+        dead_code,
+        reason = "kept beside `album_uri` so the two are not confused"
+    )]
     pub uri: String,
     #[serde(rename = "Uris", default)]
     uris: ChildNodeUris,

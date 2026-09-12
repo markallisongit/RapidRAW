@@ -174,4 +174,5 @@ pub struct AppState {
     pub disks_cache: Mutex<Option<Disks>>,
     pub disks_cache_refreshing: AtomicBool,
     pub camera_session: Mutex<CameraSession>,
+    pub publish_registry: crate::publish::PublishRegistry,
 }

@@ -56,17 +56,11 @@ impl SessionMarker {
 /// A session's spool directory, deleted when this value is dropped.
 pub struct Spool {
     root: PathBuf,
-    session_id: Uuid,
 }
 
 impl Spool {
-    /// Creates the directory and writes its marker.
-    pub fn create(app_handle: &AppHandle) -> Result<Self, PublishError> {
-        Self::create_at(&spool_root(app_handle)?)
-    }
-
-    /// [`Self::create`] without an `AppHandle`, so the lifecycle is testable
-    /// against a plain temp directory.
+    /// Creates a session directory under `base` — [`spool_root`] in the app,
+    /// a plain temp directory under test — and writes its marker.
     pub fn create_at(base: &Path) -> Result<Self, PublishError> {
         let session_id = Uuid::new_v4();
         let root = base.join(session_id.to_string());
@@ -91,15 +85,11 @@ impl Spool {
             return Err(PublishError::Io(format!("writing {SESSION_MARKER}: {e}")));
         }
 
-        Ok(Self { root, session_id })
+        Ok(Self { root })
     }
 
     pub fn path(&self) -> &Path {
         &self.root
-    }
-
-    pub fn session_id(&self) -> Uuid {
-        self.session_id
     }
 
     /// Where to render an image. Does not create the file.
@@ -142,6 +132,7 @@ impl Spool {
 
     /// Current byte footprint, for the assertion that the spool stays bounded.
     /// Unreadable entries are skipped rather than failing the measurement.
+    #[cfg(test)]
     pub fn size_on_disk(&self) -> u64 {
         walkdir::WalkDir::new(&self.root)
             .into_iter()
@@ -261,7 +252,8 @@ fn process_is_alive(pid: u32) -> bool {
     system.process(pid).is_some()
 }
 
-fn spool_root(app_handle: &AppHandle) -> Result<PathBuf, PublishError> {
+/// Where every session directory is created, and what the startup sweep scans.
+pub fn spool_root(app_handle: &AppHandle) -> Result<PathBuf, PublishError> {
     app_handle
         .path()
         .app_cache_dir()

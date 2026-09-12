@@ -53,7 +53,11 @@ pub struct LocalContainer {
 }
 
 /// How far through authorisation a destination is.
+///
+/// Internally tagged, so the frontend reads `{ "status": "Connected",
+/// "account": "…" }` rather than a shape that differs per variant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status")]
 pub enum AuthStatus {
     /// No consumer key/secret — the user has not registered an application.
     NotConfigured,
@@ -65,6 +69,7 @@ pub enum AuthStatus {
 }
 
 /// The user-facing half of an interactive authorisation handshake.
+#[derive(Debug, Clone, Serialize)]
 pub struct AuthChallenge {
     pub authorize_url: String,
     /// i18n key for the destination's instructions, not a literal string.
