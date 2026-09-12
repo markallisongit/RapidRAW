@@ -80,6 +80,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
 trash = "5.2.6"
+# OS keyring for publish destination tokens. Desktop only, following the
+# per-target shape `reqwest` already uses below: the default features cover
+# Windows and the Secret Service, and macOS needs its backend asked for by name.
+keyring = { version = "4.2", features = ["apple-native-keyring-store"] }
 tauri-plugin-single-instance = "2.4.3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "rustls"] }
 

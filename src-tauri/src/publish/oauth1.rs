@@ -5,6 +5,7 @@
 //! are reproducible in tests against published vectors.
 
 use std::fmt::Write as _;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose};
 use hmac::{Hmac, KeyInit, Mac};
@@ -25,6 +26,20 @@ pub fn percent_encode(input: &str) -> String {
         }
     }
     out
+}
+
+/// A value that will not repeat for this consumer key and timestamp, as
+/// RFC 5849 section 3.3 requires. 128 random bits, hex-encoded.
+pub fn nonce() -> String {
+    format!("{:032x}", rand::random::<u128>())
+}
+
+/// Seconds since the Unix epoch, which is what `oauth_timestamp` is.
+pub fn timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
 }
 
 /// Client and (optionally) token credentials for a single signed request.
@@ -142,7 +157,7 @@ pub fn authorization_header(
 /// Splits an `a=1&b=2` query string into decoded key/value pairs, which
 /// `signature_base_string` then re-encodes. A key with no `=` keeps an empty
 /// value, per RFC 5849 section 3.4.1.3.
-fn parse_query(query: &str) -> Vec<(String, String)> {
+pub fn parse_query(query: &str) -> Vec<(String, String)> {
     query
         .split('&')
         .filter(|pair| !pair.is_empty())
@@ -155,7 +170,7 @@ fn parse_query(query: &str) -> Vec<(String, String)> {
 
 /// Reverses `percent_encode`. A malformed escape is passed through unchanged,
 /// and `+` decodes to a space to match form encoding.
-fn percent_decode(input: &str) -> String {
+pub fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -193,6 +208,20 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn a_nonce_is_128_hex_bits_and_does_not_repeat() {
+        let first = nonce();
+        assert_eq!(first.len(), 32, "{first}");
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()), "{first}");
+        assert_ne!(first, nonce());
+    }
+
+    #[test]
+    fn the_timestamp_is_unix_seconds() {
+        // 2026-01-01, comfortably in the past and far short of a u64 overflow.
+        assert!(timestamp() > 1_767_225_600);
     }
 
     #[test]
