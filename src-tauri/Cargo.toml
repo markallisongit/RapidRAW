@@ -77,6 +77,9 @@ sha1 = "0.11"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Stands in for api.smugmug.com so the SmugMug request shaping is tested
+# without a live account or any network in CI.
+wiremock = "0.6"
 
 [target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
 trash = "5.2.6"

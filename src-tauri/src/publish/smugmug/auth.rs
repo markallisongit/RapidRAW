@@ -282,7 +282,9 @@ pub async fn fetch_nickname(
     Ok(parse_auth_user(&body_or_error(response).await?)?.nick_name)
 }
 
-fn client() -> Result<reqwest::Client, PublishError> {
+/// Shared with [`api`](super::api): one client configuration, and one place
+/// a transport failure is described.
+pub(super) fn client() -> Result<reqwest::Client, PublishError> {
     reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .build()
@@ -316,7 +318,7 @@ async fn post_signed(
     body_or_error(response).await
 }
 
-fn transport(error: reqwest::Error) -> PublishError {
+pub(super) fn transport(error: reqwest::Error) -> PublishError {
     if error.is_timeout() {
         PublishError::Network(format!("timed out: {error}"))
     } else {
@@ -326,7 +328,10 @@ fn transport(error: reqwest::Error) -> PublishError {
 
 /// Maps a response onto the shared error vocabulary, so the caller retries a
 /// 503 and stops on a 401 without knowing anything about SmugMug.
-async fn body_or_error(response: reqwest::Response) -> Result<String, PublishError> {
+///
+/// Shared with [`api`](super::api) so that every SmugMug call fails in the
+/// same vocabulary regardless of which module issued it.
+pub(super) async fn body_or_error(response: reqwest::Response) -> Result<String, PublishError> {
     let status = response.status();
     let retry_after = response
         .headers()

@@ -5,6 +5,7 @@
 //! Albums and uploads follow in later changes, which is why the remaining
 //! trait methods answer with an error rather than doing anything.
 
+pub mod api;
 pub mod auth;
 pub mod model;
 
