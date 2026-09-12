@@ -8,6 +8,7 @@
 pub mod oauth1;
 pub mod registry;
 pub mod spool;
+pub mod state;
 pub mod types;
 
 use async_trait::async_trait;
