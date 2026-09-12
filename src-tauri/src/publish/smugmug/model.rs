@@ -246,6 +246,55 @@ pub fn parse_album_images(body: &str) -> Result<AlbumImagesPage, PublishError> {
     })
 }
 
+/// What the upload host answered, once HTTP itself has succeeded.
+///
+/// The upload endpoint predates API v2 and does not use its envelope: it
+/// answers `{"stat": "ok", "Image": {…}}`, and a refusal can arrive as a 200
+/// carrying `"stat": "fail"`, so the status code alone does not say whether
+/// the image landed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UploadOutcome {
+    Uploaded(RemoteImageId),
+    Refused(String),
+}
+
+#[derive(Debug, Deserialize)]
+struct RawUploadResponse {
+    stat: String,
+    #[serde(default)]
+    code: Option<i64>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(rename = "Image", default)]
+    image: Option<RawUploadedImage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawUploadedImage {
+    #[serde(rename = "ImageUri")]
+    image_uri: String,
+}
+
+/// An `Err` here means the body could not be read at all, which after a 2xx
+/// is not the same as a refusal: the upload may well have committed.
+pub fn parse_upload_response(body: &str) -> Result<UploadOutcome, PublishError> {
+    let raw: RawUploadResponse = serde_json::from_str(body)
+        .map_err(|e| PublishError::Rejected(format!("unexpected upload response: {e}")))?;
+
+    match (raw.stat.as_str(), raw.image) {
+        ("ok", Some(image)) => Ok(UploadOutcome::Uploaded(RemoteImageId(image.image_uri))),
+        ("ok", None) => Err(PublishError::Rejected(
+            "the upload response reported success but named no image".into(),
+        )),
+        _ => Ok(UploadOutcome::Refused(format!(
+            "SmugMug refused the upload (code {}): {}",
+            raw.code
+                .map_or_else(|| "none".to_string(), |code| code.to_string()),
+            raw.message.as_deref().unwrap_or("no message")
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +476,44 @@ mod tests {
             "Uri": "/api/v2/user/somephotographer"
         }}, "Code": 200}"#;
         assert!(parse_auth_user(body).is_err());
+    }
+
+    /// Trimmed from a real upload response. `ImageUri` is what a later
+    /// upload hands back in `X-Smug-ImageUri` to replace it.
+    #[test]
+    fn reads_the_image_uri_an_upload_returns() {
+        let body = r#"{
+            "stat": "ok",
+            "method": "smugmug.images.upload",
+            "Image": {
+                "ImageUri": "/api/v2/image/XyZ123-0",
+                "AlbumImageUri": "/api/v2/album/AbCdEf/image/XyZ123-0",
+                "StatusImageReplaceUri": null,
+                "URL": "https://somephotographer.smugmug.com/Iceland-2026/i-XyZ123"
+            }
+        }"#;
+        assert_eq!(
+            parse_upload_response(body).unwrap(),
+            UploadOutcome::Uploaded(RemoteImageId("/api/v2/image/XyZ123-0".into()))
+        );
+    }
+
+    #[test]
+    fn a_failed_stat_is_a_refusal_not_a_parse_error() {
+        let body = r#"{"stat": "fail", "method": "smugmug.images.upload", "code": 5, "message": "system error"}"#;
+        match parse_upload_response(body).unwrap() {
+            UploadOutcome::Refused(detail) => {
+                assert!(detail.contains("system error"), "{detail}");
+                assert!(detail.contains('5'), "{detail}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unreadable_upload_response_is_an_error() {
+        assert!(parse_upload_response("<html>502 Bad Gateway</html>").is_err());
+        assert!(parse_upload_response(r#"{"stat": "ok"}"#).is_err());
     }
 
     #[test]

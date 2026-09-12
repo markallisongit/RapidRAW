@@ -74,6 +74,11 @@ sysinfo = "0.39.6"
 # are the digest 0.10 generation and would pull a second copy into the build.
 hmac = "0.13"
 sha1 = "0.11"
+# SmugMug upload `Content-MD5`, from the same `digest 0.11` generation as above.
+md-5 = "0.11"
+# The buffered upload body, cloned per retry by reference count rather than by
+# copying the file. Already in the tree through reqwest.
+bytes = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
