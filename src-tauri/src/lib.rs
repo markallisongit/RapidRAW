@@ -2262,6 +2262,8 @@ pub fn run() {
             publish::commands::publish_set_settings,
             publish::commands::publish_preview,
             publish::commands::publish_album,
+            publish::commands::publish_settings_impact,
+            publish::commands::publish_keep_existing_uploads,
             publish::commands::publish_cancel,
             publish::commands::publish_list_remote,
             publish::commands::publish_list_links,

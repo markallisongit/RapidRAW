@@ -2,6 +2,7 @@ pub mod commands;
 pub mod credential_store;
 pub mod links;
 pub mod oauth1;
+pub mod preset;
 pub mod registry;
 pub mod session;
 pub mod settings;

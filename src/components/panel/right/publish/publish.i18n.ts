@@ -110,6 +110,7 @@ export const publishResources = {
   },
   errors: {
     localFile: 'The photo could not be prepared on this computer.',
+    presetMissing: 'Choose an output preset for this destination.',
   },
 };
 

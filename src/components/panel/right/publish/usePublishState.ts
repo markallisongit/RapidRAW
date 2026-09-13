@@ -7,7 +7,7 @@ import { useShallow } from 'zustand/react/shallow';
 
 import { ExportSettings } from '../../../ui/ExportImportProperties';
 
-// Mirrors the serde shapes in src-tauri/src/publish/{types,session,settings,links,commands}.rs.
+// Mirrors the serde shapes in src-tauri/src/publish/{types,session,settings,links,preset,state,commands}.rs.
 
 export type AuthStatus =
   { status: 'NotConfigured' } | { status: 'NotAuthorised' } | { status: 'Connected'; account: string };
@@ -71,11 +71,26 @@ export type LinkError =
   | { kind: 'AlreadyLinked'; album_id: string; album_name: string | null }
   | { kind: 'Failed'; message: string };
 
+/** What the commands that need the destination's output preset reject with. */
+export type PresetError = { kind: 'PresetMissing'; preset_id: string | null } | { kind: 'Failed'; message: string };
+
 export interface PublishPreview {
   new: number;
+  /** Edited since they were published. */
   update: number;
+  /** Unedited, but published with different output settings. */
+  settings_changed: number;
   skip: number;
   unreadable: number;
+}
+
+/** What publishing does with photos whose only change is the output settings. */
+export type SettingsChangePolicy = 'Republish' | 'KeepExisting';
+
+/** Published photos a switch of output preset would upload again. */
+export interface SettingsImpact {
+  photos: number;
+  albums: number;
 }
 
 export type ItemState = 'skipped' | 'uploaded' | 'updated' | 'failed' | 'ambiguous';
@@ -109,6 +124,7 @@ export interface PublishSessionState {
 
 export interface PublishTarget {
   albumId: string;
+  /** Interim, removed by #21: the Export panel's settings, used only while the destination has no preset. */
   exportSettings: ExportSettings;
   outputFormat: string;
 }
@@ -122,13 +138,27 @@ const IDLE_SESSION: PublishSessionState = {
   error: null,
 };
 
+const isPresetError = (error: unknown): error is PresetError =>
+  typeof error === 'object' && error !== null && 'kind' in error;
+
+export const isPresetMissing = (error: unknown): boolean => isPresetError(error) && error.kind === 'PresetMissing';
+
+const errorMessage = (error: unknown): string => {
+  if (typeof error === 'string') return error;
+  if (error instanceof Error) return error.message;
+  if (isPresetError(error)) {
+    return error.kind === 'Failed' ? error.message : 'no output preset is chosen for this destination';
+  }
+  return String(error);
+};
+
 /**
  * `io:` errors come from rendering into the session's temporary storage and
  * can name paths inside it, which the panel never shows. The detail still
  * reaches the log.
  */
 export const displayError = (error: unknown, localFileMessage: string): string => {
-  const message = typeof error === 'string' ? error : error instanceof Error ? error.message : String(error);
+  const message = errorMessage(error);
   if (message.startsWith('io:')) {
     console.error('Publish:', message);
     return localFileMessage;
@@ -308,16 +338,29 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     [destinationId],
   );
 
+  /** `onSettingsChange` is required so settings-only changes never upload without the user having chosen to. */
   const publish = useCallback(
-    async (target: PublishTarget) => {
+    async (target: PublishTarget, onSettingsChange: SettingsChangePolicy) => {
       updateSession(() => ({ ...IDLE_SESSION, phase: 'starting' }));
       try {
-        await invoke('publish_album', { destinationId, ...target });
+        await invoke('publish_album', { destinationId, ...target, onSettingsChange });
         updateSession((current) => (current.phase === 'starting' ? { ...current, phase: 'running' } : current));
       } catch (error) {
-        updateSession(() => ({ ...IDLE_SESSION, phase: 'error', error: String(error) }));
+        updateSession(() => ({ ...IDLE_SESSION, phase: 'error', error: errorMessage(error) }));
       }
     },
+    [destinationId],
+  );
+
+  /** Compares settings hashes only, so it is cheap however much is published. */
+  const settingsImpact = useCallback(
+    (exportPresetId: string) => invoke<SettingsImpact>('publish_settings_impact', { destinationId, exportPresetId }),
+    [destinationId],
+  );
+
+  /** After switching preset: marks every published photo current with it, so none uploads again. */
+  const keepExistingUploads = useCallback(
+    () => invoke<number>('publish_keep_existing_uploads', { destinationId }),
     [destinationId],
   );
 
@@ -353,6 +396,8 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     unlink,
     preview,
     publish,
+    settingsImpact,
+    keepExistingUploads,
     cancel,
     dismissSession,
   };

@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use uuid::Uuid;
 
@@ -144,7 +144,11 @@ pub fn find_album<'t>(
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct PublishPreview {
     pub new: usize,
+    /// Edited since they were published.
     pub update: usize,
+    /// Unedited, but published with different output settings. Uploaded
+    /// again only under [`SettingsChangePolicy::Republish`].
+    pub settings_changed: usize,
     pub skip: usize,
     /// Photos that could not be fingerprinted — a missing source file, most
     /// likely. Publishing would report each one as failed.
@@ -164,17 +168,25 @@ pub fn preview(
         match pipeline.fingerprints(path) {
             Ok(fingerprints) => match state.classify(album_id, path, &fingerprints) {
                 PublishAction::New => counts.new += 1,
-                // Until the user can choose to keep existing uploads, a
-                // settings change republishes, as it always has.
-                PublishAction::Update { .. } | PublishAction::SettingsChanged { .. } => {
-                    counts.update += 1
-                }
+                PublishAction::Update { .. } => counts.update += 1,
+                PublishAction::SettingsChanged { .. } => counts.settings_changed += 1,
                 PublishAction::Skip => counts.skip += 1,
             },
             Err(_) => counts.unreadable += 1,
         }
     }
     counts
+}
+
+/// What a publish does with a photo that would upload again only because the
+/// output settings changed — Lightroom's "Republish all / Leave as-is".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum SettingsChangePolicy {
+    /// Render and upload it, replacing the existing upload, as for an edit.
+    Republish,
+    /// Leave the existing upload alone and record it as current with the new
+    /// settings.
+    KeepExisting,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -297,8 +309,12 @@ impl<'a> PublishSession<'a> {
     /// A failure of one image is recorded in the summary and never ends the
     /// session; an `Err` here means the session itself could not continue —
     /// no album, an unwritable state file, a renderer that would not start.
-    pub async fn run(&self, request: PublishRequest) -> Result<SessionSummary, PublishError> {
-        let result = self.drive(request).await;
+    pub async fn run(
+        &self,
+        request: PublishRequest,
+        on_settings_change: SettingsChangePolicy,
+    ) -> Result<SessionSummary, PublishError> {
+        let result = self.drive(request, on_settings_change).await;
         (self.events)(match &result {
             Ok(summary) if summary.cancelled => SessionEvent::Cancelled(summary.clone()),
             Ok(summary) => SessionEvent::Complete(summary.clone()),
@@ -307,7 +323,11 @@ impl<'a> PublishSession<'a> {
         result
     }
 
-    async fn drive(&self, request: PublishRequest) -> Result<SessionSummary, PublishError> {
+    async fn drive(
+        &self,
+        request: PublishRequest,
+        on_settings_change: SettingsChangePolicy,
+    ) -> Result<SessionSummary, PublishError> {
         let capabilities = self.destination.capabilities();
         let mime = self.pipeline.mime();
         if !capabilities.accepted_mime_types.contains(&mime) {
@@ -363,7 +383,7 @@ impl<'a> PublishSession<'a> {
 
         // Every skip is decided here, before the spool exists and before
         // anything is rendered.
-        let work = self.classify(&request.paths, &mut run);
+        let work = self.classify(&request.paths, on_settings_change, &mut run);
         if work.is_empty() {
             return run.finish();
         }
@@ -426,7 +446,12 @@ impl<'a> PublishSession<'a> {
 
     /// Fingerprints and classifies every photo, reporting skips and
     /// preparation failures as they are found, and returns the rest.
-    fn classify(&self, paths: &[String], run: &mut Run<'_>) -> Vec<Work> {
+    fn classify(
+        &self,
+        paths: &[String],
+        on_settings_change: SettingsChangePolicy,
+        run: &mut Run<'_>,
+    ) -> Vec<Work> {
         let total = paths.len();
         let mut work = Vec::new();
 
@@ -443,9 +468,13 @@ impl<'a> PublishSession<'a> {
                     run.skip(path, &fingerprints);
                     continue;
                 }
+                PublishAction::SettingsChanged { .. }
+                    if on_settings_change == SettingsChangePolicy::KeepExisting =>
+                {
+                    run.keep(path, &fingerprints);
+                    continue;
+                }
                 PublishAction::New => None,
-                // Republished like an edit until the user can choose to keep
-                // the existing uploads instead.
                 PublishAction::Update { replaces }
                 | PublishAction::SettingsChanged { replaces } => Some(replaces),
             };
@@ -710,6 +739,15 @@ impl Run<'_> {
     fn skip(&mut self, path: &str, fingerprints: &Fingerprints) {
         self.state
             .confirm_unchanged(&self.album_id, path, fingerprints);
+        self.summary.skipped += 1;
+        self.report(path, ItemState::Skipped);
+    }
+
+    /// A settings-only change the user chose not to upload: recorded as
+    /// current with the new settings, and reported as a skip.
+    fn keep(&mut self, path: &str, fingerprints: &Fingerprints) {
+        self.state
+            .mark_image_settings_current(&self.album_id, path, &fingerprints.settings_hash);
         self.summary.skipped += 1;
         self.report(path, ItemState::Skipped);
     }
@@ -1380,10 +1418,26 @@ mod tests {
             pipeline: &StubPipeline,
             request: PublishRequest,
         ) -> SessionSummary {
+            self.run_with(
+                destination,
+                pipeline,
+                request,
+                SettingsChangePolicy::Republish,
+            )
+            .await
+        }
+
+        async fn run_with(
+            &self,
+            destination: &StubDestination,
+            pipeline: &StubPipeline,
+            request: PublishRequest,
+            on_settings_change: SettingsChangePolicy,
+        ) -> SessionSummary {
             let recorder = Arc::clone(&self.events);
             let events: EventSink = Arc::new(move |event| recorder.lock().unwrap().push(event));
             PublishSession::new(destination, pipeline, &self.ctx, self.spool_base(), events)
-                .run(request)
+                .run(request, on_settings_change)
                 .await
                 .unwrap()
         }
@@ -1429,7 +1483,10 @@ mod tests {
             harness.spool_base(),
             events,
         )
-        .run(request(ALBUM, paths(1..=2)))
+        .run(
+            request(ALBUM, paths(1..=2)),
+            SettingsChangePolicy::Republish,
+        )
         .await;
 
         let error = result.expect_err("bob must not publish into alice's albums");
@@ -1483,6 +1540,7 @@ mod tests {
             PublishPreview {
                 new: 2,
                 update: 1,
+                settings_changed: 0,
                 skip: 2,
                 unreadable: 0,
             }
@@ -1598,20 +1656,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn preview_counts_settings_changes_apart_from_edits() {
+        let harness = Harness::new();
+        let mut pipeline = StubPipeline::new(&harness.spool_base());
+        harness.published(&pipeline, &paths(1..=3));
+        pipeline.settings = "settings:b".into();
+        pipeline.edited = [path(1)].into();
+
+        let counts = preview(&pipeline, &harness.state(), ALBUM, &paths(1..=4));
+
+        assert_eq!(
+            counts,
+            PublishPreview {
+                new: 1,
+                update: 1,
+                settings_changed: 2,
+                skip: 0,
+                unreadable: 0,
+            },
+            "an edit with new settings is an edit"
+        );
+    }
+
     #[tokio::test]
-    async fn a_settings_change_still_republishes() {
+    async fn republish_uploads_photos_whose_settings_changed() {
         let harness = Harness::new();
         let mut pipeline = StubPipeline::new(&harness.spool_base());
         let destination = StubDestination::new(&harness.spool_base());
         harness.published(&pipeline, &paths(1..=2));
         pipeline.settings = "settings:b".into();
 
-        let counts = preview(&pipeline, &harness.state(), ALBUM, &paths(1..=2));
-        let summary = harness.run(&destination, &pipeline, paths(1..=2)).await;
+        let summary = harness
+            .run_with(
+                &destination,
+                &pipeline,
+                request(ALBUM, paths(1..=2)),
+                SettingsChangePolicy::Republish,
+            )
+            .await;
 
+        let mut uploads = destination.uploads.lock().unwrap().clone();
+        uploads.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
-            counts.update, 2,
-            "counted as updates until the user can choose"
+            uploads,
+            vec![
+                (file_name(1), Some(image_id(ALBUM, &file_name(1)))),
+                (file_name(2), Some(image_id(ALBUM, &file_name(2)))),
+            ],
+            "replaced in place, like an edit"
         );
         assert_eq!(summary.updated, 2);
         assert_eq!(
@@ -1620,6 +1713,72 @@ mod tests {
                 .classify(ALBUM, &path(1), &pipeline.fingerprints_of(&path(1))),
             PublishAction::Skip,
             "the new settings hash is recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn keeping_existing_uploads_publishes_only_edits_and_new_photos() {
+        let harness = Harness::new();
+        let mut pipeline = StubPipeline::new(&harness.spool_base());
+        let destination = StubDestination::new(&harness.spool_base());
+        harness.published(&pipeline, &paths(1..=3));
+        pipeline.settings = "settings:b".into();
+        pipeline.edited = [path(1)].into();
+
+        let summary = harness
+            .run_with(
+                &destination,
+                &pipeline,
+                request(ALBUM, paths(1..=4)),
+                SettingsChangePolicy::KeepExisting,
+            )
+            .await;
+
+        let mut uploads = destination.uploads.lock().unwrap().clone();
+        uploads.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            uploads,
+            vec![
+                (file_name(1), Some(image_id(ALBUM, &file_name(1)))),
+                (file_name(4), None),
+            ],
+            "the edit and the new photo upload; the settings-only changes do not"
+        );
+        assert_eq!(
+            pipeline.renders.load(Ordering::SeqCst),
+            2,
+            "a kept upload costs no render"
+        );
+        assert_eq!(
+            (summary.updated, summary.uploaded, summary.skipped),
+            (1, 1, 2)
+        );
+        let reported: Vec<ItemState> = harness
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::Progress(progress) if progress.current_file == path(2) => {
+                    Some(progress.state)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reported, [ItemState::Skipped]);
+
+        let state = harness.state();
+        for n in 1..=4 {
+            assert_eq!(
+                state.classify(ALBUM, &path(n), &pipeline.fingerprints_of(&path(n))),
+                PublishAction::Skip,
+                "photo {n} is current with the new settings"
+            );
+        }
+        assert_eq!(
+            state.image_for(ALBUM, &path(2)).unwrap().remote_uri,
+            image_id(ALBUM, &file_name(2)).0,
+            "a kept upload keeps its remote image"
         );
     }
 
@@ -1748,7 +1907,10 @@ mod tests {
             harness.spool_base(),
             events,
         )
-        .run(request(ALBUM, paths(1..=2)))
+        .run(
+            request(ALBUM, paths(1..=2)),
+            SettingsChangePolicy::Republish,
+        )
         .await;
 
         assert!(result.is_err());
@@ -1986,7 +2148,7 @@ mod tests {
             harness.spool_base(),
             events,
         );
-        let run = session.run(request(ALBUM, vec![]));
+        let run = session.run(request(ALBUM, vec![]), SettingsChangePolicy::Republish);
         assert_send(&run);
     }
 

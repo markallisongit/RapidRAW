@@ -117,10 +117,6 @@ pub enum PublishAction {
 }
 
 /// Published photos a change of output settings would affect.
-#[allow(
-    dead_code,
-    reason = "for asking before a settings change re-uploads, which is not wired up yet"
-)]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct SettingsImpact {
     /// Uploads, so a photo published into two albums counts twice.
@@ -494,10 +490,6 @@ impl PublishState {
     /// Records still awaiting their first confirmation after migration are
     /// left alone: without an edit hash, marking their settings current would
     /// also hide any edit made since.
-    #[allow(
-        dead_code,
-        reason = "for asking before a settings change re-uploads, which is not wired up yet"
-    )]
     pub fn mark_settings_current(&mut self, album_id: Option<&str>, settings_hash: &str) -> usize {
         let mut changed = 0;
         for (id, link) in &mut self.links {
@@ -516,13 +508,32 @@ impl PublishState {
         changed
     }
 
+    /// [`Self::mark_settings_current`] for one photo, which a session keeping
+    /// existing uploads calls for each settings-only change it leaves alone.
+    /// `true` when the record changed.
+    pub fn mark_image_settings_current(
+        &mut self,
+        album_id: &str,
+        virtual_path: &str,
+        settings_hash: &str,
+    ) -> bool {
+        let Some(record) = self
+            .links
+            .get_mut(album_id)
+            .and_then(|link| link.images.get_mut(virtual_path))
+        else {
+            return false;
+        };
+        if record.edit_hash.is_none() || record.settings_hash.as_deref() == Some(settings_hash) {
+            return false;
+        }
+        record.settings_hash = Some(settings_hash.to_string());
+        true
+    }
+
     /// Published photos whose `settings_hash` differs from `settings_hash`.
     /// Compares hashes only, so it needs no photo I/O. Records migrated from
     /// v1 are not counted: their settings are unknown.
-    #[allow(
-        dead_code,
-        reason = "for asking before a settings change re-uploads, which is not wired up yet"
-    )]
     pub fn settings_impact(&self, settings_hash: &str) -> SettingsImpact {
         let mut impact = SettingsImpact::default();
         for link in self.links.values() {
@@ -748,10 +759,6 @@ pub fn fingerprints(
 
 /// [`Fingerprints::settings_hash`] alone, for comparing candidate settings
 /// against what is published without touching any photo.
-#[allow(
-    dead_code,
-    reason = "for asking before a settings change re-uploads, which is not wired up yet"
-)]
 pub fn settings_hash(export_settings: &RelevantExportSettings) -> String {
     hash_settings(&canonical_settings(export_settings))
 }

@@ -22,7 +22,7 @@ import { useSettingsStore } from '../../../../store/useSettingsStore';
 import { useUIStore } from '../../../../store/useUIStore';
 import PublishProgress from './PublishProgress';
 import SmugMugAuthCard from './SmugMugAuthCard';
-import { PublishPreview, PublishTarget, displayError, usePublishState } from './usePublishState';
+import { PublishPreview, PublishTarget, displayError, isPresetMissing, usePublishState } from './usePublishState';
 
 const DESTINATION_ID = 'smugmug';
 
@@ -156,7 +156,15 @@ export default function PublishPanel() {
     api
       .preview(target)
       .then((counts) => isCurrent && setPreview(counts))
-      .catch((error) => isCurrent && setPreviewError(displayError(error, t('publish.errors.localFile'))))
+      .catch(
+        (error) =>
+          isCurrent &&
+          setPreviewError(
+            isPresetMissing(error)
+              ? t('publish.errors.presetMissing')
+              : displayError(error, t('publish.errors.localFile')),
+          ),
+      )
       .finally(() => isCurrent && setIsPreviewing(false));
     return () => {
       isCurrent = false;
@@ -181,7 +189,8 @@ export default function PublishPanel() {
     .filter(Boolean)
     .join(' · ');
 
-  const toPublish = preview ? preview.new + preview.update : 0;
+  // Interim, until #21 asks: settings-only changes republish, as they always have.
+  const toPublish = preview ? preview.new + preview.update + preview.settings_changed : 0;
   const canPublish = isConnected && !!album && album.images.length > 0 && isFormatAccepted && !isPreviewing;
 
   const renderBody = () => {
@@ -304,7 +313,7 @@ export default function PublishPanel() {
                   <Text color={TextColors.primary}>
                     {t('publish.preview.counts', {
                       unchanged: preview.skip,
-                      update: preview.update,
+                      update: preview.update + preview.settings_changed,
                       new: preview.new,
                     })}
                   </Text>
@@ -343,7 +352,7 @@ export default function PublishPanel() {
                 <Button
                   className="rounded-md h-11 w-full flex items-center text-md font-bold! justify-center"
                   disabled={!canPublish}
-                  onClick={() => target && api.publish(target)}
+                  onClick={() => target && api.publish(target, 'Republish')}
                   size="lg"
                 >
                   <UploadCloud size={18} className="mr-2" />

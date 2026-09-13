@@ -16,12 +16,15 @@ use crate::AppState;
 use crate::export_processing::ExportSettings;
 use crate::file_management::AlbumItem;
 use crate::publish::links::{LinkError, LinkInfo, LinkTarget, link_album, list_links};
+use crate::publish::preset::{
+    PresetError, PublishOutput, destination_output, keep_existing_uploads, settings_impact,
+};
 use crate::publish::session::{
-    ExportPipeline, PublishPreview, PublishRequest, PublishSession, check_account, preview,
-    tauri_event_sink,
+    ExportPipeline, PublishPreview, PublishRequest, PublishSession, SettingsChangePolicy,
+    check_account, preview, tauri_event_sink,
 };
 use crate::publish::settings::DestinationSettings;
-use crate::publish::state::{AlbumMembership, PublishState, state_dir};
+use crate::publish::state::{AlbumMembership, PublishState, SettingsImpact, state_dir};
 use crate::publish::{
     AuthChallenge, AuthStatus, DestinationCapabilities, PublishContext, PublishDestination,
     PublishError, RemoteNode, RemoteNodeId, credential_store, spool,
@@ -227,27 +230,41 @@ pub fn publish_unlink(
     Ok(())
 }
 
-/// Counts new, changed and unchanged photos. Never renders or uploads, and
-/// needs no connection: it reads only the state file, the photos and, when
-/// connected, which account that is.
+/// Counts new, edited, settings-changed and unchanged photos, for the
+/// destination's preset. Never renders or uploads, and needs no connection:
+/// it reads only the state file, the photos and, when connected, which
+/// account that is.
+///
+/// `export_settings` and `output_format` are the Export panel's, used only
+/// while the destination has no preset. Interim: removed by #21.
 #[tauri::command]
 pub async fn publish_preview(
     destination_id: String,
     album_id: String,
-    export_settings: ExportSettings,
-    output_format: String,
+    export_settings: Option<ExportSettings>,
+    output_format: Option<String>,
     state: State<'_, AppState>,
     app_handle: AppHandle,
-) -> Result<PublishPreview, String> {
+) -> Result<PublishPreview, PresetError> {
     let destination = destination(&state, &destination_id)?;
     let request = album(&app_handle, &album_id)?;
+    let output = output(
+        &app_handle,
+        &destination_id,
+        interim(export_settings, output_format),
+    )?;
     let ctx = context(&app_handle, &destination_id, idle_cancel())?;
     let mut publish_state =
         PublishState::load_in(&ctx.state_dir, &destination_id, &request.albums)?;
     // Refused like the publish it previews. The claim this may record is
     // never saved: a preview writes nothing.
     check_account(destination.as_ref(), &ctx, &mut publish_state).await?;
-    let pipeline = ExportPipeline::new(app_handle, export_settings, output_format, idle_cancel());
+    let pipeline = ExportPipeline::new(
+        app_handle,
+        output.export_settings,
+        output.output_format,
+        idle_cancel(),
+    );
 
     // A stat and a sidecar read per photo is too much blocking for an async
     // worker once an album runs to thousands.
@@ -260,23 +277,34 @@ pub async fn publish_preview(
         )
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string().into())
 }
 
 /// Starts publishing `album_id` and returns at once. The session reports
 /// through `publish-progress` and ends with exactly one of
 /// `publish-complete`, `publish-cancelled` or `publish-error`.
+///
+/// Renders with the destination's preset. `on_settings_change` decides
+/// whether photos whose only change is that preset upload again, and is
+/// required so that never happens without the user having been asked.
+/// `export_settings` and `output_format` are as for [`publish_preview`].
 #[tauri::command]
 pub async fn publish_album(
     destination_id: String,
     album_id: String,
-    export_settings: ExportSettings,
-    output_format: String,
+    export_settings: Option<ExportSettings>,
+    output_format: Option<String>,
+    on_settings_change: SettingsChangePolicy,
     state: State<'_, AppState>,
     app_handle: AppHandle,
-) -> Result<(), String> {
+) -> Result<(), PresetError> {
     let destination = destination(&state, &destination_id)?;
     let request = album(&app_handle, &album_id)?;
+    let output = output(
+        &app_handle,
+        &destination_id,
+        interim(export_settings, output_format),
+    )?;
     let spool_base = spool::spool_root(&app_handle)?;
     let session = state.publish_registry.begin_session()?;
     let ctx = context(&app_handle, &destination_id, session.cancel_flag())?;
@@ -286,19 +314,66 @@ pub async fn publish_album(
         let _session = session;
         let pipeline = ExportPipeline::new(
             app_handle.clone(),
-            export_settings,
-            output_format,
+            output.export_settings,
+            output.output_format,
             Arc::clone(&ctx.cancel),
         );
         let events = tauri_event_sink(app_handle);
         let run = PublishSession::new(destination.as_ref(), &pipeline, &ctx, spool_base, events)
-            .run(request)
+            .run(request, on_settings_change)
             .await;
         if let Err(error) = run {
             log::error!("Publishing to {destination_id} stopped: {error}");
         }
     });
     Ok(())
+}
+
+/// How many published photos switching the destination to
+/// `export_preset_id` would upload again, and in how many albums. Compares
+/// settings hashes only, so it reads no photos.
+#[tauri::command]
+pub fn publish_settings_impact(
+    destination_id: String,
+    export_preset_id: String,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<SettingsImpact, PresetError> {
+    destination(&state, &destination_id)?;
+    let tree = crate::file_management::get_albums(app_handle.clone())?;
+    let publish_state = load_state(&app_handle, &destination_id, &tree)?;
+    settings_impact(
+        &publish_state,
+        &export_preset_id,
+        &export_presets(&app_handle)?,
+    )
+}
+
+/// Records every published photo as current with the destination's preset,
+/// so switching to it uploads nothing again. Returns how many records
+/// changed. Refused while publishing, like linking.
+#[tauri::command]
+pub fn publish_keep_existing_uploads(
+    destination_id: String,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<usize, PresetError> {
+    destination(&state, &destination_id)?;
+    let _session = state.publish_registry.begin_session()?;
+    let dir = state_dir(&app_handle)?;
+    let tree = crate::file_management::get_albums(app_handle.clone())?;
+    let mut publish_state = load_state(&app_handle, &destination_id, &tree)?;
+    let preset_id = DestinationSettings::load_in(&dir, &destination_id)?.export_preset_id;
+
+    let changed = keep_existing_uploads(
+        &mut publish_state,
+        preset_id.as_deref(),
+        &export_presets(&app_handle)?,
+    )?;
+    if changed > 0 {
+        publish_state.save_in(&dir)?;
+    }
+    Ok(changed)
 }
 
 /// `false` when there was no session to cancel, which is not an error: the
@@ -340,6 +415,41 @@ fn album(app_handle: &AppHandle, album_id: &str) -> Result<PublishRequest, Strin
     let tree = crate::file_management::get_albums(app_handle.clone())?;
     PublishRequest::from_album_tree(&tree, album_id)
         .ok_or_else(|| format!("no album with id {album_id}"))
+}
+
+/// What `destination_id` publishes with. Interim: removed by #21, along with
+/// `interim`.
+fn output(
+    app_handle: &AppHandle,
+    destination_id: &str,
+    interim: Option<PublishOutput>,
+) -> Result<PublishOutput, PresetError> {
+    let settings = DestinationSettings::load_in(&state_dir(app_handle)?, destination_id)?;
+    destination_output(
+        settings.export_preset_id.as_deref(),
+        &export_presets(app_handle)?,
+        interim,
+    )
+}
+
+/// Interim: removed by #21. The Export panel's settings, when the panel sent
+/// them.
+fn interim(
+    export_settings: Option<ExportSettings>,
+    output_format: Option<String>,
+) -> Option<PublishOutput> {
+    export_settings
+        .zip(output_format)
+        .map(|(export_settings, output_format)| PublishOutput {
+            export_settings,
+            output_format,
+        })
+}
+
+fn export_presets(
+    app_handle: &AppHandle,
+) -> Result<Vec<crate::app_settings::ExportPreset>, String> {
+    Ok(crate::app_settings::load_settings(app_handle.clone())?.export_presets)
 }
 
 /// The album tree migrates a v1 state file; the caller has it loaded anyway.

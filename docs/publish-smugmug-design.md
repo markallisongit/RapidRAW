@@ -194,8 +194,10 @@ remote album drops its records, which describe images in the old album.
 `settings_hash = blake3(relevant_export_settings)` — `blake3` is already a dependency, fields are
 length-prefixed, JSON is canonicalised. Both match ⇒ skip _before_ rendering, so an unchanged
 album costs one file read and no GPU work. The split gives four outcomes: `New`, `Update` (edit
-changed), `SettingsChanged` (only settings changed) and `Skip`. Until the user can choose to keep
-existing uploads, `SettingsChanged` republishes like `Update`. `relevant_export_settings`
+changed), `SettingsChanged` (only settings changed) and `Skip`. A publish takes a required
+`SettingsChangePolicy`: `Republish` uploads `SettingsChanged` photos like `Update`, `KeepExisting`
+marks them current without rendering. The settings come from the destination's export preset
+(`preset.rs`), never the Export panel's current values. `relevant_export_settings`
 (`state.rs`) leaves out `destination_type`, `subfolder`, `preserve_folders` and
 `filename_template`, which decide where a file lands, not what is in it — otherwise renaming the
 output template would re-upload the whole library.
