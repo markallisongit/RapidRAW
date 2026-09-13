@@ -3,9 +3,9 @@
 **Design document** · 2026-09-12, updated 2026-09-13 · Mark Allison (with Claude)
 Target: [CyberTimon/RapidRAW](https://github.com/CyberTimon/RapidRAW) · Fork: [markallisongit/RapidRAW](https://github.com/markallisongit/RapidRAW) · Branch: `feat/publish-destinations-smugmug`
 
-**Implementation:** tracked in [#13](https://github.com/markallisongit/RapidRAW/issues/13), broken into ordered issues [#1](https://github.com/markallisongit/RapidRAW/issues/1)–[#12](https://github.com/markallisongit/RapidRAW/issues/12). Each issue carries its own task detail; this document is the rationale only.
+**Implementation:** phase 1 tracked in [#13](https://github.com/markallisongit/RapidRAW/issues/13) (issues [#1](https://github.com/markallisongit/RapidRAW/issues/1)–[#12](https://github.com/markallisongit/RapidRAW/issues/12)); the Publish Manager batch in [#14](https://github.com/markallisongit/RapidRAW/issues/14) (issues [#15](https://github.com/markallisongit/RapidRAW/issues/15)–[#24](https://github.com/markallisongit/RapidRAW/issues/24)). Each issue carries its own task detail; this document is the rationale only.
 
-**Status:** phase 1 complete — all twelve issues closed, and tested end-to-end against a live SmugMug account on 2026-09-13. Follow-up changes are tracked as their own issues.
+**Status:** phase 1 complete: all twelve issues closed, and tested end-to-end against a live SmugMug account on 2026-09-13. The #14 batch is in progress; [#15](https://github.com/markallisongit/RapidRAW/issues/15) (Publish as a panel tab) is done. This document describes what is implemented, and #24 brings it fully up to date at the end of the batch.
 
 ## Summary
 
@@ -246,8 +246,17 @@ state exporting doesn't (auth, album choice, "12 unchanged, 3 to update, 1 new")
 behind a select value makes the panel change shape drastically on one value. `destination_type`
 (`export_processing.rs:78`) stays for filesystem destinations.
 
-`PublishDock` mounts in the library view: a button beside the bottom bar while closed, a panel
-beside the grid while open. Hidden on Android (no `keyring` backend) and in the community view.
+Publish is a tab in RapidRAW's dockable panel system, `Panel.Publish`, after Export in the left
+dock. It drags between regions and persists in the saved workspace like every other panel, works
+in both the library and the editor, and reaches existing workspaces through `reconcileWorkspace`,
+which appends panels a saved layout lacks. It is filtered out on Android, which has no `keyring`
+backend.
+
+A region mounts only its active tab, so the panel unmounts whenever another tab is chosen. The
+backend reports a session only through events and cannot be asked about one afterwards, so
+`usePublishState` keeps session and auth state, including a pending authorisation, in a
+module-level zustand store with listeners registered once for the app's lifetime. This is the
+same reason `useTetheringStore` exists.
 
 States: not configured (key/secret entry + link to the developer page) → not authorised (connect,
 browser, verifier paste) → connected (account, album picker, new/update/skip/unreadable preview) →
@@ -263,15 +272,17 @@ line. The spool is never surfaced.
 | `src-tauri/src/lib.rs`                   | `mod publish;` + spool sweep in setup + registry init                                                        | 3     | Very low                       |
 | `src-tauri/src/lib.rs`                   | commands in `generate_handler![]`                                                                            | 10    | **Medium — both sides append** |
 | `src-tauri/src/app_state.rs`             | `publish_registry` field                                                                                     | 1     | Low                            |
-| `src/App.tsx`                            | import + `registerPublishResources()`                                                                        | 3     | Medium — busy file             |
-| `src/store/useUIStore.ts`                | `isPublishPanelVisible`                                                                                      | 2     | Low                            |
-| `src/components/views/LibraryView.tsx`   | import + mount `PublishDock`                                                                                 | 2     | Low                            |
+| `src/App.tsx`                            | import + `registerPublishResources()`; `case Panel.Publish` in `renderAppPanel`                              | 6     | Medium — busy file             |
+| `src/components/ui/AppProperties.tsx`    | `Panel.Publish` enum member                                                                                  | 1     | Low                            |
+| `src/components/panel/PanelSwitcher.tsx` | `Send` icon and tooltip key in `PANEL_ICONS` / `PANEL_TITLES`                                                | 3     | Low                            |
+| `src/store/useUIStore.ts`                | `Panel.Publish` in `ALL_PANELS`, default regions and both default layouts                                    | 10    | Low                            |
+| `src/store/useUIStore.ts`                | Android gating: `isPublishSupported` in the `allowedPanels` filter                                           | 15    | Low                            |
 | `i18next.config.ts`                      | `extract.ignore` for the publish directory                                                                   | 3     | Low                            |
 | `src/@types/i18next.d.ts`                | `PublishTranslations` in the type augmentation                                                               | 5     | Low                            |
 | **`src-tauri/src/export_processing.rs`** | **none**                                                                                                     | **0** | **None**                       |
 | `src/i18n/**`                            | **none**                                                                                                     | 0     | None                           |
 
-**~50 lines across 8 existing files** (`scripts/check-fork-surface.sh` prints the live figure;
+**~80 lines across 9 existing files** (77+/4− after #15; `scripts/check-fork-surface.sh` prints the live figure;
 `Cargo.lock` follows `Cargo.toml` and is not counted). Everything else is new, and new files never
 conflict.
 
@@ -295,20 +306,23 @@ upstream/main ──► main                       mirror only; fast-forward, ne
                     ▼
       feat/publish-destinations-smugmug      integration branch; what gets built and run
           ▲         ▲         ▲
-     tweak/14   tweak/15   tweak/16          one per issue; merged by PR, then deleted
+     tweak/15   tweak/16   tweak/17          one per issue; merged locally, then deleted
 ```
 
 **`main` mirrors upstream.** It only ever fast-forwards
-(`git fetch upstream && git checkout main && git merge --ff-only upstream/main && git push origin main`)
+(`git fetch upstream main:main && git push origin main`, which never checks `main` out)
 and nothing of ours is committed to it, so it stays a clean base for upstream PRs and for the
-surface guard.
+surface guard. Avoid switching branches in the working tree while `tauri dev` runs: the watchers
+rebuild against the swapped source and the app crashes. Use `git worktree add` when another
+branch's files are needed.
 
 **`feat/publish-destinations-smugmug` is the long-lived integration branch.** `main` is **merged**
 in, never rebased onto, because merges preserve the conflict resolutions `rerere` (enabled)
 replays. Merge weekly, not on demand: small frequent merges are far cheaper.
 
 **Follow-up work** is one GitHub issue per change and one short-lived branch per issue
-(`tweak/<issue>-<slug>`), cut from the integration branch and merged back by PR within the fork.
+(`tweak/<issue>-<slug>`), cut from the integration branch and merged back locally, fast-forward
+where possible. There are no PRs within the fork, and issues are closed by hand after merging.
 Stack branches only where one change genuinely depends on another; independent changes on
 independent branches can be dropped or reworked alone.
 
@@ -322,7 +336,7 @@ to one commit.
 mirrors it) touches anything outside the table above; surface creep is invisible otherwise. Run it
 before merging any follow-up branch.
 
-For the PR: open a discussion issue first, lead with the integration surface, frame it as
+For the PR, the only one this work produces: open a discussion issue first, lead with the integration surface, frame it as
 infrastructure with SmugMug as the reference implementation, and offer to maintain it.
 
 ## Testing
@@ -365,6 +379,9 @@ Open questions, and where phase 1 left them:
 - **Tuning** — `RENDER_CHUNK_SIZE = 8` and `UPLOAD_CONCURRENCY = 3` (`session.rs`) are still
   guesses worth measuring.
 - **Album privacy** — new albums set none and inherit the account root's, which may be public.
+  Decided for #14: new-album privacy becomes a destination setting, default Public to match
+  SmugMug's own Lightroom plugin, shown before an album is created
+  ([#17](https://github.com/markallisongit/RapidRAW/issues/17)).
 
 ## References
 
