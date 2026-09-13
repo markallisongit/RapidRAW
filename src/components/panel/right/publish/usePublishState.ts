@@ -7,7 +7,7 @@ import { useShallow } from 'zustand/react/shallow';
 
 import { ExportSettings } from '../../../ui/ExportImportProperties';
 
-// Mirrors the serde shapes in src-tauri/src/publish/{types,session,settings,commands}.rs.
+// Mirrors the serde shapes in src-tauri/src/publish/{types,session,settings,links,commands}.rs.
 
 export type AuthStatus =
   { status: 'NotConfigured' } | { status: 'NotAuthorised' } | { status: 'Connected'; account: string };
@@ -37,6 +37,39 @@ export interface DestinationInfo {
     supported_privacy: ContainerPrivacy[];
   };
 }
+
+export type RemoteNodeKind = 'Folder' | 'Album';
+
+/** One entry in the destination's album tree. `id` drills into a folder; `container` is what an album links by. */
+export interface RemoteNode {
+  id: string;
+  container: string | null;
+  kind: RemoteNodeKind;
+  name: string;
+  web_url: string | null;
+  has_children: boolean;
+}
+
+export type LinkTarget = { kind: 'Existing'; remote_uri: string } | { kind: 'CreateNew'; name: string };
+
+export interface LinkInfo {
+  album_id: string;
+  /** Null when the local album has been deleted. */
+  album_name: string | null;
+  /** Group names, outermost first. */
+  album_path: string[];
+  remote_uri: string;
+  remote_name: string | null;
+  web_url: string | null;
+  last_published: string | null;
+  broken: boolean;
+}
+
+/** What `publish_link_album` rejects with. */
+export type LinkError =
+  | { kind: 'AlreadyExists'; remote: RemoteNode }
+  | { kind: 'AlreadyLinked'; album_id: string; album_name: string | null }
+  | { kind: 'Failed'; message: string };
 
 export interface PublishPreview {
   new: number;
@@ -250,6 +283,26 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     await refreshAuth();
   }, [destinationId, refreshAuth]);
 
+  /** One level of the remote album tree; `parent` is a folder's `id`, or null for the root. */
+  const listRemote = useCallback(
+    (parent: string | null = null) => invoke<RemoteNode[]>('publish_list_remote', { destinationId, parent }),
+    [destinationId],
+  );
+
+  const listLinks = useCallback(() => invoke<LinkInfo[]>('publish_list_links', { destinationId }), [destinationId]);
+
+  /** Rejects with a `LinkError`. Linking to a different remote album drops the old one's photo records. */
+  const linkAlbum = useCallback(
+    (albumId: string, target: LinkTarget) => invoke<LinkInfo>('publish_link_album', { destinationId, albumId, target }),
+    [destinationId],
+  );
+
+  /** Nothing on the destination is touched. */
+  const unlink = useCallback(
+    (albumId: string) => invoke('publish_unlink', { destinationId, albumId }),
+    [destinationId],
+  );
+
   const preview = useCallback(
     (target: PublishTarget) => invoke<PublishPreview>('publish_preview', { destinationId, ...target }),
     [destinationId],
@@ -294,6 +347,10 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     getSettings,
     setSettings,
     disconnect,
+    listRemote,
+    listLinks,
+    linkAlbum,
+    unlink,
     preview,
     publish,
     cancel,

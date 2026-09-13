@@ -141,7 +141,8 @@ mod tests {
     use crate::publish::registry::PublishRegistry;
     use crate::publish::types::{
         AuthChallenge, AuthStatus, ContainerPrivacy, DestinationCapabilities, LocalContainer,
-        PublishContext, PublishError, PublishItem, RemoteContainerId, RemoteImageId,
+        PublishContext, PublishError, PublishItem, RemoteContainerId, RemoteImageId, RemoteNode,
+        RemoteNodeId,
     };
 
     struct StubDestination;
@@ -184,6 +185,38 @@ mod tests {
         }
 
         async fn disconnect(&self, _ctx: &PublishContext) -> Result<(), PublishError> {
+            unimplemented!()
+        }
+
+        async fn list_containers(
+            &self,
+            _parent: Option<&RemoteNodeId>,
+            _ctx: &PublishContext,
+        ) -> Result<Vec<RemoteNode>, PublishError> {
+            unimplemented!()
+        }
+
+        async fn find_container(
+            &self,
+            _name: &str,
+            _ctx: &PublishContext,
+        ) -> Result<Option<RemoteNode>, PublishError> {
+            unimplemented!()
+        }
+
+        async fn create_container(
+            &self,
+            _name: &str,
+            _ctx: &PublishContext,
+        ) -> Result<RemoteNode, PublishError> {
+            unimplemented!()
+        }
+
+        async fn container(
+            &self,
+            _id: &RemoteContainerId,
+            _ctx: &PublishContext,
+        ) -> Result<RemoteNode, PublishError> {
             unimplemented!()
         }
 

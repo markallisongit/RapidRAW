@@ -25,7 +25,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::export_processing::{ExportSettings, ResizeOptions, WatermarkSettings};
 use crate::file_management::AlbumItem;
-use crate::publish::{PublishError, RemoteContainerId, RemoteImageId};
+use crate::publish::{PublishError, RemoteContainerId, RemoteImageId, RemoteNode};
 
 /// Subdirectory of `app_data_dir` holding one file per destination.
 const STATE_DIR_NAME: &str = "publish";
@@ -89,6 +89,15 @@ pub struct PublishState {
     account: Option<String>,
     /// Keyed on the RapidRAW album id.
     links: BTreeMap<String, LinkRecord>,
+}
+
+/// Why [`PublishState::link_album`] would not link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkRefused {
+    /// Another RapidRAW album is linked to that remote album.
+    AlreadyLinked { album_id: String },
+    /// A folder, which photos cannot be published into.
+    NotAContainer,
 }
 
 /// What a republish would do to one photo, and what the panel previews.
@@ -296,9 +305,13 @@ impl PublishState {
         self.account.as_deref()
     }
 
-    #[cfg(test)]
     pub fn link(&self, album_id: &str) -> Option<&LinkRecord> {
         self.links.get(album_id)
+    }
+
+    /// Every link, keyed on the RapidRAW album id, in id order.
+    pub fn links(&self) -> impl Iterator<Item = (&String, &LinkRecord)> {
+        self.links.iter()
     }
 
     #[cfg(test)]
@@ -332,6 +345,40 @@ impl PublishState {
                 );
             }
         }
+    }
+
+    /// Links `album_id` to the remote album `remote`, as the user chose it,
+    /// recording its name and address. Relinking keeps or drops the image
+    /// records as [`Self::record_link`] does.
+    ///
+    /// Refused when another RapidRAW album is already linked to `remote`: two
+    /// albums publishing into one would replace each other's photos.
+    pub fn link_album(&mut self, album_id: &str, remote: &RemoteNode) -> Result<(), LinkRefused> {
+        let Some(container) = &remote.container else {
+            return Err(LinkRefused::NotAContainer);
+        };
+        if let Some((other, _)) = self
+            .links
+            .iter()
+            .find(|(id, link)| *id != album_id && link.remote_uri == container.0)
+        {
+            return Err(LinkRefused::AlreadyLinked {
+                album_id: other.clone(),
+            });
+        }
+
+        self.record_link(album_id, container, remote.web_url.clone());
+        if let Some(link) = self.links.get_mut(album_id) {
+            link.remote_name = Some(remote.name.clone());
+            link.web_url = remote.web_url.clone();
+        }
+        Ok(())
+    }
+
+    /// Forgets the link and what was published through it. Nothing remote is
+    /// touched. `false` when the album was not linked.
+    pub fn unlink_album(&mut self, album_id: &str) -> bool {
+        self.links.remove(album_id).is_some()
     }
 
     /// Stamps the link's `last_published`. A no-op for an unlinked album.
@@ -1150,6 +1197,119 @@ mod tests {
         assert!(
             state.image_for("a", "/p/a.raf").is_none(),
             "records of images in the old album must not be replaced into the new one"
+        );
+    }
+
+    use crate::publish::{RemoteNodeId, RemoteNodeKind};
+
+    fn remote_album(key: &str, name: &str) -> RemoteNode {
+        RemoteNode {
+            id: RemoteNodeId(format!("/api/v2/node/{key}")),
+            container: Some(album_uri(key)),
+            kind: RemoteNodeKind::Album,
+            name: name.into(),
+            web_url: Some(format!("https://example.smugmug.com/{name}")),
+            has_children: false,
+        }
+    }
+
+    #[test]
+    fn linking_records_the_remote_album_name_and_address() {
+        let mut state = PublishState::empty("smugmug");
+
+        state
+            .link_album("iceland", &remote_album("Ice", "Iceland 2026"))
+            .unwrap();
+
+        let link = state.link("iceland").unwrap();
+        assert_eq!(link.remote_uri, "/api/v2/album/Ice");
+        assert_eq!(link.remote_name.as_deref(), Some("Iceland 2026"));
+        assert_eq!(
+            link.web_url.as_deref(),
+            Some("https://example.smugmug.com/Iceland 2026")
+        );
+        assert_eq!(link.last_published, None);
+        assert!(link.images.is_empty());
+    }
+
+    #[test]
+    fn a_remote_album_takes_one_link_only() {
+        let mut state = published("iceland", &[("/p/a.raf", "/img/1", prints("e1", "s1"))]);
+        let remote = remote_album("iceland", "Iceland");
+
+        state
+            .link_album("iceland", &remote)
+            .expect("relinking an album to its own remote album is not a second link");
+        assert!(
+            state.image_for("iceland", "/p/a.raf").is_some(),
+            "and keeps its records"
+        );
+
+        let refused = state.link_album("best-of", &remote).unwrap_err();
+        assert_eq!(
+            refused,
+            LinkRefused::AlreadyLinked {
+                album_id: "iceland".into()
+            }
+        );
+        assert!(state.link("best-of").is_none(), "a refusal records nothing");
+    }
+
+    #[test]
+    fn relinking_to_another_remote_album_drops_the_image_records() {
+        let mut state = published("iceland", &[("/p/a.raf", "/img/1", prints("e1", "s1"))]);
+
+        state
+            .link_album("iceland", &remote_album("Other", "Other"))
+            .unwrap();
+
+        assert_eq!(
+            state.link("iceland").unwrap().remote_uri,
+            "/api/v2/album/Other"
+        );
+        assert_eq!(
+            state.classify("iceland", "/p/a.raf", &prints("e1", "s1")),
+            PublishAction::New,
+            "the next publish uploads everything as new"
+        );
+        state
+            .link_album("best-of", &remote_album("iceland", "Iceland"))
+            .expect("the old remote album is free again");
+    }
+
+    #[test]
+    fn a_folder_cannot_be_linked() {
+        let mut state = PublishState::empty("smugmug");
+        let folder = RemoteNode {
+            container: None,
+            kind: RemoteNodeKind::Folder,
+            ..remote_album("Travel", "Travel")
+        };
+
+        assert!(state.link_album("iceland", &folder).is_err());
+        assert!(state.link("iceland").is_none());
+    }
+
+    #[test]
+    fn unlinking_removes_the_link_and_its_image_records() {
+        let mut state = published("iceland", &[("/p/a.raf", "/img/1", prints("e1", "s1"))]);
+        state.record_link("best-of", &album_uri("best-of"), None);
+
+        assert!(state.unlink_album("iceland"));
+
+        assert!(state.link("iceland").is_none());
+        assert_eq!(
+            state.classify("iceland", "/p/a.raf", &prints("e1", "s1")),
+            PublishAction::New
+        );
+        assert!(state.link("best-of").is_some(), "other links stay");
+        assert!(
+            !state.unlink_album("iceland"),
+            "unlinking twice is harmless"
+        );
+        assert_eq!(
+            state.links().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            ["best-of"]
         );
     }
 

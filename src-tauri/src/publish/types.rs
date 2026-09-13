@@ -24,6 +24,32 @@ pub struct RemoteContainerId(pub String);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoteImageId(pub String);
 
+/// Opaque destination-side identifier for anything in the container tree,
+/// folder or album, e.g. `/api/v2/node/1c3l4nd`. Not a [`RemoteContainerId`]:
+/// a destination may name an album's place in the tree and the album itself
+/// differently, and only the latter takes uploads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteNodeId(pub String);
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RemoteNodeKind {
+    Folder,
+    Album,
+}
+
+/// One entry in the destination's container tree, as the Publish Manager
+/// browses it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteNode {
+    pub id: RemoteNodeId,
+    /// `Some` for an album: what a link records and uploads go into.
+    pub container: Option<RemoteContainerId>,
+    pub kind: RemoteNodeKind,
+    pub name: String,
+    pub web_url: Option<String>,
+    pub has_children: bool,
+}
+
 /// What a destination can do, so the session branches on capabilities rather
 /// than on [`PublishDestination::id`](crate::publish::PublishDestination::id).
 ///
@@ -36,7 +62,9 @@ pub struct DestinationCapabilities {
     pub supports_replace: bool,
     /// Can list a container so an ambiguous upload can be resolved.
     pub supports_reconcile: bool,
-    /// Containers can nest; when false the local hierarchy is flattened.
+    /// Containers can sit inside folders, which
+    /// [`list_containers`](crate::publish::PublishDestination::list_containers)
+    /// then returns for browsing.
     pub supports_nested_containers: bool,
     /// Per-file upload ceiling, when the destination publishes one.
     pub max_bytes: Option<u64>,

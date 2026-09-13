@@ -14,15 +14,17 @@ use tauri::{AppHandle, State};
 
 use crate::AppState;
 use crate::export_processing::ExportSettings;
+use crate::file_management::AlbumItem;
+use crate::publish::links::{LinkError, LinkInfo, LinkTarget, link_album, list_links};
 use crate::publish::session::{
     ExportPipeline, PublishPreview, PublishRequest, PublishSession, check_account, preview,
     tauri_event_sink,
 };
 use crate::publish::settings::DestinationSettings;
-use crate::publish::state::{PublishState, state_dir};
+use crate::publish::state::{AlbumMembership, PublishState, state_dir};
 use crate::publish::{
     AuthChallenge, AuthStatus, DestinationCapabilities, PublishContext, PublishDestination,
-    PublishError, credential_store, spool,
+    PublishError, RemoteNode, RemoteNodeId, credential_store, spool,
 };
 
 #[derive(Serialize)]
@@ -149,6 +151,82 @@ pub async fn publish_disconnect(
     Ok(destination.disconnect(&ctx).await?)
 }
 
+/// One level of the remote album tree: `parent` is a node id from an earlier
+/// listing, and `None` the account root.
+#[tauri::command]
+pub async fn publish_list_remote(
+    destination_id: String,
+    parent: Option<String>,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<Vec<RemoteNode>, String> {
+    let destination = destination(&state, &destination_id)?;
+    let ctx = context(&app_handle, &destination_id, idle_cancel())?;
+    let parent = parent.map(RemoteNodeId);
+    Ok(destination.list_containers(parent.as_ref(), &ctx).await?)
+}
+
+/// Needs no connection: names come from the local album tree.
+#[tauri::command]
+pub fn publish_list_links(
+    destination_id: String,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<Vec<LinkInfo>, String> {
+    destination(&state, &destination_id)?;
+    let tree = crate::file_management::get_albums(app_handle.clone())?;
+    let publish_state = load_state(&app_handle, &destination_id, &tree)?;
+    Ok(list_links(&publish_state, &tree))
+}
+
+/// Refused while publishing, as is unlinking: the session saves the state it
+/// loaded at the start, which would silently undo the change.
+#[tauri::command]
+pub async fn publish_link_album(
+    destination_id: String,
+    album_id: String,
+    target: LinkTarget,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<LinkInfo, LinkError> {
+    let destination = destination(&state, &destination_id)?;
+    let _session = state.publish_registry.begin_session()?;
+    let tree = crate::file_management::get_albums(app_handle.clone())?;
+    let ctx = context(&app_handle, &destination_id, idle_cancel())?;
+    let mut publish_state = load_state(&app_handle, &destination_id, &tree)?;
+
+    let info = link_album(
+        destination.as_ref(),
+        &ctx,
+        &mut publish_state,
+        &tree,
+        &album_id,
+        target,
+    )
+    .await?;
+    publish_state.save_in(&ctx.state_dir)?;
+    Ok(info)
+}
+
+/// Forgets the link and its image records. Nothing on the destination is
+/// touched, and unlinking an album that is not linked is not an error.
+#[tauri::command]
+pub fn publish_unlink(
+    destination_id: String,
+    album_id: String,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<(), String> {
+    destination(&state, &destination_id)?;
+    let _session = state.publish_registry.begin_session()?;
+    let tree = crate::file_management::get_albums(app_handle.clone())?;
+    let mut publish_state = load_state(&app_handle, &destination_id, &tree)?;
+    if publish_state.unlink_album(&album_id) {
+        publish_state.save_in(&state_dir(&app_handle)?)?;
+    }
+    Ok(())
+}
+
 /// Counts new, changed and unchanged photos. Never renders or uploads, and
 /// needs no connection: it reads only the state file, the photos and, when
 /// connected, which account that is.
@@ -262,6 +340,19 @@ fn album(app_handle: &AppHandle, album_id: &str) -> Result<PublishRequest, Strin
     let tree = crate::file_management::get_albums(app_handle.clone())?;
     PublishRequest::from_album_tree(&tree, album_id)
         .ok_or_else(|| format!("no album with id {album_id}"))
+}
+
+/// The album tree migrates a v1 state file; the caller has it loaded anyway.
+fn load_state(
+    app_handle: &AppHandle,
+    destination_id: &str,
+    tree: &[AlbumItem],
+) -> Result<PublishState, PublishError> {
+    PublishState::load_in(
+        &state_dir(app_handle)?,
+        destination_id,
+        &AlbumMembership::from_tree(tree),
+    )
 }
 
 fn context(

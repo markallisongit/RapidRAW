@@ -16,13 +16,13 @@ use crate::publish::smugmug::auth::{
     SmugMugAuth, account_key, authorize_url, exchange_verifier, fetch_nickname,
     fetch_request_token, normalize_verifier,
 };
-use crate::publish::smugmug::model::TokenPair;
+use crate::publish::smugmug::model::{ChildNode, TokenPair};
 use crate::publish::smugmug::upload::SmugMugUploader;
 use crate::publish::state::PublishState;
 use crate::publish::{
     AuthChallenge, AuthStatus, ConsumerCredentials, ContainerPrivacy, DestinationCapabilities,
     LocalContainer, PublishContext, PublishDestination, PublishError, PublishItem,
-    RemoteContainerId, RemoteImageId,
+    RemoteContainerId, RemoteImageId, RemoteNode, RemoteNodeId, RemoteNodeKind,
 };
 
 /// Also the name of the state file, so it must not change once shipped.
@@ -159,6 +159,40 @@ fn flattened_name(local: &LocalContainer) -> String {
         .join(" - ")
 }
 
+/// A folder or an album as the Publish Manager lists it. `None` for a page,
+/// which holds no photos, and for an album without an album URI, which could
+/// not be linked or uploaded into.
+fn remote_node(node: &ChildNode) -> Option<RemoteNode> {
+    let (kind, container) = match node.node_type.as_str() {
+        "Folder" => (RemoteNodeKind::Folder, None),
+        "Album" => (
+            RemoteNodeKind::Album,
+            Some(RemoteContainerId(node.album_uri()?.to_string())),
+        ),
+        _ => return None,
+    };
+    Some(RemoteNode {
+        id: RemoteNodeId(node.uri.clone()),
+        container,
+        kind,
+        name: node.name.clone(),
+        web_url: node.web_uri.clone(),
+        has_children: node.has_children,
+    })
+}
+
+/// [`remote_node`], for a node that has to be a usable album.
+fn album_node(node: &ChildNode) -> Result<RemoteNode, PublishError> {
+    remote_node(node)
+        .filter(|remote| remote.container.is_some())
+        .ok_or_else(|| {
+            PublishError::Rejected(format!(
+                "the SmugMug node \"{}\" is not an album that can be published to",
+                node.name
+            ))
+        })
+}
+
 #[async_trait]
 impl PublishDestination for SmugMugDestination {
     fn id(&self) -> &'static str {
@@ -173,8 +207,9 @@ impl PublishDestination for SmugMugDestination {
         DestinationCapabilities {
             supports_replace: true,
             supports_reconcile: true,
-            // Phase 1 flattens the local hierarchy into the album name.
-            supports_nested_containers: false,
+            // Albums sit in folders on SmugMug. Publishing still flattens the
+            // local groups into the album name: see `flattened_name`.
+            supports_nested_containers: true,
             // SmugMug's per-file ceiling varies by plan and is not published
             // as one number, so the upload reports the server's own rejection
             // rather than guessing at a limit here.
@@ -253,6 +288,65 @@ impl PublishDestination for SmugMugDestination {
             SmugMugAuth::delete_tokens(&account_key(&nickname))?;
         }
         SmugMugAuth::set_connected_account(None)
+    }
+
+    async fn list_containers(
+        &self,
+        parent: Option<&RemoteNodeId>,
+        ctx: &PublishContext,
+    ) -> Result<Vec<RemoteNode>, PublishError> {
+        let connection = self.connection(ctx)?;
+        let parent = match parent {
+            Some(parent) => parent.0.clone(),
+            None => connection.api.auth_user().await?.node_uri,
+        };
+        let children = connection.api.list_children(&parent).await?;
+        Ok(children.iter().filter_map(remote_node).collect())
+    }
+
+    async fn find_container(
+        &self,
+        name: &str,
+        ctx: &PublishContext,
+    ) -> Result<Option<RemoteNode>, PublishError> {
+        let connection = self.connection(ctx)?;
+        let root = connection.api.auth_user().await?.node_uri;
+        match connection.api.find_child_album(&root, name).await? {
+            Some(node) => album_node(&node).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn create_container(
+        &self,
+        name: &str,
+        ctx: &PublishContext,
+    ) -> Result<RemoteNode, PublishError> {
+        let connection = self.connection(ctx)?;
+        let root = connection.api.auth_user().await?.node_uri;
+        let node = connection
+            .api
+            .create_album(&root, name, ctx.new_container_privacy)
+            .await?;
+        album_node(&node)
+    }
+
+    /// Read from the album itself, so a link to one inside a folder costs no
+    /// walk of the tree.
+    async fn container(
+        &self,
+        id: &RemoteContainerId,
+        ctx: &PublishContext,
+    ) -> Result<RemoteNode, PublishError> {
+        let album = self.connection(ctx)?.api.album(id).await?;
+        Ok(RemoteNode {
+            id: RemoteNodeId(album.node_uri),
+            container: Some(RemoteContainerId(album.uri)),
+            kind: RemoteNodeKind::Album,
+            name: album.name,
+            web_url: album.web_uri,
+            has_children: false,
+        })
     }
 
     /// Albums go directly under the account's root node until the panel
@@ -445,6 +539,63 @@ mod tests {
 
         destination.disconnect(&ctx).await.unwrap();
         assert_eq!(status(&destination, &ctx).await, "NotAuthorised");
+    }
+
+    #[test]
+    fn folders_and_albums_are_listed_and_anything_else_is_not() {
+        let body = serde_json::json!({
+            "Response": { "Node": [
+                {
+                    "Name": "Travel", "Type": "Folder", "Uri": "/api/v2/node/trv",
+                    "WebUri": "https://x.smugmug.com/Travel", "HasChildren": true
+                },
+                {
+                    "Name": "Iceland", "Type": "Album", "Uri": "/api/v2/node/ice",
+                    "WebUri": "https://x.smugmug.com/Iceland",
+                    "Uris": { "Album": { "Uri": "/api/v2/album/Ice" } }
+                },
+                { "Name": "About", "Type": "Page", "Uri": "/api/v2/node/abt" },
+                { "Name": "Broken", "Type": "Album", "Uri": "/api/v2/node/brk" }
+            ]},
+            "Code": 200
+        })
+        .to_string();
+        let nodes = model::parse_node_children(&body).unwrap().nodes;
+
+        let listed: Vec<RemoteNode> = nodes.iter().filter_map(remote_node).collect();
+
+        assert_eq!(
+            listed,
+            [
+                RemoteNode {
+                    id: RemoteNodeId("/api/v2/node/trv".into()),
+                    container: None,
+                    kind: RemoteNodeKind::Folder,
+                    name: "Travel".into(),
+                    web_url: Some("https://x.smugmug.com/Travel".into()),
+                    has_children: true,
+                },
+                RemoteNode {
+                    id: RemoteNodeId("/api/v2/node/ice".into()),
+                    container: Some(RemoteContainerId("/api/v2/album/Ice".into())),
+                    kind: RemoteNodeKind::Album,
+                    name: "Iceland".into(),
+                    web_url: Some("https://x.smugmug.com/Iceland".into()),
+                    has_children: false,
+                },
+            ],
+            "a page holds no photos, and an album with no album URI cannot be linked"
+        );
+    }
+
+    #[test]
+    fn smugmug_containers_nest_in_folders() {
+        assert!(
+            SmugMugDestination::new()
+                .capabilities()
+                .supports_nested_containers,
+            "without folders, albums inside one could never be browsed to"
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod credential_store;
+pub mod links;
 pub mod oauth1;
 pub mod registry;
 pub mod session;
@@ -15,6 +16,7 @@ pub use registry::PublishRegistry;
 pub use types::{
     AuthChallenge, AuthStatus, ConsumerCredentials, ContainerPrivacy, DestinationCapabilities,
     LocalContainer, PublishContext, PublishError, PublishItem, RemoteContainerId, RemoteImageId,
+    RemoteNode, RemoteNodeId, RemoteNodeKind,
 };
 
 /// A place photos can be published to.
@@ -37,6 +39,38 @@ pub trait PublishDestination: Send + Sync {
     /// and its links alone, so reconnecting the same account resumes where
     /// it left off. Idempotent.
     async fn disconnect(&self, ctx: &PublishContext) -> Result<(), PublishError>;
+
+    /// One level of the destination's container tree, every page. Folders
+    /// appear only when `capabilities().supports_nested_containers`. `None` is
+    /// the account root.
+    async fn list_containers(
+        &self,
+        parent: Option<&RemoteNodeId>,
+        ctx: &PublishContext,
+    ) -> Result<Vec<RemoteNode>, PublishError>;
+
+    /// A container directly under the root with exactly this name, if any.
+    async fn find_container(
+        &self,
+        name: &str,
+        ctx: &PublishContext,
+    ) -> Result<Option<RemoteNode>, PublishError>;
+
+    /// Creates a container directly under the root, with
+    /// [`PublishContext::new_container_privacy`]. Never reuses one of the same
+    /// name: that is [`find_container`](Self::find_container)'s to report.
+    async fn create_container(
+        &self,
+        name: &str,
+        ctx: &PublishContext,
+    ) -> Result<RemoteNode, PublishError>;
+
+    /// One container, read and never modified.
+    async fn container(
+        &self,
+        id: &RemoteContainerId,
+        ctx: &PublishContext,
+    ) -> Result<RemoteNode, PublishError>;
 
     /// Idempotent.
     async fn ensure_container(

@@ -12,8 +12,8 @@ use serde_json::json;
 use crate::publish::oauth1::{self, Credentials};
 use crate::publish::smugmug::auth::{body_or_error, client, transport};
 use crate::publish::smugmug::model::{
-    AuthUser, ChildNode, RemoteImageSummary, parse_album_images, parse_auth_user,
-    parse_created_node, parse_node_children,
+    Album, AuthUser, ChildNode, RemoteImageSummary, parse_album, parse_album_images,
+    parse_auth_user, parse_created_node, parse_node_children,
 };
 use crate::publish::{ContainerPrivacy, PublishError, RemoteContainerId};
 
@@ -66,6 +66,23 @@ impl SmugMugApi {
         parse_auth_user(&self.get_signed(&url).await?)
     }
 
+    /// Every child of `parent_node`, across every page: folders, albums and
+    /// pages alike, in SmugMug's order.
+    pub async fn list_children(&self, parent_node: &str) -> Result<Vec<ChildNode>, PublishError> {
+        let mut nodes = Vec::new();
+        let mut next = Some(self.children_url(parent_node));
+
+        while let Some(url) = next {
+            let page = parse_node_children(&self.get_signed(&url).await?)?;
+            nodes.extend(page.nodes);
+            next = page
+                .next_page
+                .map(|path| format!("{}{path}", self.base_url));
+        }
+
+        Ok(nodes)
+    }
+
     /// The album directly under `parent_node` whose name is exactly `name`.
     ///
     /// `parent_node` is a node *URI*, as [`AuthUser::node_uri`] hands back.
@@ -76,22 +93,20 @@ impl SmugMugApi {
         &self,
         parent_node: &str,
         name: &str,
-    ) -> Result<Option<RemoteContainerId>, PublishError> {
-        let mut next = Some(format!(
-            "{}{parent_node}!children?count={PAGE_SIZE}",
-            self.base_url
-        ));
+    ) -> Result<Option<ChildNode>, PublishError> {
+        let mut next = Some(self.children_url(parent_node));
 
         // Every page is searched, not just the first: an account whose albums
         // span several pages would otherwise gain a duplicate per publish.
+        // Not `list_children`, so a match on an early page stops the paging.
         while let Some(url) = next {
             let page = parse_node_children(&self.get_signed(&url).await?)?;
             if let Some(found) = page
                 .nodes
-                .iter()
+                .into_iter()
                 .find(|node| node.is_album() && node.name == name)
             {
-                return Ok(Some(album_of(found)?));
+                return Ok(Some(found));
             }
             next = page
                 .next_page
@@ -99,6 +114,12 @@ impl SmugMugApi {
         }
 
         Ok(None)
+    }
+
+    /// One album, read and never modified.
+    pub async fn album(&self, album: &RemoteContainerId) -> Result<Album, PublishError> {
+        let url = format!("{}{}", self.base_url, album.0);
+        parse_album(&self.get_signed(&url).await?)
     }
 
     /// Creates an album under `parent_node`. Not idempotent on its own — see
@@ -114,7 +135,7 @@ impl SmugMugApi {
         parent_node: &str,
         name: &str,
         privacy: ContainerPrivacy,
-    ) -> Result<RemoteContainerId, PublishError> {
+    ) -> Result<ChildNode, PublishError> {
         let url = format!("{}{parent_node}!children", self.base_url);
 
         for attempt in 0..URL_NAME_ATTEMPTS {
@@ -125,7 +146,7 @@ impl SmugMugApi {
                 "Privacy": smugmug_privacy(privacy),
             });
             match self.post_create(&url, &body).await? {
-                Created::Node(payload) => return album_of(&parse_created_node(&payload)?),
+                Created::Node(payload) => return parse_created_node(&payload),
                 Created::UrlNameTaken => continue,
             }
         }
@@ -146,10 +167,11 @@ impl SmugMugApi {
         name: &str,
         privacy: ContainerPrivacy,
     ) -> Result<RemoteContainerId, PublishError> {
-        match self.find_child_album(parent_node, name).await? {
-            Some(existing) => Ok(existing),
-            None => self.create_album(parent_node, name, privacy).await,
-        }
+        let node = match self.find_child_album(parent_node, name).await? {
+            Some(existing) => existing,
+            None => self.create_album(parent_node, name, privacy).await?,
+        };
+        album_of(&node)
     }
 
     /// Everything the album already holds, across every page.
@@ -176,6 +198,10 @@ impl SmugMugApi {
         }
 
         Ok(images)
+    }
+
+    fn children_url(&self, parent_node: &str) -> String {
+        format!("{}{parent_node}!children?count={PAGE_SIZE}", self.base_url)
     }
 
     fn authorization(&self, method: &str, url: &str) -> String {
@@ -238,7 +264,7 @@ enum Created {
 
 /// An album node with no album URI cannot be published to, and saying so here
 /// beats handing the node URI to an upload that will reject it.
-fn album_of(node: &ChildNode) -> Result<RemoteContainerId, PublishError> {
+pub(super) fn album_of(node: &ChildNode) -> Result<RemoteContainerId, PublishError> {
     node.album_uri()
         .map(|uri| RemoteContainerId(uri.to_string()))
         .ok_or_else(|| {
@@ -550,6 +576,159 @@ mod tests {
             .unwrap();
 
         assert_eq!(album, RemoteContainerId(album_uri("Iceland 2026")));
+    }
+
+    #[tokio::test]
+    async fn list_children_reads_folders_and_albums_across_every_page() {
+        let server = MockServer::start().await;
+        let next = format!("{ROOT}!children?start=3&count=2");
+        Mock::given(method("GET"))
+            .and(path(format!("{ROOT}!children")))
+            .and(query_param_is_missing("start"))
+            .respond_with(ok(children_page(
+                vec![child("Travel", "Folder"), child("Faroes 2025", "Album")],
+                Some(&next),
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{ROOT}!children")))
+            .and(query_param("start", "3"))
+            .respond_with(ok(children_page(
+                vec![child("Iceland 2026", "Album")],
+                None,
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let nodes = api(&server).list_children(ROOT).await.unwrap();
+
+        let listed: Vec<(&str, bool)> = nodes
+            .iter()
+            .map(|node| (node.name.as_str(), node.is_album()))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("Travel", false),
+                ("Faroes 2025", true),
+                ("Iceland 2026", true)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_children_lists_a_folder() {
+        let server = MockServer::start().await;
+        let folder = "/api/v2/node/Travel";
+        Mock::given(method("GET"))
+            .and(path(format!("{folder}!children")))
+            .respond_with(ok(children_page(
+                vec![child("Iceland 2026", "Album")],
+                None,
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let nodes = api(&server).list_children(folder).await.unwrap();
+
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0].album_uri(),
+            Some(album_uri("Iceland 2026").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn find_child_album_hands_back_the_node_it_matched_exactly() {
+        let server = MockServer::start().await;
+        mount_children(
+            &server,
+            children_page(
+                vec![
+                    child("Iceland 2026 Draft", "Album"),
+                    child("iceland 2026", "Album"),
+                    child("Iceland 2026", "Folder"),
+                    child("Iceland 2026", "Album"),
+                ],
+                None,
+            ),
+        )
+        .await;
+
+        let found = api(&server)
+            .find_child_album(ROOT, "Iceland 2026")
+            .await
+            .unwrap()
+            .expect("the exact album");
+
+        assert!(found.is_album());
+        assert_eq!(found.album_uri(), Some(album_uri("Iceland 2026").as_str()));
+        assert_eq!(
+            api(&server)
+                .find_child_album(ROOT, "Iceland")
+                .await
+                .unwrap()
+                .map(|node| node.name),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn create_album_hands_back_the_created_node() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("{ROOT}!children")))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_raw(created_node("Iceland 2026"), "application/json"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let node = api(&server)
+            .create_album(ROOT, "Iceland 2026", ContainerPrivacy::Unlisted)
+            .await
+            .unwrap();
+
+        assert_eq!(node.name, "Iceland 2026");
+        assert_eq!(node.album_uri(), Some(album_uri("Iceland 2026").as_str()));
+    }
+
+    #[tokio::test]
+    async fn album_reads_one_album_without_changing_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/album/AbCdEf"))
+            .respond_with(ok(json!({
+                "Response": { "Album": {
+                    "Name": "Iceland 2026",
+                    "Uri": "/api/v2/album/AbCdEf",
+                    "WebUri": "https://somephotographer.smugmug.com/Iceland-2026",
+                    "Uris": { "Node": { "Uri": "/api/v2/node/1c3l4nd" } }
+                }},
+                "Code": 200
+            })
+            .to_string()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        forbid_creation(&server).await;
+
+        let album = api(&server)
+            .album(&RemoteContainerId("/api/v2/album/AbCdEf".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(album.name, "Iceland 2026");
+        assert_eq!(album.node_uri, "/api/v2/node/1c3l4nd");
+        for request in server.received_requests().await.unwrap() {
+            assert_eq!(request.method.as_str(), "GET", "{}", request.url);
+        }
     }
 
     #[tokio::test]

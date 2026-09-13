@@ -128,12 +128,15 @@ pub struct ChildNode {
     pub name: String,
     #[serde(rename = "Type")]
     pub node_type: String,
+    /// The node, which is what browsing drills into. Never where uploads go.
     #[serde(rename = "Uri")]
-    #[allow(
-        dead_code,
-        reason = "kept beside `album_uri` so the two are not confused"
-    )]
     pub uri: String,
+    /// The page on the account's site, which the panel opens.
+    #[serde(rename = "WebUri", default)]
+    pub web_uri: Option<String>,
+    /// Absent on an album, which holds images rather than nodes.
+    #[serde(rename = "HasChildren", default)]
+    pub has_children: bool,
     #[serde(rename = "Uris", default)]
     uris: ChildNodeUris,
 }
@@ -189,6 +192,52 @@ struct CreatedNodeResponse {
 /// Reads the node a `POST <node>!children` created.
 pub fn parse_created_node(body: &str) -> Result<ChildNode, PublishError> {
     Ok(parse_envelope::<CreatedNodeResponse>("album creation", body)?.node)
+}
+
+/// One album, from `GET /api/v2/album/<key>`: what linking to it records.
+///
+/// `node_uri` is required for the same reason as on [`AuthUser`]: an album is
+/// always in a node, and one without says the response is not what it seems.
+#[derive(Debug, Clone)]
+pub struct Album {
+    pub name: String,
+    pub uri: String,
+    pub web_uri: Option<String>,
+    pub node_uri: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AlbumResponse {
+    #[serde(rename = "Album")]
+    album: RawAlbum,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAlbum {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Uri")]
+    uri: String,
+    #[serde(rename = "WebUri", default)]
+    web_uri: Option<String>,
+    #[serde(rename = "Uris")]
+    uris: AlbumUris,
+}
+
+#[derive(Debug, Deserialize)]
+struct AlbumUris {
+    #[serde(rename = "Node")]
+    node: UriRef,
+}
+
+pub fn parse_album(body: &str) -> Result<Album, PublishError> {
+    let raw = parse_envelope::<AlbumResponse>("album", body)?.album;
+    Ok(Album {
+        name: raw.name,
+        uri: raw.uri,
+        web_uri: raw.web_uri,
+        node_uri: raw.uris.node.uri,
+    })
 }
 
 /// What an album already holds, as far as republish needs to know: enough to
@@ -355,7 +404,9 @@ mod tests {
                     "Name": "Faroes 2025",
                     "Type": "Folder",
                     "Uri": "/api/v2/node/f4r0e5",
-                    "UrlName": "Faroes-2025"
+                    "UrlName": "Faroes-2025",
+                    "WebUri": "https://somephotographer.smugmug.com/Faroes-2025",
+                    "HasChildren": true
                 },
                 {
                     "Name": "Iceland 2026",
@@ -387,6 +438,49 @@ mod tests {
         assert!(page.nodes[1].is_album());
         assert_eq!(page.nodes[1].name, "Iceland 2026");
         assert_eq!(page.nodes[1].album_uri(), Some("/api/v2/album/AbCdEf"));
+    }
+
+    #[test]
+    fn reads_the_web_address_and_whether_a_node_has_children() {
+        let page = parse_node_children(CHILDREN_BODY).unwrap();
+        assert!(page.nodes[0].has_children);
+        assert_eq!(
+            page.nodes[0].web_uri.as_deref(),
+            Some("https://somephotographer.smugmug.com/Faroes-2025")
+        );
+        assert!(
+            !page.nodes[1].has_children,
+            "absent is false, as on an album"
+        );
+        assert_eq!(page.nodes[1].web_uri, None);
+    }
+
+    #[test]
+    fn reads_an_album_with_its_node() {
+        let body = r#"{
+            "Response": {
+                "Uri": "/api/v2/album/AbCdEf",
+                "Album": {
+                    "Name": "Iceland 2026",
+                    "Uri": "/api/v2/album/AbCdEf",
+                    "WebUri": "https://somephotographer.smugmug.com/Iceland-2026",
+                    "Privacy": "Unlisted",
+                    "Uris": {
+                        "Node": { "Uri": "/api/v2/node/1c3l4nd" },
+                        "AlbumImages": { "Uri": "/api/v2/album/AbCdEf!images" }
+                    }
+                }
+            },
+            "Code": 200
+        }"#;
+        let album = parse_album(body).unwrap();
+        assert_eq!(album.name, "Iceland 2026");
+        assert_eq!(album.uri, "/api/v2/album/AbCdEf");
+        assert_eq!(album.node_uri, "/api/v2/node/1c3l4nd");
+        assert_eq!(
+            album.web_uri.as_deref(),
+            Some("https://somephotographer.smugmug.com/Iceland-2026")
+        );
     }
 
     #[test]

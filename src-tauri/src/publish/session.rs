@@ -93,42 +93,51 @@ impl PublishRequest {
     /// above it. `None` when no album has that id — a group's id included,
     /// since phase 1 publishes one album at a time.
     pub fn from_album_tree(tree: &[AlbumItem], album_id: &str) -> Option<Self> {
-        fn find(
-            items: &[AlbumItem],
-            album_id: &str,
-            parents: &mut Vec<String>,
-        ) -> Option<PublishRequest> {
-            for item in items {
-                match item {
-                    AlbumItem::Album {
-                        id, name, images, ..
-                    } if id == album_id => {
-                        return Some(PublishRequest {
-                            album: LocalContainer {
-                                album_id: id.clone(),
-                                name: name.clone(),
-                                parent_path: parents.clone(),
-                            },
-                            paths: images.clone(),
-                            albums: AlbumMembership::default(),
-                        });
+        let (album, images) = find_album(tree, album_id)?;
+        Some(PublishRequest {
+            album,
+            paths: images.to_vec(),
+            albums: AlbumMembership::from_tree(tree),
+        })
+    }
+}
+
+/// The album `album_id` anywhere in the tree, with the names of the groups
+/// above it and its photos. `None` for a group's id, which holds no photos.
+pub fn find_album<'t>(
+    tree: &'t [AlbumItem],
+    album_id: &str,
+) -> Option<(LocalContainer, &'t [String])> {
+    fn find<'t>(
+        items: &'t [AlbumItem],
+        album_id: &str,
+        parents: &mut Vec<String>,
+    ) -> Option<(LocalContainer, &'t [String])> {
+        for item in items {
+            match item {
+                AlbumItem::Album {
+                    id, name, images, ..
+                } if id == album_id => {
+                    let album = LocalContainer {
+                        album_id: id.clone(),
+                        name: name.clone(),
+                        parent_path: parents.clone(),
+                    };
+                    return Some((album, images));
+                }
+                AlbumItem::Album { .. } => {}
+                AlbumItem::Group { name, children, .. } => {
+                    parents.push(name.clone());
+                    if let Some(found) = find(children, album_id, parents) {
+                        return Some(found);
                     }
-                    AlbumItem::Album { .. } => {}
-                    AlbumItem::Group { name, children, .. } => {
-                        parents.push(name.clone());
-                        if let Some(found) = find(children, album_id, parents) {
-                            return Some(found);
-                        }
-                        parents.pop();
-                    }
+                    parents.pop();
                 }
             }
-            None
         }
-        let mut request = find(tree, album_id, &mut Vec::new())?;
-        request.albums = AlbumMembership::from_tree(tree);
-        Some(request)
+        None
     }
+    find(tree, album_id, &mut Vec::new())
 }
 
 /// What publishing would do, counted without rendering or uploading.
@@ -329,13 +338,28 @@ impl<'a> PublishSession<'a> {
             return Ok(run.summary);
         }
 
-        let container = self
-            .destination
-            .ensure_container(&request.album, self.ctx)
-            .await?;
-        run.state
-            .record_link(&request.album.album_id, &container, None);
-        run.save()?;
+        let container = match run.state.link(&request.album.album_id) {
+            Some(link) if link.broken => {
+                return Err(PublishError::Rejected(format!(
+                    "the linked album no longer exists on {}. Link \"{}\" to another album first",
+                    self.destination.display_name(),
+                    request.album.name
+                )));
+            }
+            Some(link) => RemoteContainerId(link.remote_uri.clone()),
+            // Phase 1's fallback, until the panel links every album first:
+            // find or create a remote album by name, and link it.
+            None => {
+                let container = self
+                    .destination
+                    .ensure_container(&request.album, self.ctx)
+                    .await?;
+                run.state
+                    .record_link(&request.album.album_id, &container, None);
+                run.save()?;
+                container
+            }
+        };
 
         // Every skip is decided here, before the spool exists and before
         // anything is rendered.
@@ -941,7 +965,8 @@ mod tests {
 
     use super::*;
     use crate::publish::{
-        AuthChallenge, ContainerPrivacy, DestinationCapabilities, state::PublishState,
+        AuthChallenge, ContainerPrivacy, DestinationCapabilities, RemoteNode, RemoteNodeId,
+        state::PublishState,
     };
 
     const DESTINATION: &str = "stub";
@@ -1164,6 +1189,38 @@ mod tests {
         }
 
         async fn disconnect(&self, _ctx: &PublishContext) -> Result<(), PublishError> {
+            unimplemented!()
+        }
+
+        async fn list_containers(
+            &self,
+            _parent: Option<&RemoteNodeId>,
+            _ctx: &PublishContext,
+        ) -> Result<Vec<RemoteNode>, PublishError> {
+            unimplemented!()
+        }
+
+        async fn find_container(
+            &self,
+            _name: &str,
+            _ctx: &PublishContext,
+        ) -> Result<Option<RemoteNode>, PublishError> {
+            unimplemented!()
+        }
+
+        async fn create_container(
+            &self,
+            _name: &str,
+            _ctx: &PublishContext,
+        ) -> Result<RemoteNode, PublishError> {
+            unimplemented!()
+        }
+
+        async fn container(
+            &self,
+            _id: &RemoteContainerId,
+            _ctx: &PublishContext,
+        ) -> Result<RemoteNode, PublishError> {
             unimplemented!()
         }
 
@@ -1614,6 +1671,90 @@ mod tests {
             third.uploads.lock().unwrap().clone(),
             vec![(file_name(2), Some(image_id("album-2", &file_name(2))))],
             "an edit replaces the copy in the album being published"
+        );
+    }
+
+    /// A remote album the user chose, whose URI is not what finding one by
+    /// name would produce.
+    const CHOSEN: &str = "/api/v2/album/ChosenOnSmugMug";
+
+    #[tokio::test]
+    async fn a_linked_album_publishes_into_its_link_without_a_lookup() {
+        let harness = Harness::new();
+        let pipeline = StubPipeline::new(&harness.spool_base());
+        let destination = StubDestination::new(&harness.spool_base());
+        let mut state = harness.state();
+        state.record_link(ALBUM, &RemoteContainerId(CHOSEN.into()), None);
+        state.save_in(&harness.ctx.state_dir).unwrap();
+
+        let summary = harness.run(&destination, &pipeline, paths(1..=2)).await;
+
+        assert_eq!(summary.uploaded, 2);
+        assert!(
+            !destination
+                .log
+                .lock()
+                .unwrap()
+                .contains(&"ensure_container".to_string()),
+            "an explicit link is never replaced by a same-named album"
+        );
+        assert!(
+            destination
+                .containers
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, container)| container == CHOSEN)
+        );
+        assert_eq!(harness.state().link(ALBUM).unwrap().remote_uri, CHOSEN);
+        assert!(harness.state().image_for(ALBUM, &path(1)).is_some());
+    }
+
+    #[tokio::test]
+    async fn an_unlinked_album_is_still_found_or_created_by_name() {
+        let harness = Harness::new();
+        let pipeline = StubPipeline::new(&harness.spool_base());
+        let destination = StubDestination::new(&harness.spool_base());
+
+        harness.run(&destination, &pipeline, paths(1..=1)).await;
+
+        assert_eq!(destination.log.lock().unwrap()[0], "ensure_container");
+        assert_eq!(
+            harness.state().link(ALBUM).unwrap().remote_uri,
+            album_uri(ALBUM)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_broken_link_is_not_published_into() {
+        let harness = Harness::new();
+        let pipeline = StubPipeline::new(&harness.spool_base());
+        let destination = StubDestination::new(&harness.spool_base());
+        std::fs::create_dir_all(&harness.ctx.state_dir).unwrap();
+        let mut state = harness.state();
+        state.record_link(ALBUM, &RemoteContainerId(CHOSEN.into()), None);
+        state.save_in(&harness.ctx.state_dir).unwrap();
+        let mut written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(harness.state_file()).unwrap()).unwrap();
+        written["links"][ALBUM]["broken"] = true.into();
+        std::fs::write(harness.state_file(), written.to_string()).unwrap();
+
+        let recorder = Arc::clone(&harness.events);
+        let events: EventSink = Arc::new(move |event| recorder.lock().unwrap().push(event));
+        let result = PublishSession::new(
+            &destination,
+            &pipeline,
+            &harness.ctx,
+            harness.spool_base(),
+            events,
+        )
+        .run(request(ALBUM, paths(1..=2)))
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            destination.log.lock().unwrap().is_empty(),
+            "nothing is created in its place and nothing uploads"
         );
     }
 

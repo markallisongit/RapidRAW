@@ -2263,6 +2263,10 @@ pub fn run() {
             publish::commands::publish_preview,
             publish::commands::publish_album,
             publish::commands::publish_cancel,
+            publish::commands::publish_list_remote,
+            publish::commands::publish_list_links,
+            publish::commands::publish_link_album,
+            publish::commands::publish_unlink,
             // --- end publish ---
         ])
         .build(tauri::generate_context!())
