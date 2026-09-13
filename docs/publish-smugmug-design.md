@@ -227,8 +227,10 @@ src-tauri/src/publish/
                        upload.rs (raw-body POST, retry, reconcile) · model.rs
 
 src/components/panel/right/publish/
-  PublishPanel.tsx · SmugMugAuthCard.tsx · PublishProgress.tsx
+  PublishPanel.tsx · PublishProgress.tsx · output.ts (preset summary, format checks)
   usePublishState.ts · publish.i18n.ts
+  manager/             PublishManagerModal.tsx (portal, destination list, Save/Cancel)
+                       SmugMugAccountSection.tsx · OutputSection.tsx · NewAlbumsSection.tsx
 ```
 
 ## OAuth flow

@@ -2,42 +2,30 @@ import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useShallow } from 'zustand/react/shallow';
 import { motion } from 'framer-motion';
-import { AlertTriangle, ArrowUpRight, Loader, UploadCloud } from 'lucide-react';
+import { AlertTriangle, ArrowUpRight, Loader, Settings, UploadCloud } from 'lucide-react';
 
 import Button from '../../../ui/Button';
 import Dropdown from '../../../ui/Dropdown';
 import Text from '../../../ui/Text';
 import { AlbumItem, Panel } from '../../../ui/AppProperties';
-import {
-  ExportPreset,
-  ExportSettings,
-  FILE_FORMATS,
-  FileFormats,
-  WatermarkAnchor,
-} from '../../../ui/ExportImportProperties';
 import { TextColors, TextVariants, TextWeights } from '../../../../types/typography';
 import { useExportSettings } from '../../../../hooks/useExportSettings';
 import { useLibraryStore } from '../../../../store/useLibraryStore';
 import { useSettingsStore } from '../../../../store/useSettingsStore';
 import { useUIStore } from '../../../../store/useUIStore';
+import PublishManagerModal from './manager/PublishManagerModal';
+import { LAST_USED_PRESET_ID, describeOutput, formatOf, formatSupport, toExportSettings } from './output';
 import PublishProgress from './PublishProgress';
-import SmugMugAuthCard from './SmugMugAuthCard';
-import { PublishPreview, PublishTarget, displayError, isPresetMissing, usePublishState } from './usePublishState';
+import {
+  PublishPreview,
+  PublishTarget,
+  displayError,
+  isPresetMissing,
+  usePublishManager,
+  usePublishState,
+} from './usePublishState';
 
 const DESTINATION_ID = 'smugmug';
-
-/** The extension-to-MIME mapping `ExportPipeline::mime` applies in the backend. */
-const MIME_BY_EXTENSION: Record<string, string> = {
-  jpg: 'image/jpeg',
-  jpeg: 'image/jpeg',
-  png: 'image/png',
-  tif: 'image/tiff',
-  tiff: 'image/tiff',
-  webp: 'image/webp',
-  jxl: 'image/jxl',
-};
-
-const QUALITY_FORMATS: string[] = [FileFormats.Jpeg, FileFormats.Webp, FileFormats.Jxl];
 
 interface PublishableAlbum {
   id: string;
@@ -61,29 +49,16 @@ const flattenAlbums = (items: AlbumItem[], parents: string[] = []): PublishableA
       : flattenAlbums(item.children, [...parents, item.name]),
   );
 
-/** The same `ExportSettings` the Export panel builds from these values. */
-const toExportSettings = (s: Omit<ExportPreset, 'id' | 'name'>): ExportSettings => ({
-  filenameTemplate: s.filenameTemplate,
-  jpegQuality: s.jpegQuality,
-  keepMetadata: s.keepMetadata,
-  preserveTimestamps: s.preserveTimestamps,
-  preserveFolders: s.preserveFolders,
-  destinationType: s.destinationType,
-  subfolder: s.subfolder,
-  resize: s.enableResize ? { mode: s.resizeMode, value: s.resizeValue, dontEnlarge: s.dontEnlarge } : null,
-  stripGps: s.stripGps,
-  exportMasks: s.exportMasks,
-  watermark:
-    s.enableWatermark && s.watermarkPath
-      ? {
-          path: s.watermarkPath,
-          anchor: s.watermarkAnchor as WatermarkAnchor,
-          scale: s.watermarkScale,
-          spacing: s.watermarkSpacing,
-          opacity: s.watermarkOpacity,
-        }
-      : null,
-});
+function Warning({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="flex items-start gap-2 bg-yellow-500/10 rounded-md p-3">
+      <AlertTriangle size={16} className="shrink-0 mt-0.5 text-yellow-400" />
+      <Text variant={TextVariants.small} color={TextColors.primary}>
+        {children}
+      </Text>
+    </div>
+  );
+}
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -101,8 +76,9 @@ export default function PublishPanel() {
   const { t } = useTranslation();
   const isVisible = useUIStore((state) => Object.values(state.activePanels).includes(Panel.Publish));
   const api = usePublishState(DESTINATION_ID, isVisible);
-  const { authStatus, authError, destination, session } = api;
+  const { authStatus, authError, destination, session, settings } = api;
   const destinationName = destination?.display_name ?? 'SmugMug';
+  const { openManager } = usePublishManager();
 
   const appSettings = useSettingsStore((state) => state.appSettings);
   const setPanel = useUIStore((state) => state.setPanel);
@@ -110,10 +86,10 @@ export default function PublishPanel() {
     useShallow((state) => ({ albumTree: state.albumTree, activeAlbumId: state.activeAlbumId })),
   );
 
-  // Export settings come from the Export panel's last-used preset, through
-  // the same hook and defaults, rather than from a second settings UI.
+  // Interim, until #21 requires a preset: with none chosen, publishing uses
+  // the Export panel's last-used settings, through the same hook and defaults.
   const { currentSettingsObject, handleApplyPreset } = useExportSettings();
-  const lastUsedPreset = appSettings?.exportPresets?.find((p) => p.id === '__last_used__');
+  const lastUsedPreset = appSettings?.exportPresets?.find((p) => p.id === LAST_USED_PRESET_ID);
   useEffect(() => {
     if (lastUsedPreset) handleApplyPreset(lastUsedPreset);
   }, [lastUsedPreset, handleApplyPreset]);
@@ -125,21 +101,18 @@ export default function PublishPanel() {
   }, [activeAlbumId, albums]);
   const album = albums.find((a) => a.id === selectedAlbumId) ?? null;
 
-  const format = FILE_FORMATS.find((f) => f.id === currentSettingsObject.fileFormat) ?? FILE_FORMATS[0];
-  const outputFormat = format.extensions[0];
-  const acceptedMimes = destination?.capabilities.accepted_mime_types ?? [];
-  const isFormatAccepted = acceptedMimes.includes(MIME_BY_EXTENSION[outputFormat] ?? '');
-  const acceptedFormatNames = FILE_FORMATS.filter((f) => acceptedMimes.includes(MIME_BY_EXTENSION[f.extensions[0]]))
-    .map((f) => f.name)
-    .join(', ');
+  const presetId = settings?.export_preset_id ?? null;
+  const preset = presetId === null ? null : (appSettings?.exportPresets?.find((p) => p.id === presetId) ?? null);
+  // What publishing renders with; unknown when the chosen preset has been deleted.
+  const output = presetId === null ? currentSettingsObject : preset;
+  const outputFormat = formatOf(currentSettingsObject.fileFormat).extensions[0];
+  const support = formatSupport(destination, output?.fileFormat ?? currentSettingsObject.fileFormat);
+  const isFormatAccepted = support.isAccepted;
 
   const target: PublishTarget | null = useMemo(
     () => (album ? { albumId: album.id, exportSettings: toExportSettings(currentSettingsObject), outputFormat } : null),
     [album, currentSettingsObject, outputFormat],
   );
-
-  const [editing, setEditing] = useState<'configure' | 'authorise' | null>(null);
-  useEffect(() => setEditing(null), [authStatus]);
 
   const isConnected = authStatus?.status === 'Connected';
   const [preview, setPreview] = useState<PublishPreview | null>(null);
@@ -149,7 +122,7 @@ export default function PublishPanel() {
   useEffect(() => {
     setPreview(null);
     setPreviewError(null);
-    if (!isVisible || !isConnected || !target || !isFormatAccepted || session.phase !== 'idle') return;
+    if (!isVisible || !isConnected || !target || !output || !isFormatAccepted || session.phase !== 'idle') return;
 
     let isCurrent = true;
     setIsPreviewing(true);
@@ -169,29 +142,12 @@ export default function PublishPanel() {
     return () => {
       isCurrent = false;
     };
-  }, [isVisible, isConnected, target, album?.images, isFormatAccepted, session.phase, api.preview, t]);
-
-  const resizeModeLabels: Record<string, string> = {
-    longEdge: t('export.resize.modes.longEdge'),
-    shortEdge: t('export.resize.modes.shortEdge'),
-    width: t('export.resize.modes.width'),
-    height: t('export.resize.modes.height'),
-  };
-  const settingsSummary = [
-    format.name,
-    QUALITY_FORMATS.includes(format.id) &&
-      t('publish.settings.quality', { quality: currentSettingsObject.jpegQuality }),
-    currentSettingsObject.enableResize
-      ? `${resizeModeLabels[currentSettingsObject.resizeMode] ?? ''} ${currentSettingsObject.resizeValue} px`
-      : t('publish.settings.fullSize'),
-    currentSettingsObject.enableWatermark && currentSettingsObject.watermarkPath && t('publish.settings.watermark'),
-  ]
-    .filter(Boolean)
-    .join(' · ');
+  }, [isVisible, isConnected, target, album?.images, output, isFormatAccepted, session.phase, api.preview, t]);
 
   // Interim, until #21 asks: settings-only changes republish, as they always have.
   const toPublish = preview ? preview.new + preview.update + preview.settings_changed : 0;
-  const canPublish = isConnected && !!album && album.images.length > 0 && isFormatAccepted && !isPreviewing;
+  const canPublish =
+    isConnected && !!album && album.images.length > 0 && output !== null && isFormatAccepted && !isPreviewing;
 
   const renderBody = () => {
     if (authError) {
@@ -211,23 +167,22 @@ export default function PublishPanel() {
         </Text>
       );
     }
-    if (authStatus.status === 'NotConfigured' || editing === 'configure') {
+    if (authStatus.status !== 'Connected') {
+      const hasKey = authStatus.status === 'NotAuthorised';
       return (
-        <SmugMugAuthCard
-          api={api}
-          mode="configure"
-          onCancel={authStatus.status !== 'NotConfigured' ? () => setEditing(null) : undefined}
-        />
-      );
-    }
-    if (authStatus.status === 'NotAuthorised' || editing === 'authorise') {
-      return (
-        <SmugMugAuthCard
-          api={api}
-          mode="authorise"
-          onChangeKey={() => setEditing('configure')}
-          onCancel={authStatus.status === 'Connected' ? () => setEditing(null) : undefined}
-        />
+        <div className="space-y-3">
+          <Text>
+            {hasKey
+              ? t('publish.prompt.notConnected', { destination: destinationName })
+              : t('publish.prompt.notSetUp', { destination: destinationName })}
+          </Text>
+          <Button onClick={() => openManager(DESTINATION_ID, hasKey ? 'account' : 'apiKey')}>
+            <Settings size={16} />
+            {hasKey
+              ? t('publish.prompt.connect', { destination: destinationName })
+              : t('publish.prompt.setUp', { destination: destinationName })}
+          </Button>
+        </div>
       );
     }
 
@@ -235,20 +190,6 @@ export default function PublishPanel() {
       <>
         <Section title={t('publish.connected.heading')}>
           <Text color={TextColors.primary}>{t('publish.connected.account', { account: authStatus.account })}</Text>
-          <div className="flex gap-4">
-            <button
-              className="text-sm text-text-secondary hover:text-text-primary"
-              onClick={() => setEditing('authorise')}
-            >
-              {t('publish.connected.reconnect')}
-            </button>
-            <button
-              className="text-sm text-text-secondary hover:text-text-primary"
-              onClick={() => setEditing('configure')}
-            >
-              {t('publish.connected.changeKey')}
-            </button>
-          </div>
         </Section>
 
         <Section title={t('publish.album.heading')}>
@@ -275,31 +216,45 @@ export default function PublishPanel() {
         </Section>
 
         <Section title={t('publish.settings.heading')}>
-          <Text>{t('publish.settings.current')}</Text>
-          <Text color={TextColors.primary} weight={TextWeights.medium}>
-            {settingsSummary}
-          </Text>
-          {!isFormatAccepted && acceptedMimes.length > 0 && (
-            <div className="flex items-start gap-2 bg-yellow-500/10 rounded-md p-3">
-              <AlertTriangle size={16} className="shrink-0 mt-0.5 text-yellow-400" />
-              <Text variant={TextVariants.small} color={TextColors.primary}>
-                {t('publish.settings.unsupportedFormat', {
-                  destination: destinationName,
-                  formats: acceptedFormatNames,
-                })}
+          {output ? (
+            <>
+              <Text>
+                {preset ? t('publish.settings.preset', { name: preset.name }) : t('publish.settings.current')}
               </Text>
-            </div>
+              <Text color={TextColors.primary} weight={TextWeights.medium}>
+                {describeOutput(output, t)}
+              </Text>
+            </>
+          ) : (
+            <Warning>{t('publish.errors.presetMissing')}</Warning>
+          )}
+          {!isFormatAccepted && (
+            <Warning>
+              {t(preset ? 'publish.settings.unsupportedPresetFormat' : 'publish.settings.unsupportedFormat', {
+                destination: destinationName,
+                formats: support.acceptedNames,
+              })}
+            </Warning>
+          )}
+          {presetId === null && (
+            <button
+              className="flex items-center gap-1 text-sm text-accent hover:underline"
+              onClick={() => setPanel(Panel.Export)}
+            >
+              {t('publish.settings.openExport')}
+              <ArrowUpRight size={14} />
+            </button>
           )}
           <button
             className="flex items-center gap-1 text-sm text-accent hover:underline"
-            onClick={() => setPanel(Panel.Export)}
+            onClick={() => openManager(DESTINATION_ID, 'output')}
           >
-            {t('publish.settings.openExport')}
+            {preset ? t('publish.settings.changePreset') : t('publish.settings.choosePreset')}
             <ArrowUpRight size={14} />
           </button>
         </Section>
 
-        {album && album.images.length > 0 && isFormatAccepted && (
+        {album && album.images.length > 0 && output && isFormatAccepted && (
           <Section title={t('publish.preview.heading')}>
             {isPreviewing ? (
               <Text className="flex items-center gap-2 italic">
@@ -335,6 +290,14 @@ export default function PublishPanel() {
     <div className="flex flex-col h-full">
       <div className="p-3 flex justify-between items-center shrink-0 border-b border-surface">
         <Text variant={TextVariants.title}>{t('publish.panel.title')}</Text>
+        <button
+          aria-label={t('publish.manager.title')}
+          className="p-1.5 rounded-md text-text-secondary hover:text-text-primary hover:bg-surface transition-colors"
+          data-tooltip={t('publish.manager.title')}
+          onClick={() => openManager(DESTINATION_ID)}
+        >
+          <Settings size={18} />
+        </button>
       </div>
 
       {session.phase !== 'idle' ? (
@@ -342,7 +305,7 @@ export default function PublishPanel() {
       ) : (
         <>
           <div className="grow overflow-y-auto p-3 space-y-8">{renderBody()}</div>
-          {isConnected && editing === null && (
+          {isConnected && (
             <div className="p-3 border-t border-surface shrink-0">
               <motion.div
                 whileTap={canPublish ? { scale: 0.98 } : undefined}
@@ -365,6 +328,8 @@ export default function PublishPanel() {
           )}
         </>
       )}
+
+      <PublishManagerModal />
     </div>
   );
 }

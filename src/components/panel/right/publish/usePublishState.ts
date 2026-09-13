@@ -171,6 +171,8 @@ interface DestinationEntry {
   authStatus: AuthStatus | null;
   authError: string | null;
   challenge: AuthChallenge | null;
+  /** As last saved, so the panel follows what the manager saves. */
+  settings: DestinationSettings | null;
 }
 
 const EMPTY_DESTINATION: DestinationEntry = {
@@ -178,12 +180,24 @@ const EMPTY_DESTINATION: DestinationEntry = {
   authStatus: null,
   authError: null,
   challenge: null,
+  settings: null,
 };
+
+export type ManagerSection = 'account' | 'apiKey' | 'output' | 'newAlbums';
+
+/** Which destination the Publish Manager opens on, and the section to bring into view. */
+export interface ManagerRequest {
+  destinationId: string;
+  section: ManagerSection | null;
+}
 
 interface PublishStore {
   destinations: Record<string, DestinationEntry>;
+  /** Every destination the backend offers, in its order. */
+  catalogue: DestinationInfo[] | null;
   /** One for the app: the backend runs a single session, and its events name no destination. */
   session: PublishSessionState;
+  manager: ManagerRequest | null;
 }
 
 /**
@@ -192,7 +206,12 @@ interface PublishStore {
  * cannot be asked what one is doing after the fact, so progress and a pending
  * authorisation have to outlive the panel.
  */
-const usePublishStore = create<PublishStore>(() => ({ destinations: {}, session: IDLE_SESSION }));
+const usePublishStore = create<PublishStore>(() => ({
+  destinations: {},
+  catalogue: null,
+  session: IDLE_SESSION,
+  manager: null,
+}));
 
 const updateDestination = (destinationId: string, patch: Partial<DestinationEntry>) =>
   usePublishStore.setState((state) => ({
@@ -236,7 +255,7 @@ const listenForSessionEvents = () => {
  * The publish commands and session events for one destination.
  */
 export function usePublishState(destinationId: string, isActive: boolean) {
-  const { destination, authStatus, authError, challenge } = usePublishStore(
+  const { destination, authStatus, authError, challenge, settings } = usePublishStore(
     useShallow((state) => state.destinations[destinationId] ?? EMPTY_DESTINATION),
   );
   const session = usePublishStore((state) => state.session);
@@ -250,6 +269,7 @@ export function usePublishState(destinationId: string, isActive: boolean) {
         invoke<DestinationInfo[]>('publish_get_destinations'),
         invoke<AuthStatus>('publish_get_auth_status', { destinationId }),
       ]);
+      usePublishStore.setState({ catalogue: destinations });
       updateDestination(destinationId, {
         destination: destinations.find((d) => d.id === destinationId) ?? null,
         authStatus: status,
@@ -296,13 +316,30 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     [destinationId, refreshAuth],
   );
 
-  const getSettings = useCallback(
-    () => invoke<DestinationSettings>('publish_get_settings', { destinationId }),
-    [destinationId],
-  );
+  const refreshSettings = useCallback(async () => {
+    const next = await invoke<DestinationSettings>('publish_get_settings', { destinationId });
+    updateDestination(destinationId, { settings: next });
+    return next;
+  }, [destinationId]);
 
-  const setSettings = useCallback(
-    (settings: DestinationSettings) => invoke('publish_set_settings', { destinationId, settings }),
+  useEffect(() => {
+    if (isActive && settings === null) refreshSettings().catch((error) => console.error('Publish settings:', error));
+  }, [isActive, settings, refreshSettings]);
+
+  /**
+   * `keepExistingUploads` marks every published photo current with the new
+   * preset before the store changes, so the panel never previews them as
+   * changed in between.
+   */
+  const saveSettings = useCallback(
+    async (next: DestinationSettings, keepExistingUploads = false) => {
+      await invoke('publish_set_settings', { destinationId, settings: next });
+      try {
+        if (keepExistingUploads) await invoke<number>('publish_keep_existing_uploads', { destinationId });
+      } finally {
+        updateDestination(destinationId, { settings: next });
+      }
+    },
     [destinationId],
   );
 
@@ -358,12 +395,6 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     [destinationId],
   );
 
-  /** After switching preset: marks every published photo current with it, so none uploads again. */
-  const keepExistingUploads = useCallback(
-    () => invoke<number>('publish_keep_existing_uploads', { destinationId }),
-    [destinationId],
-  );
-
   const cancel = useCallback(async () => {
     updateSession((current) => ({ ...current, phase: 'cancelling' }));
     try {
@@ -381,14 +412,15 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     authStatus,
     authError,
     challenge,
+    settings,
     session,
     refreshAuth,
     setCredentials,
     beginAuth,
     reopenAuthPage,
     completeAuth,
-    getSettings,
-    setSettings,
+    refreshSettings,
+    saveSettings,
     disconnect,
     listRemote,
     listLinks,
@@ -397,10 +429,32 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     preview,
     publish,
     settingsImpact,
-    keepExistingUploads,
     cancel,
     dismissSession,
   };
 }
 
 export type PublishStateApi = ReturnType<typeof usePublishState>;
+
+/** The element focused when the manager opened, given focus back when it closes. */
+let managerOpener: HTMLElement | null = null;
+
+export function usePublishManager() {
+  const request = usePublishStore((state) => state.manager);
+
+  const openManager = useCallback((destinationId: string, section: ManagerSection | null = null) => {
+    managerOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    usePublishStore.setState({ manager: { destinationId, section } });
+  }, []);
+
+  const closeManager = useCallback(() => {
+    usePublishStore.setState({ manager: null });
+    managerOpener?.focus();
+    managerOpener = null;
+  }, []);
+
+  return { request, openManager, closeManager };
+}
+
+/** Every destination, loaded by the first `usePublishState` to check its connection. */
+export const usePublishCatalogue = () => usePublishStore((state) => state.catalogue);
