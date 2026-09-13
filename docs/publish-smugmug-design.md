@@ -1,9 +1,11 @@
 # RapidRAW → SmugMug publishing
 
-**Design document** · 2026-09-12 · Mark Allison (with Claude)
+**Design document** · 2026-09-12, updated 2026-09-13 · Mark Allison (with Claude)
 Target: [CyberTimon/RapidRAW](https://github.com/CyberTimon/RapidRAW) · Fork: [markallisongit/RapidRAW](https://github.com/markallisongit/RapidRAW) · Branch: `feat/publish-destinations-smugmug`
 
 **Implementation:** tracked in [#13](https://github.com/markallisongit/RapidRAW/issues/13), broken into ordered issues [#1](https://github.com/markallisongit/RapidRAW/issues/1)–[#12](https://github.com/markallisongit/RapidRAW/issues/12). Each issue carries its own task detail; this document is the rationale only.
+
+**Status:** phase 1 complete — all twelve issues closed, and tested end-to-end against a live SmugMug account on 2026-09-13. Follow-up changes are tracked as their own issues.
 
 ## Summary
 
@@ -19,17 +21,17 @@ other destinations.
 
 ## Decisions
 
-| #   | Question      | Decision                                                                               |
-| --- | ------------- | -------------------------------------------------------------------------------------- |
-| 1   | Sync model    | Publish, phased. Remote-ID map + skip-unchanged in phase 1                             |
-| 2   | Mapping       | One RapidRAW `Album` → one SmugMug album under a chosen root folder. `Group` flattened |
-| 3   | Credentials   | User supplies their own API key/secret. Nothing embedded                               |
-| 4   | Token storage | OS keyring (`keyring` 4.2). Explicit error where unavailable, no plaintext fallback    |
-| 5   | OAuth         | Hand-rolled `oauth1` module over `hmac`/`sha1` (~150 lines)                            |
-| 6   | Callback      | Out-of-band verifier code. No loopback listener                                        |
-| 7   | Byte path     | Spool to managed temp dir, upload from disk, delete on success                         |
-| 8   | Pipeline      | Call existing `export_images_impl` unmodified with a temp output folder                |
-| 9   | Idempotency   | Stable `X-Smug-UploadRequestId` per image + post-timeout reconciliation                |
+| #   | Question      | Decision                                                                                           |
+| --- | ------------- | -------------------------------------------------------------------------------------------------- |
+| 1   | Sync model    | Publish, phased. Remote-ID map + skip-unchanged in phase 1                                         |
+| 2   | Mapping       | One RapidRAW `Album` → one SmugMug album under the account root. `Group` path folded into the name |
+| 3   | Credentials   | User supplies their own API key/secret. Nothing embedded                                           |
+| 4   | Token storage | OS keyring (`keyring` 4.2). Explicit error where unavailable, no plaintext fallback                |
+| 5   | OAuth         | Hand-rolled `oauth1` module over `hmac`/`sha1` (~150 lines)                                        |
+| 6   | Callback      | Out-of-band verifier code. No loopback listener                                                    |
+| 7   | Byte path     | Spool to managed temp dir, upload from disk, delete on success                                     |
+| 8   | Pipeline      | Call existing `export_images_impl` unmodified with a temp output folder                            |
+| 9   | Idempotency   | Stable `X-Smug-UploadRequestId` per image + post-timeout reconciliation                            |
 
 Rationale for the contentious ones. **User keys (3):** an embedded consumer secret in an
 open-source desktop binary is trivially extractable and puts CyberTimon on the hook for every
@@ -57,9 +59,9 @@ we need.
 - **`X-Smug-ImageUri` replaces** an existing image instead of creating one. This is what makes
   non-duplicating republish possible.
 
-Undocumented headers, observed in SmugMug's own Lightroom plugin and worth adopting:
-`X-Smug-UploadRequestId` (stable per-upload id — with `X-Smug-RetryCount`, lets the server
-deduplicate retries), `X-Smug-AssetUri`, `X-Smug-Version`. The same plugin logs _"Album Upload
+Undocumented headers, observed in SmugMug's own Lightroom plugin: `X-Smug-UploadRequestId` (stable
+per-upload id — with `X-Smug-RetryCount`, lets the server deduplicate retries) and `X-Smug-Version`
+are adopted; `X-Smug-AssetUri` is not, as nothing in phase 1 needs it. The same plugin logs _"Album Upload
 timeout previously, search for files that might have uploaded successfully"_ — even SmugMug's
 client reconciles rather than blindly retrying. It also sets per-upload timeouts from measured
 bandwidth, and runs uploads on a pool separate from rendering.
@@ -134,9 +136,9 @@ pub struct PublishItem<'a> {
 
 `publish_image` takes a **path**, not bytes — SmugMug reads the file once, hashes it for
 `Content-MD5` and sends that buffer, which is its business. It buffers rather than streams: the
-project's `reqwest` has no `stream` feature, and three concurrent 5–25 MB buffers are cheap. `DestinationCapabilities` (`supports_replace`,
-`supports_reconcile`, `supports_nested_containers`, `max_bytes`, `accepted_mime_types`) means the
-session never special-cases on `id()`. `async-trait` is required: `dyn` async traits aren't
+project's `reqwest` has no `stream` feature, and three concurrent 5–25 MB buffers are cheap.
+`DestinationCapabilities` (`supports_replace`, `supports_reconcile`, `supports_nested_containers`,
+`max_bytes`, `accepted_mime_types`) means the session never special-cases on `id()`. `async-trait` is required: `dyn` async traits aren't
 object-safe without boxing on Rust 1.98.
 
 The registry is a plain `Vec<Arc<dyn PublishDestination>>` with an explicit constructor, not
@@ -168,14 +170,17 @@ interrupted publish resumes.
 }
 ```
 
+`account` is `null` until the first publish, and `web_url` is `null` where SmugMug returns none.
+
 **Key on the full virtual path**, not the source path — virtual copies use a `vc=` suffix
-(`export_processing.rs:1030-1040`) and are distinct publishable photos.
+(`export_processing.rs:937-942`, named `_VCnn` at `:1034-1038`) and are distinct publishable photos.
 
 **The fingerprint is Lightroom's `metadataThatTriggersRepublish`:**
 `blake3(source_mtime, source_size, adjustments_json, relevant_export_settings)` — `blake3` is
 already a dependency. Match ⇒ skip _before_ rendering, so an unchanged album costs one file read
-and no GPU work. `relevant_export_settings` excludes destination and filename-template fields,
-which don't affect pixels.
+and no GPU work. `relevant_export_settings` (`state.rs`) leaves out `destination_type`,
+`subfolder`, `preserve_folders` and `filename_template`, which decide where a file lands, not what
+is in it — otherwise renaming the output template would re-upload the whole library.
 
 ## Module layout
 
@@ -236,16 +241,19 @@ X-Smug-RetryCount:       <0, 1, 2, …>
 
 ## Frontend
 
-A new **Publish** panel, sibling to Export — not a third entry in the export destination dropdown.
-Publishing has state exporting doesn't (auth, album mapping, "12 unchanged, 3 to update, 1 new"),
-and hiding that behind a select value makes the panel change shape drastically on one value.
-`destination_type` (`export_processing.rs:78`) stays for filesystem destinations.
+A separate **Publish** panel — not a third entry in the export destination dropdown. Publishing has
+state exporting doesn't (auth, album choice, "12 unchanged, 3 to update, 1 new"), and hiding that
+behind a select value makes the panel change shape drastically on one value. `destination_type`
+(`export_processing.rs:78`) stays for filesystem destinations.
+
+`PublishDock` mounts in the library view: a button beside the bottom bar while closed, a panel
+beside the grid while open. Hidden on Android (no `keyring` backend) and in the community view.
 
 States: not configured (key/secret entry + link to the developer page) → not authorised (connect,
-browser, verifier paste) → connected (account, root folder, album mapping, new/update/skip preview)
-→ publishing (progress, per-image status, cancel). Export settings are reused from the existing
-store with an explicit "publishing with your current export settings" line. The spool is never
-surfaced.
+browser, verifier paste) → connected (account, album picker, new/update/skip/unreadable preview) →
+publishing (progress, per-image status including failed and ambiguous, cancel). Export settings are
+reused from the existing store with an explicit "publishing with your current export settings"
+line. The spool is never surfaced.
 
 ## Integration surface
 
@@ -274,20 +282,45 @@ fails CI's `i18next-cli extract --ci`, so `i18next.config.ts` ignores the publis
 `PublishTranslations` joins the `i18next.d.ts` augmentation so keys stay type-checked.
 
 **`generate_handler!`** is the one guaranteed recurring conflict: Tauri permits one
-`invoke_handler` and both sides append. Chosen: ~8 commands in a contiguous block behind a
-`// --- publish ---` marker, one mechanical hunk per merge that `rerere` learns. Fallback if that
+`invoke_handler` and both sides append. Chosen: the eight `publish_*` commands in one contiguous
+block between `// --- publish ---` and `// --- end publish ---`, one mechanical hunk per merge that
+`rerere` learns. Fallback if that
 proves painful: a single `publish_invoke(action, payload)` dispatch. Reversible.
 
 ## Fork maintenance
 
-`smugmug` is the long-lived integration branch — upstream is **merged** in, never rebased, because
-merges preserve the conflict history `rerere` needs. `pr/publish-destinations` carries clean
-rebased history for the PR, regenerated from `smugmug`, never merged into. Conflating the two is
-why long-lived forks become painful. `rerere` enabled. Merge upstream weekly, not on demand: small
-frequent merges are far cheaper. Two commits ordered by independence — trait/registry/spool, then
-the SmugMug destination — so if upstream takes only the reusable half the fork's delta shrinks to
-one commit. `scripts/check-fork-surface.sh` fails if the diff against `upstream/main` touches
-anything outside the table above; surface creep is invisible otherwise.
+```
+upstream/main ──► main                       mirror only; fast-forward, never commit
+                    │ merge weekly
+                    ▼
+      feat/publish-destinations-smugmug      integration branch; what gets built and run
+          ▲         ▲         ▲
+     tweak/14   tweak/15   tweak/16          one per issue; merged by PR, then deleted
+```
+
+**`main` mirrors upstream.** It only ever fast-forwards
+(`git fetch upstream && git checkout main && git merge --ff-only upstream/main && git push origin main`)
+and nothing of ours is committed to it, so it stays a clean base for upstream PRs and for the
+surface guard.
+
+**`feat/publish-destinations-smugmug` is the long-lived integration branch.** `main` is **merged**
+in, never rebased onto, because merges preserve the conflict resolutions `rerere` (enabled)
+replays. Merge weekly, not on demand: small frequent merges are far cheaper.
+
+**Follow-up work** is one GitHub issue per change and one short-lived branch per issue
+(`tweak/<issue>-<slug>`), cut from the integration branch and merged back by PR within the fork.
+Stack branches only where one change genuinely depends on another; independent changes on
+independent branches can be dropped or reworked alone.
+
+**`pr/publish-destinations`** is built only when going upstream: regenerated from the integration
+branch, rebased onto `upstream/main`, never merged back. Conflating it with the integration branch
+is why long-lived forks become painful. Two commits ordered by independence — trait/registry/spool,
+then the SmugMug destination — so if upstream takes only the reusable half the fork's delta shrinks
+to one commit.
+
+`scripts/check-fork-surface.sh [base]` fails if the diff against `upstream/main` (or `main`, which
+mirrors it) touches anything outside the table above; surface creep is invisible otherwise. Run it
+before merging any follow-up branch.
 
 For the PR: open a discussion issue first, lead with the integration surface, frame it as
 infrastructure with SmugMug as the reference implementation, and offer to maintain it.
@@ -305,7 +338,7 @@ modules) rather than extending one. The export pipeline is untouched, not "still
 
 ## Phasing
 
-1. Trait, registry, spool, state, OAuth, SmugMug upload, panel — the working feature.
+1. Trait, registry, spool, state, OAuth, SmugMug upload, panel — the working feature. **Done.**
 2. `Group` → folder mirroring, keywords/captions from tags.
 3. Delete sync, comment/rating pull, rename/reparent sync.
 4. A second destination. This matters more than its position suggests: an abstraction with one
@@ -322,10 +355,16 @@ modules) rather than extending one. The export pipeline is untouched, not "still
 | `keyring` unavailable on some Linux setups                                                             | Explicit error, no plaintext fallback                                          |
 | SmugMug rate limits, undocumented                                                                      | Concurrency 3, honour `Retry-After`, log limit headers                         |
 
-Open, not blocking: whether to respect the library view's rating/colour filters (leaning yes, with
-the count shown first); whether AI tags (`tagging.rs`) feed `X-Smug-Keywords` (probably, off by
-default — publishing machine keywords silently is a surprising default); Android has no `keyring`
-backend, so phase 1 may gate the panel to desktop; the 8-image chunk is a guess worth measuring.
+Open questions, and where phase 1 left them:
+
+- **Rating/colour filters** — not implemented; a publish sends the whole album. Leaning towards
+  respecting the library view's filters, with the count shown first.
+- **AI tags as `X-Smug-Keywords`** — off; keywords are always empty. Probably opt-in later:
+  publishing machine keywords silently is a surprising default.
+- **Android** — settled: the panel is desktop-only, as there is no `keyring` backend.
+- **Tuning** — `RENDER_CHUNK_SIZE = 8` and `UPLOAD_CONCURRENCY = 3` (`session.rs`) are still
+  guesses worth measuring.
+- **Album privacy** — new albums set none and inherit the account root's, which may be public.
 
 ## References
 
