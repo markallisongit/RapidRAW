@@ -743,17 +743,46 @@ pub fn fingerprints(
     export_settings: &RelevantExportSettings,
 ) -> Fingerprints {
     let source = source_bytes(source_mtime, source_size);
-    let adjustments = canonical_json_str(adjustments_json);
     let settings = canonical_settings(export_settings);
+    let (adjustments, edit_adjustments) = match serde_json::from_str::<Value>(adjustments_json) {
+        Ok(mut value) => {
+            let all = canonical_json(&value);
+            strip_view_only(&mut value);
+            (all, canonical_json(&value))
+        }
+        // Unparseable text still hashes stably, as in `canonical_json_str`.
+        Err(_) => (adjustments_json.to_string(), adjustments_json.to_string()),
+    };
 
     let mut edit = blake3::Hasher::new();
     edit.update(&source);
-    update_field(&mut edit, adjustments.as_bytes());
+    update_field(&mut edit, edit_adjustments.as_bytes());
 
     Fingerprints {
         edit_hash: finish(edit),
         settings_hash: hash_settings(&settings),
+        // v1 hashed every field, so migrated records are compared with them all.
         legacy: combined_hash(&source, &adjustments, &settings),
+    }
+}
+
+/// Removes the sidecar fields that are screen state rather than edits, so
+/// looking at a photo never makes it upload again:
+///
+/// - `showClipping`: the clipping overlay. Export always renders without it.
+/// - `aiPatches[].isLoading`: set while a patch generates.
+///
+/// `sectionVisibility` and mask / patch `visible`, `opacity` and `invert` stay:
+/// they change the rendered pixels.
+fn strip_view_only(adjustments: &mut Value) {
+    let Some(map) = adjustments.as_object_mut() else {
+        return;
+    };
+    map.remove("showClipping");
+    if let Some(Value::Array(patches)) = map.get_mut("aiPatches") {
+        for patch in patches.iter_mut().filter_map(Value::as_object_mut) {
+            patch.remove("isLoading");
+        }
     }
 }
 
@@ -833,6 +862,8 @@ fn finish(hasher: blake3::Hasher) -> String {
 /// Canonicalises a JSON document, falling back to the raw text when it is not
 /// JSON at all — an unparseable adjustments blob should still produce a stable
 /// fingerprint rather than collapsing every such image onto one hash.
+/// [`fingerprints`] does the same inline, keeping the parsed value to strip.
+#[cfg(test)]
 fn canonical_json_str(json: &str) -> String {
     match serde_json::from_str::<Value>(json) {
         Ok(value) => canonical_json(&value),
@@ -1641,6 +1672,54 @@ mod tests {
                 base.settings_hash, changed.settings_hash,
                 "{what} is not a settings change"
             );
+        }
+    }
+
+    #[test]
+    fn view_only_adjustments_do_not_change_the_edit_hash() {
+        let edit = |show_clipping: bool, loading: bool| {
+            let adjustments = format!(
+                r#"{{"exposure":0.5,"showClipping":{show_clipping},"aiPatches":[{{"id":"p1","visible":true,"isLoading":{loading}}}]}}"#
+            );
+            fingerprints(a_time(), 1024, &adjustments, &relevant()).edit_hash
+        };
+        let base = edit(false, false);
+
+        assert_eq!(
+            edit(true, false),
+            base,
+            "the clipping overlay is not an edit"
+        );
+        assert_eq!(
+            edit(false, true),
+            base,
+            "a patch that is generating is not an edit"
+        );
+    }
+
+    #[test]
+    fn rendered_toggles_still_change_the_edit_hash() {
+        let edit =
+            |adjustments: &str| fingerprints(a_time(), 1024, adjustments, &relevant()).edit_hash;
+        let base = edit(
+            r#"{"exposure":0.5,"sectionVisibility":{"basic":true},"masks":[{"id":"m1","visible":true}]}"#,
+        );
+
+        for (changed, what) in [
+            (
+                r#"{"exposure":0.6,"sectionVisibility":{"basic":true},"masks":[{"id":"m1","visible":true}]}"#,
+                "an adjustment",
+            ),
+            (
+                r#"{"exposure":0.5,"sectionVisibility":{"basic":false},"masks":[{"id":"m1","visible":true}]}"#,
+                "a disabled section",
+            ),
+            (
+                r#"{"exposure":0.5,"sectionVisibility":{"basic":true},"masks":[{"id":"m1","visible":false}]}"#,
+                "a hidden mask",
+            ),
+        ] {
+            assert_ne!(edit(changed), base, "{what} changes the render");
         }
     }
 
