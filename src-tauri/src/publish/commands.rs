@@ -108,14 +108,22 @@ pub async fn publish_preview(
 ) -> Result<PublishPreview, String> {
     destination(&state, &destination_id)?;
     let request = album(&app_handle, &album_id)?;
-    let publish_state = PublishState::load_in(&state_dir(&app_handle)?, &destination_id)?;
+    let publish_state =
+        PublishState::load_in(&state_dir(&app_handle)?, &destination_id, &request.albums)?;
     let pipeline = ExportPipeline::new(app_handle, export_settings, output_format, idle_cancel());
 
     // A stat and a sidecar read per photo is too much blocking for an async
     // worker once an album runs to thousands.
-    tauri::async_runtime::spawn_blocking(move || preview(&pipeline, &publish_state, &request.paths))
-        .await
-        .map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        preview(
+            &pipeline,
+            &publish_state,
+            &request.album.album_id,
+            &request.paths,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Starts publishing `album_id` and returns at once. The session reports

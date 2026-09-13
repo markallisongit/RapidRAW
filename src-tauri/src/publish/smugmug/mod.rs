@@ -60,9 +60,7 @@ impl SmugMugDestination {
     /// The nickname of the account this install last connected, which names
     /// both the keyring entry and the state file's id map.
     fn connected_nickname(ctx: &PublishContext) -> Result<Option<String>, PublishError> {
-        Ok(PublishState::load_in(&ctx.state_dir, DESTINATION_ID)?
-            .account()
-            .map(str::to_string))
+        PublishState::account_in(&ctx.state_dir, DESTINATION_ID)
     }
 
     /// Reuses the cached clients while the consumer credentials match. A new
@@ -211,9 +209,7 @@ impl PublishDestination for SmugMugDestination {
         SmugMugAuth::store_tokens(&account_key(&nickname), &access.token, &access.token_secret)?;
         *self.connection.lock().map_err(|_| poisoned())? = None;
 
-        let mut state = PublishState::load_in(&ctx.state_dir, DESTINATION_ID)?;
-        state.set_account(Some(nickname));
-        state.save_in(&ctx.state_dir)
+        PublishState::set_account_in(&ctx.state_dir, DESTINATION_ID, Some(nickname))
     }
 
     /// Albums go directly under the account's root node until the panel

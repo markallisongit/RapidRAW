@@ -71,10 +71,8 @@ pub fn replace_consumer(
         return Ok(());
     }
 
-    let mut state = PublishState::load_in(state_dir, destination_id)?;
-    if state.account().is_some() {
-        state.set_account(None);
-        state.save_in(state_dir)?;
+    if PublishState::account_in(state_dir, destination_id)?.is_some() {
+        PublishState::set_account_in(state_dir, destination_id, None)?;
     }
     Ok(())
 }

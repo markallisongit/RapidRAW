@@ -153,34 +153,60 @@ interrupted publish resumes.
 
 ```jsonc
 {
-  "version": 1,
+  "version": 2,
   "destination": "smugmug",
   "account": "markallison",
-  "containers": {
-    "<album_id>": { "remote_uri": "/api/v2/album/AbCdEf", "web_url": "…", "last_published": "2026-09-12T10:14:02Z" },
-  },
-  "images": {
-    "<virtual_path>": {
-      "remote_uri": "/api/v2/image/XyZ123-0",
+  "links": {
+    "<album_id>": {
+      "remote_uri": "/api/v2/album/AbCdEf",
+      "remote_name": null,                 // null when unknown
       "web_url": "…",
-      "fingerprint": "b3:9f2c…",
-      "last_published": "…",
+      "linked_at": "2026-09-12T10:14:02Z",
+      "last_published": "…",               // null until the first publish
+      "broken": false,                     // the remote album is gone
+      "images": {
+        "<virtual_path>": {
+          "remote_uri": "/api/v2/image/XyZ123-0",
+          "web_url": "…",
+          "edit_hash": "b3:…",
+          "settings_hash": "b3:…",
+          "last_published": "…",
+        },
+      },
     },
   },
 }
 ```
 
 `account` is `null` until the first publish, and `web_url` is `null` where SmugMug returns none.
+The account is read and written on its own (`PublishState::account_in` / `set_account_in`), so
+connecting never loads — or migrates — the image records.
+
+**Image records live under their link.** A photo in two RapidRAW albums is two uploads, one into
+each remote album, each replaced or skipped on its own. Relinking an album to a *different*
+remote album drops its records, which describe images in the old album.
 
 **Key on the full virtual path**, not the source path — virtual copies use a `vc=` suffix
 (`export_processing.rs:937-942`, named `_VCnn` at `:1034-1038`) and are distinct publishable photos.
 
-**The fingerprint is Lightroom's `metadataThatTriggersRepublish`:**
-`blake3(source_mtime, source_size, adjustments_json, relevant_export_settings)` — `blake3` is
-already a dependency. Match ⇒ skip _before_ rendering, so an unchanged album costs one file read
-and no GPU work. `relevant_export_settings` (`state.rs`) leaves out `destination_type`,
-`subfolder`, `preserve_folders` and `filename_template`, which decide where a file lands, not what
-is in it — otherwise renaming the output template would re-upload the whole library.
+**The fingerprint is Lightroom's `metadataThatTriggersRepublish`, split in two:**
+`edit_hash = blake3(source_mtime, source_size, adjustments_json)` and
+`settings_hash = blake3(relevant_export_settings)` — `blake3` is already a dependency, fields are
+length-prefixed, JSON is canonicalised. Both match ⇒ skip _before_ rendering, so an unchanged
+album costs one file read and no GPU work. The split gives four outcomes: `New`, `Update` (edit
+changed), `SettingsChanged` (only settings changed) and `Skip`. Until the user can choose to keep
+existing uploads, `SettingsChanged` republishes like `Update`. `relevant_export_settings`
+(`state.rs`) leaves out `destination_type`, `subfolder`, `preserve_folders` and
+`filename_template`, which decide where a file lands, not what is in it — otherwise renaming the
+output template would re-upload the whole library.
+
+**Migration from version 1** (phase 1's `containers` plus path-keyed `images`) runs on load and is
+written as version 2 by the next save. Each container becomes a link. A v1 image record is copied
+into every migrated link whose RapidRAW album contains that path — so loading takes the album tree
+as input — and dropped, with a logged count, when it is in none. v1 records keep their combined
+fingerprint as `legacy_fingerprint`, with both split hashes `null`; they are compared against the
+v1 fingerprint of the current inputs (match ⇒ `Skip`, and the record takes split hashes; otherwise
+`Update`). An unknown future version is rejected, never reset.
 
 ## Module layout
 
@@ -192,7 +218,7 @@ src-tauri/src/publish/
   commands.rs          Tauri commands, startup spool sweep
   session.rs           chunked render→upload driver, progress events, cancellation
   spool.rs             temp dir lifecycle, Drop guard, startup sweep
-  state.rs             remote ID map, fingerprints, atomic persistence
+  state.rs             links, per-link remote ID map, split fingerprints, v1 migration
   oauth1.rs            OAuth 1.0a signing — generic, no SmugMug specifics
   credential_store.rs  keyring access for consumer keys and tokens
   smugmug/             mod.rs · auth.rs (OAuth flow) · api.rs (album lookup/create)

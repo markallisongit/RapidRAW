@@ -4,8 +4,9 @@
 //! Per image, in this order:
 //!
 //! 1. Fingerprint the source (a `stat`, the sidecar, the export settings).
-//! 2. Classify it against the state file. A `Skip` stops here, before any
-//!    rendering: an unchanged album costs one `stat` per photo and no GPU time.
+//! 2. Classify it against the album's link in the state file. A `Skip` stops
+//!    here, before any rendering: an unchanged album costs one `stat` per
+//!    photo and no GPU time.
 //! 3. Render into the spool through the unmodified export pipeline.
 //! 4. Upload, replacing the remote image when this is an update.
 //! 5. On success, write the state entry and release the spooled file at once.
@@ -29,7 +30,10 @@ use uuid::Uuid;
 use crate::export_processing::{ExportAdjustmentsMode, ExportSettings};
 use crate::file_management::AlbumItem;
 use crate::publish::spool::Spool;
-use crate::publish::state::{PublishAction, PublishState, RelevantExportSettings, fingerprint};
+use crate::publish::state::{
+    AlbumMembership, Fingerprints, PublishAction, PublishState, RelevantExportSettings,
+    fingerprints,
+};
 use crate::publish::{
     LocalContainer, PublishContext, PublishDestination, PublishError, PublishItem,
     RemoteContainerId, RemoteImageId,
@@ -55,7 +59,7 @@ pub trait RenderPipeline: Send + Sync {
     /// What decides whether a photo needs publishing again. Runs for every
     /// photo, the skipped ones included, so it must stay cheap: a `stat` and
     /// the sidecar, never a decode.
-    fn fingerprint(&self, virtual_path: &str) -> Result<String, PublishError>;
+    fn fingerprints(&self, virtual_path: &str) -> Result<Fingerprints, PublishError>;
 
     /// The name the image goes by at the destination. Only asked of photos
     /// that will be uploaded. `index` and `total` feed `{sequence}`.
@@ -80,6 +84,8 @@ pub struct PublishRequest {
     pub album: LocalContainer,
     /// Virtual paths, so virtual copies publish as distinct photos.
     pub paths: Vec<String>,
+    /// Every album's photos, which loading a v1 state file needs to migrate it.
+    pub albums: AlbumMembership,
 }
 
 impl PublishRequest {
@@ -104,6 +110,7 @@ impl PublishRequest {
                                 parent_path: parents.clone(),
                             },
                             paths: images.clone(),
+                            albums: AlbumMembership::default(),
                         });
                     }
                     AlbumItem::Album { .. } => {}
@@ -118,7 +125,9 @@ impl PublishRequest {
             }
             None
         }
-        find(tree, album_id, &mut Vec::new())
+        let mut request = find(tree, album_id, &mut Vec::new())?;
+        request.albums = AlbumMembership::from_tree(tree);
+        Some(request)
     }
 }
 
@@ -138,14 +147,19 @@ pub struct PublishPreview {
 pub fn preview(
     pipeline: &dyn RenderPipeline,
     state: &PublishState,
+    album_id: &str,
     paths: &[String],
 ) -> PublishPreview {
     let mut counts = PublishPreview::default();
     for path in paths {
-        match pipeline.fingerprint(path) {
-            Ok(fingerprint) => match state.classify(path, &fingerprint) {
+        match pipeline.fingerprints(path) {
+            Ok(fingerprints) => match state.classify(album_id, path, &fingerprints) {
                 PublishAction::New => counts.new += 1,
-                PublishAction::Update { .. } => counts.update += 1,
+                // Until the user can choose to keep existing uploads, a
+                // settings change republishes, as it always has.
+                PublishAction::Update { .. } | PublishAction::SettingsChanged { .. } => {
+                    counts.update += 1
+                }
                 PublishAction::Skip => counts.skip += 1,
             },
             Err(_) => counts.unreadable += 1,
@@ -280,8 +294,13 @@ impl<'a> PublishSession<'a> {
         }
 
         let mut run = Run {
-            state: PublishState::load_in(&self.ctx.state_dir, self.destination.id())?,
+            state: PublishState::load_in(
+                &self.ctx.state_dir,
+                self.destination.id(),
+                &request.albums,
+            )?,
             state_dir: &self.ctx.state_dir,
+            album_id: request.album.album_id.clone(),
             events: &self.events,
             summary: SessionSummary::default(),
             completed: 0,
@@ -297,14 +316,14 @@ impl<'a> PublishSession<'a> {
             .ensure_container(&request.album, self.ctx)
             .await?;
         run.state
-            .record_container(&request.album.album_id, &container, None);
+            .record_link(&request.album.album_id, &container, None);
         run.save()?;
 
         // Every skip is decided here, before the spool exists and before
         // anything is rendered.
         let work = self.classify(&request.paths, &mut run);
         if work.is_empty() {
-            return Ok(run.summary);
+            return run.finish();
         }
 
         let spool = Spool::create_at(&self.spool_base)?;
@@ -356,7 +375,7 @@ impl<'a> PublishSession<'a> {
             run.summary.cancelled = self.cancelled();
         }
 
-        Ok(run.summary)
+        run.finish()
     }
 
     fn cancelled(&self) -> bool {
@@ -370,25 +389,28 @@ impl<'a> PublishSession<'a> {
         let mut work = Vec::new();
 
         for (index, path) in paths.iter().enumerate() {
-            let fingerprint = match self.pipeline.fingerprint(path) {
-                Ok(fingerprint) => fingerprint,
+            let fingerprints = match self.pipeline.fingerprints(path) {
+                Ok(fingerprints) => fingerprints,
                 Err(error) => {
                     run.fail(path, &error);
                     continue;
                 }
             };
-            let replaces = match run.state.classify(path, &fingerprint) {
+            let replaces = match run.state.classify(&run.album_id, path, &fingerprints) {
                 PublishAction::Skip => {
-                    run.skip(path);
+                    run.skip(path, &fingerprints);
                     continue;
                 }
                 PublishAction::New => None,
-                PublishAction::Update { replaces } => Some(replaces),
+                // Republished like an edit until the user can choose to keep
+                // the existing uploads instead.
+                PublishAction::Update { replaces }
+                | PublishAction::SettingsChanged { replaces } => Some(replaces),
             };
             match self.pipeline.file_name(path, index, total) {
                 Ok(file_name) => work.push(Work {
                     path: path.clone(),
-                    fingerprint,
+                    fingerprints,
                     file_name,
                     replaces,
                     request_id: Uuid::new_v4(),
@@ -575,7 +597,7 @@ impl<'a> PublishSession<'a> {
 /// A photo that needs uploading.
 struct Work {
     path: String,
-    fingerprint: String,
+    fingerprints: Fingerprints,
     file_name: String,
     replaces: Option<RemoteImageId>,
     /// One per photo for the whole session, re-queue included, so the
@@ -610,6 +632,8 @@ impl Rendered {
 struct Run<'s> {
     state: PublishState,
     state_dir: &'s Path,
+    /// The album being published, whose link every record goes under.
+    album_id: String,
     events: &'s EventSink,
     summary: SessionSummary,
     completed: usize,
@@ -619,6 +643,16 @@ struct Run<'s> {
 impl Run<'_> {
     fn save(&self) -> Result<(), PublishError> {
         self.state.save_in(self.state_dir)
+    }
+
+    /// Stamps the link as published unless the session was cancelled, and
+    /// saves: skipped records upgraded from v1 hashes are otherwise unwritten.
+    fn finish(mut self) -> Result<SessionSummary, PublishError> {
+        if !self.summary.cancelled {
+            self.state.mark_published(&self.album_id);
+        }
+        self.save()?;
+        Ok(self.summary)
     }
 
     fn report(&mut self, path: &str, state: ItemState) {
@@ -631,7 +665,9 @@ impl Run<'_> {
         }));
     }
 
-    fn skip(&mut self, path: &str) {
+    fn skip(&mut self, path: &str, fingerprints: &Fingerprints) {
+        self.state
+            .confirm_unchanged(&self.album_id, path, fingerprints);
         self.summary.skipped += 1;
         self.report(path, ItemState::Skipped);
     }
@@ -640,7 +676,7 @@ impl Run<'_> {
     /// must not forget what already landed.
     fn succeed(&mut self, work: &Work, id: &RemoteImageId) -> Result<(), PublishError> {
         self.state
-            .record_image(&work.path, id, &work.fingerprint, None);
+            .record_image(&self.album_id, &work.path, id, &work.fingerprints, None)?;
         self.save()?;
         let state = if work.replaces.is_some() {
             self.summary.updated += 1;
@@ -722,7 +758,7 @@ impl RenderPipeline for ExportPipeline {
         }
     }
 
-    fn fingerprint(&self, virtual_path: &str) -> Result<String, PublishError> {
+    fn fingerprints(&self, virtual_path: &str) -> Result<Fingerprints, PublishError> {
         let (source, sidecar) = crate::file_management::parse_virtual_path(virtual_path);
         let unreadable = |e: std::io::Error| PublishError::Io(format!("{}: {e}", source.display()));
         let metadata = std::fs::metadata(&source).map_err(unreadable)?;
@@ -734,7 +770,7 @@ impl RenderPipeline for ExportPipeline {
             &self.export_settings,
             &self.output_format,
         );
-        Ok(fingerprint(
+        Ok(fingerprints(
             modified,
             metadata.len(),
             &adjustments,
@@ -889,7 +925,8 @@ mod tests {
     use crate::publish::{AuthChallenge, AuthStatus, DestinationCapabilities, state::PublishState};
 
     const DESTINATION: &str = "stub";
-    const ALBUM_URI: &str = "/api/v2/album/Stub";
+    /// The album every test publishes unless it names another.
+    const ALBUM: &str = "album-1";
     const FILE_BYTES: usize = 1000;
 
     /// Walks the spool base, so the measurement covers every session
@@ -913,14 +950,22 @@ mod tests {
         format!("DSC_{n:04}.jpg")
     }
 
-    fn image_id(name: &str) -> RemoteImageId {
-        RemoteImageId(format!("/api/v2/image/{name}"))
+    /// The remote album the stub finds or creates for a local one.
+    fn album_uri(album_id: &str) -> String {
+        format!("/api/v2/album/{album_id}")
+    }
+
+    /// Distinct per album, so a photo uploaded into two albums has two ids.
+    fn image_id(album_id: &str, name: &str) -> RemoteImageId {
+        RemoteImageId(format!("{}/image/{name}", album_uri(album_id)))
     }
 
     /// Renders a fixed-size file per image and counts what it was asked to do.
     struct StubPipeline {
-        /// Fingerprints that differ from the default, to simulate an edit.
+        /// Photos whose edit hash differs from the default, to simulate an edit.
         edited: HashSet<String>,
+        /// The settings hash every photo gets, to simulate a settings change.
+        settings: String,
         renders: AtomicUsize,
         spool_base: PathBuf,
         peak: AtomicU64,
@@ -930,17 +975,23 @@ mod tests {
         fn new(spool_base: &Path) -> Self {
             Self {
                 edited: HashSet::new(),
+                settings: "settings:a".into(),
                 renders: AtomicUsize::new(0),
                 spool_base: spool_base.to_path_buf(),
                 peak: AtomicU64::new(0),
             }
         }
 
-        fn fingerprint_of(&self, virtual_path: &str) -> String {
-            if self.edited.contains(virtual_path) {
+        fn fingerprints_of(&self, virtual_path: &str) -> Fingerprints {
+            let edit_hash = if self.edited.contains(virtual_path) {
                 format!("edited:{virtual_path}")
             } else {
-                format!("fp:{virtual_path}")
+                format!("edit:{virtual_path}")
+            };
+            Fingerprints {
+                legacy: format!("legacy:{edit_hash}:{}", self.settings),
+                edit_hash,
+                settings_hash: self.settings.clone(),
             }
         }
     }
@@ -951,8 +1002,8 @@ mod tests {
             "image/jpeg"
         }
 
-        fn fingerprint(&self, virtual_path: &str) -> Result<String, PublishError> {
-            Ok(self.fingerprint_of(virtual_path))
+        fn fingerprints(&self, virtual_path: &str) -> Result<Fingerprints, PublishError> {
+            Ok(self.fingerprints_of(virtual_path))
         }
 
         fn file_name(
@@ -999,6 +1050,8 @@ mod tests {
     struct StubDestination {
         log: Mutex<Vec<String>>,
         uploads: Mutex<Vec<(String, Option<RemoteImageId>)>>,
+        /// The remote album each upload went into, by file name.
+        containers: Mutex<Vec<(String, String)>>,
         script: Mutex<HashMap<String, VecDeque<Scripted>>>,
         /// What reconcile reports as having landed.
         landed: HashSet<String>,
@@ -1013,6 +1066,7 @@ mod tests {
             Self {
                 log: Mutex::new(Vec::new()),
                 uploads: Mutex::new(Vec::new()),
+                containers: Mutex::new(Vec::new()),
                 script: Mutex::new(HashMap::new()),
                 landed: HashSet::new(),
                 cancel_on_upload: None,
@@ -1079,11 +1133,11 @@ mod tests {
 
         async fn ensure_container(
             &self,
-            _local: &LocalContainer,
+            local: &LocalContainer,
             _ctx: &PublishContext,
         ) -> Result<RemoteContainerId, PublishError> {
             self.log.lock().unwrap().push("ensure_container".into());
-            Ok(RemoteContainerId(ALBUM_URI.into()))
+            Ok(RemoteContainerId(album_uri(&local.album_id)))
         }
 
         async fn publish_image(
@@ -1106,6 +1160,10 @@ mod tests {
                 uploads.push((item.file_name.clone(), item.replaces.clone()));
                 uploads.len()
             };
+            self.containers
+                .lock()
+                .unwrap()
+                .push((item.file_name.clone(), item.container.0.clone()));
             if let Some((at, flag)) = &self.cancel_on_upload {
                 assert!(Arc::ptr_eq(flag, &ctx.cancel));
                 if count == *at {
@@ -1124,7 +1182,10 @@ mod tests {
                 Some(Scripted::Ambiguous) => Err(PublishError::Ambiguous {
                     file_name: item.file_name.clone(),
                 }),
-                None => Ok(image_id(&item.file_name)),
+                None => Ok(RemoteImageId(format!(
+                    "{}/image/{}",
+                    item.container.0, item.file_name
+                ))),
             }
         }
 
@@ -1134,7 +1195,7 @@ mod tests {
             expected: &[PublishItem<'_>],
             _ctx: &PublishContext,
         ) -> Result<Vec<(String, RemoteImageId)>, PublishError> {
-            assert_eq!(container.0, ALBUM_URI);
+            assert_eq!(container.0, album_uri(ALBUM));
             let names: Vec<&str> = expected.iter().map(|i| i.file_name.as_str()).collect();
             self.log
                 .lock()
@@ -1143,7 +1204,7 @@ mod tests {
             Ok(expected
                 .iter()
                 .filter(|item| self.landed.contains(&item.file_name))
-                .map(|item| (item.file_name.clone(), image_id(&item.file_name)))
+                .map(|item| (item.file_name.clone(), image_id(ALBUM, &item.file_name)))
                 .collect())
         }
     }
@@ -1174,18 +1235,37 @@ mod tests {
         }
 
         fn state(&self) -> PublishState {
-            PublishState::load_in(&self.ctx.state_dir, DESTINATION).unwrap()
+            PublishState::load_in(
+                &self.ctx.state_dir,
+                DESTINATION,
+                &AlbumMembership::default(),
+            )
+            .unwrap()
         }
 
-        /// Records `paths` as already published with the stub's fingerprints.
+        fn state_file(&self) -> PathBuf {
+            self.ctx.state_dir.join(format!("{DESTINATION}.json"))
+        }
+
+        /// Records `paths` as already published into [`ALBUM`] with the
+        /// stub's fingerprints.
         fn published(&self, pipeline: &StubPipeline, paths: &[String]) {
             let mut state = self.state();
+            state.record_link(ALBUM, &RemoteContainerId(album_uri(ALBUM)), None);
             for path in paths {
                 let name = format!(
                     "{}.jpg",
                     Path::new(path).file_stem().unwrap().to_str().unwrap()
                 );
-                state.record_image(path, &image_id(&name), &pipeline.fingerprint_of(path), None);
+                state
+                    .record_image(
+                        ALBUM,
+                        path,
+                        &image_id(ALBUM, &name),
+                        &pipeline.fingerprints_of(path),
+                        None,
+                    )
+                    .unwrap();
             }
             state.save_in(&self.ctx.state_dir).unwrap();
         }
@@ -1196,17 +1276,20 @@ mod tests {
             pipeline: &StubPipeline,
             paths: Vec<String>,
         ) -> SessionSummary {
+            self.run_request(destination, pipeline, request(ALBUM, paths))
+                .await
+        }
+
+        async fn run_request(
+            &self,
+            destination: &StubDestination,
+            pipeline: &StubPipeline,
+            request: PublishRequest,
+        ) -> SessionSummary {
             let recorder = Arc::clone(&self.events);
             let events: EventSink = Arc::new(move |event| recorder.lock().unwrap().push(event));
             PublishSession::new(destination, pipeline, &self.ctx, self.spool_base(), events)
-                .run(PublishRequest {
-                    album: LocalContainer {
-                        album_id: "album-1".into(),
-                        name: "Iceland 2026".into(),
-                        parent_path: vec![],
-                    },
-                    paths,
-                })
+                .run(request)
                 .await
                 .unwrap()
         }
@@ -1220,6 +1303,18 @@ mod tests {
         range.map(path).collect()
     }
 
+    fn request(album_id: &str, paths: Vec<String>) -> PublishRequest {
+        PublishRequest {
+            album: LocalContainer {
+                album_id: album_id.into(),
+                name: format!("Album {album_id}"),
+                parent_path: vec![],
+            },
+            paths,
+            albums: AlbumMembership::default(),
+        }
+    }
+
     #[test]
     fn preview_counts_what_a_publish_would_do_without_rendering() {
         let harness = Harness::new();
@@ -1227,7 +1322,7 @@ mod tests {
         harness.published(&pipeline, &paths(1..=3));
         pipeline.edited = [path(2)].into();
 
-        let counts = preview(&pipeline, &harness.state(), &paths(1..=5));
+        let counts = preview(&pipeline, &harness.state(), ALBUM, &paths(1..=5));
 
         assert_eq!(
             counts,
@@ -1304,6 +1399,15 @@ mod tests {
         assert!(destination.uploaded_names().is_empty());
         assert_eq!(summary.skipped, 5);
         assert_eq!(harness.terminal_event(), "publish-complete");
+        assert!(
+            harness
+                .state()
+                .link(ALBUM)
+                .unwrap()
+                .last_published
+                .is_some(),
+            "a completed session stamps the link"
+        );
     }
 
     #[tokio::test]
@@ -1321,8 +1425,8 @@ mod tests {
         assert_eq!(
             uploads,
             vec![
-                (file_name(1), Some(image_id(&file_name(1)))),
-                (file_name(2), Some(image_id(&file_name(2)))),
+                (file_name(1), Some(image_id(ALBUM, &file_name(1)))),
+                (file_name(2), Some(image_id(ALBUM, &file_name(2)))),
                 (file_name(4), None),
             ],
             "edits replace in place, a new photo is added, an unchanged one is left alone"
@@ -1334,9 +1438,146 @@ mod tests {
         );
         let state = harness.state();
         assert_eq!(
-            state.classify(&path(1), &pipeline.fingerprint_of(&path(1))),
+            state.classify(ALBUM, &path(1), &pipeline.fingerprints_of(&path(1))),
             PublishAction::Skip,
             "the new fingerprint is recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_settings_change_still_republishes() {
+        let harness = Harness::new();
+        let mut pipeline = StubPipeline::new(&harness.spool_base());
+        let destination = StubDestination::new(&harness.spool_base());
+        harness.published(&pipeline, &paths(1..=2));
+        pipeline.settings = "settings:b".into();
+
+        let counts = preview(&pipeline, &harness.state(), ALBUM, &paths(1..=2));
+        let summary = harness.run(&destination, &pipeline, paths(1..=2)).await;
+
+        assert_eq!(
+            counts.update, 2,
+            "counted as updates until the user can choose"
+        );
+        assert_eq!(summary.updated, 2);
+        assert_eq!(
+            harness
+                .state()
+                .classify(ALBUM, &path(1), &pipeline.fingerprints_of(&path(1))),
+            PublishAction::Skip,
+            "the new settings hash is recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_photo_shared_by_two_albums_is_uploaded_into_each() {
+        let harness = Harness::new();
+        let mut pipeline = StubPipeline::new(&harness.spool_base());
+        let first = StubDestination::new(&harness.spool_base());
+        harness.run(&first, &pipeline, paths(1..=2)).await;
+
+        let second = StubDestination::new(&harness.spool_base());
+        let summary = harness
+            .run_request(&second, &pipeline, request("album-2", paths(2..=3)))
+            .await;
+
+        let mut uploads = second.uploads.lock().unwrap().clone();
+        uploads.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            uploads,
+            vec![(file_name(2), None), (file_name(3), None)],
+            "the shared photo is new to the second album, not skipped or replaced"
+        );
+        assert!(
+            second
+                .containers
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, container)| *container == album_uri("album-2"))
+        );
+        assert_eq!(summary.uploaded, 2);
+        let state = harness.state();
+        assert_eq!(
+            state.image_for(ALBUM, &path(2)).unwrap().remote_uri,
+            image_id(ALBUM, &file_name(2)).0,
+            "the first album's record is untouched"
+        );
+        assert_eq!(
+            state.image_for("album-2", &path(2)).unwrap().remote_uri,
+            image_id("album-2", &file_name(2)).0
+        );
+
+        pipeline.edited = [path(2)].into();
+        let third = StubDestination::new(&harness.spool_base());
+        harness
+            .run_request(&third, &pipeline, request("album-2", paths(2..=3)))
+            .await;
+        assert_eq!(
+            third.uploads.lock().unwrap().clone(),
+            vec![(file_name(2), Some(image_id("album-2", &file_name(2))))],
+            "an edit replaces the copy in the album being published"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_v1_state_file_republishes_nothing_that_is_unchanged() {
+        let harness = Harness::new();
+        let mut pipeline = StubPipeline::new(&harness.spool_base());
+        let destination = StubDestination::new(&harness.spool_base());
+        let unchanged = pipeline.fingerprints_of(&path(1)).legacy;
+        pipeline.edited = [path(2)].into();
+        std::fs::create_dir_all(&harness.ctx.state_dir).unwrap();
+        let v1_image = |n: usize| {
+            serde_json::json!({
+                "remote_uri": image_id(ALBUM, &file_name(n)).0,
+                "web_url": null,
+                "fingerprint": unchanged.replace(&path(1), &path(n)),
+                "last_published": "2026-09-01T10:00:00+00:00"
+            })
+        };
+        let v1 = serde_json::json!({
+            "version": 1,
+            "destination": DESTINATION,
+            "account": "stub",
+            "containers": {
+                ALBUM: {
+                    "remote_uri": album_uri(ALBUM),
+                    "web_url": null,
+                    "last_published": "2026-09-01T10:00:00+00:00"
+                }
+            },
+            "images": { path(1): v1_image(1), path(2): v1_image(2) }
+        });
+        std::fs::write(harness.state_file(), v1.to_string()).unwrap();
+        let tree = vec![AlbumItem::Album {
+            id: ALBUM.into(),
+            name: "Iceland".into(),
+            icon: None,
+            images: paths(1..=2),
+        }];
+        let request = PublishRequest::from_album_tree(&tree, ALBUM).unwrap();
+
+        let summary = harness.run_request(&destination, &pipeline, request).await;
+
+        assert_eq!(
+            destination.uploads.lock().unwrap().clone(),
+            vec![(file_name(2), Some(image_id(ALBUM, &file_name(2))))],
+            "only the edited photo uploads, replacing its migrated record"
+        );
+        assert_eq!((summary.skipped, summary.updated), (1, 1));
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(harness.state_file()).unwrap()).unwrap();
+        assert_eq!(written["version"], 2);
+        let state = harness.state();
+        let upgraded = state.image_for(ALBUM, &path(1)).unwrap();
+        assert_eq!(
+            upgraded.legacy_fingerprint, None,
+            "the skipped record upgrades"
+        );
+        assert_eq!(
+            upgraded.edit_hash.as_deref(),
+            Some(pipeline.fingerprints_of(&path(1)).edit_hash.as_str())
         );
     }
 
@@ -1355,7 +1596,7 @@ mod tests {
         assert_eq!(summary.failed[0].path, path(3));
         let state = harness.state();
         let recorded: Vec<bool> = (1..=5)
-            .map(|n| state.image_for(&path(n)).is_some())
+            .map(|n| state.image_for(ALBUM, &path(n)).is_some())
             .collect();
         assert_eq!(recorded, [true, true, false, true, true]);
         assert_eq!(harness.terminal_event(), "publish-complete");
@@ -1405,7 +1646,7 @@ mod tests {
             "what did not land is uploaded again; what did is not"
         );
         let state = harness.state();
-        assert!((1..=5).all(|n| state.image_for(&path(n)).is_some()));
+        assert!((1..=5).all(|n| state.image_for(ALBUM, &path(n)).is_some()));
         assert!(summary.ambiguous.is_empty());
     }
 
@@ -1424,14 +1665,14 @@ mod tests {
 
         let state = harness.state();
         assert!(
-            state.image_for(&path(1)).is_none(),
+            state.image_for(ALBUM, &path(1)).is_none(),
             "a failure is not recorded"
         );
         assert!(
-            state.image_for(&path(2)).is_none(),
+            state.image_for(ALBUM, &path(2)).is_none(),
             "an ambiguity reconcile could not confirm is not recorded"
         );
-        assert!(state.image_for(&path(3)).is_some());
+        assert!(state.image_for(ALBUM, &path(3)).is_some());
         assert_eq!(summary.ambiguous, [path(2)]);
         assert_eq!(summary.failed.len(), 1);
         assert_eq!(summary.uploaded, 1);
@@ -1463,7 +1704,7 @@ mod tests {
         let state = harness.state();
         assert_eq!(
             (1..=40)
-                .filter(|n| state.image_for(&path(*n)).is_some())
+                .filter(|n| state.image_for(ALBUM, &path(*n)).is_some())
                 .count(),
             3
         );
@@ -1507,14 +1748,7 @@ mod tests {
             harness.spool_base(),
             events,
         );
-        let run = session.run(PublishRequest {
-            album: LocalContainer {
-                album_id: "album-1".into(),
-                name: "Iceland 2026".into(),
-                parent_path: vec![],
-            },
-            paths: vec![],
-        });
+        let run = session.run(request(ALBUM, vec![]));
         assert_send(&run);
     }
 
