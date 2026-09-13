@@ -1,0 +1,18 @@
+# Files outside the publish directories that the fork may touch.
+# See "Integration surface" in docs/publish-smugmug-design.md; keep the two in step.
+# Deliberately absent: src-tauri/src/export_processing.rs (zero-line diff).
+
+src-tauri/Cargo.toml
+src-tauri/src/lib.rs
+src-tauri/src/app_state.rs
+src/App.tsx
+src/store/useUIStore.ts
+src/components/views/LibraryView.tsx
+
+# Out-of-tree publish strings (#2).
+i18next.config.ts
+src/@types/i18next.d.ts
+
+docs/publish-smugmug-design.md
+scripts/check-fork-surface.sh
+scripts/fork-surface-allowlist.txt

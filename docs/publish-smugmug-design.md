@@ -244,10 +244,14 @@ surfaced.
 | `src/App.tsx` | import + mount `PublishPanel` | ~6 | Medium — busy file |
 | `src/store/useUIStore.ts` | `isPublishPanelVisible` | 2 | Low |
 | `src/components/views/LibraryView.tsx` | toolbar button | ~4 | Low |
+| `i18next.config.ts` | `extract.ignore` for the publish directory | 3 | Low |
+| `src/@types/i18next.d.ts` | `PublishTranslations` in the type augmentation | ~4 | Low |
 | **`src-tauri/src/export_processing.rs`** | **none** | **0** | **None** |
 | `src/i18n/**` | **none** | 0 | None |
 
-**~30 lines across 6 existing files.** Everything else is new, and new files never conflict.
+**~50 lines across 8 existing files** (`scripts/check-fork-surface.sh` prints the live figure;
+`Cargo.lock` follows `Cargo.toml` and is not counted). Everything else is new, and new files never
+conflict.
 
 **i18n with zero edits:** `publish.i18n.ts` calls `i18n.addResourceBundle('en', 'translation',
 { publish: {…} }, true, true)` at import time, instead of editing thirteen locale JSONs — thirteen
