@@ -19,17 +19,17 @@ other destinations.
 
 ## Decisions
 
-| # | Question | Decision |
-| --- | --- | --- |
-| 1 | Sync model | Publish, phased. Remote-ID map + skip-unchanged in phase 1 |
-| 2 | Mapping | One RapidRAW `Album` → one SmugMug album under a chosen root folder. `Group` flattened |
-| 3 | Credentials | User supplies their own API key/secret. Nothing embedded |
-| 4 | Token storage | OS keyring (`keyring` 4.2). Explicit error where unavailable, no plaintext fallback |
-| 5 | OAuth | Hand-rolled `oauth1` module over `hmac`/`sha1` (~150 lines) |
-| 6 | Callback | Out-of-band verifier code. No loopback listener |
-| 7 | Byte path | Spool to managed temp dir, upload from disk, delete on success |
-| 8 | Pipeline | Call existing `export_images_impl` unmodified with a temp output folder |
-| 9 | Idempotency | Stable `X-Smug-UploadRequestId` per image + post-timeout reconciliation |
+| #   | Question      | Decision                                                                               |
+| --- | ------------- | -------------------------------------------------------------------------------------- |
+| 1   | Sync model    | Publish, phased. Remote-ID map + skip-unchanged in phase 1                             |
+| 2   | Mapping       | One RapidRAW `Album` → one SmugMug album under a chosen root folder. `Group` flattened |
+| 3   | Credentials   | User supplies their own API key/secret. Nothing embedded                               |
+| 4   | Token storage | OS keyring (`keyring` 4.2). Explicit error where unavailable, no plaintext fallback    |
+| 5   | OAuth         | Hand-rolled `oauth1` module over `hmac`/`sha1` (~150 lines)                            |
+| 6   | Callback      | Out-of-band verifier code. No loopback listener                                        |
+| 7   | Byte path     | Spool to managed temp dir, upload from disk, delete on success                         |
+| 8   | Pipeline      | Call existing `export_images_impl` unmodified with a temp output folder                |
+| 9   | Idempotency   | Stable `X-Smug-UploadRequestId` per image + post-timeout reconciliation                |
 
 Rationale for the contentious ones. **User keys (3):** an embedded consumer secret in an
 open-source desktop binary is trivially extractable and puts CyberTimon on the hook for every
@@ -46,7 +46,7 @@ we need.
 ## SmugMug API v2 — the traps
 
 - **OAuth 1.0a only.** HMAC-SHA1 over `METHOD&encoded_url&encoded_sorted_params`.
-- Percent-encoding is RFC 3986 *unreserved only* (`-._~` survive, uppercase hex). Rust's URL
+- Percent-encoding is RFC 3986 _unreserved only_ (`-._~` survive, uppercase hex). Rust's URL
   helpers do not match this — hand-rolled and table-tested.
 - **Uploads accept OAuth parameters only in the `Authorization` header.** The canonical failure:
   clients defaulting to query-string params work for ordinary API calls and fail opaquely on every
@@ -59,8 +59,8 @@ we need.
 
 Undocumented headers, observed in SmugMug's own Lightroom plugin and worth adopting:
 `X-Smug-UploadRequestId` (stable per-upload id — with `X-Smug-RetryCount`, lets the server
-deduplicate retries), `X-Smug-AssetUri`, `X-Smug-Version`. The same plugin logs *"Album Upload
-timeout previously, search for files that might have uploaded successfully"* — even SmugMug's
+deduplicate retries), `X-Smug-AssetUri`, `X-Smug-Version`. The same plugin logs _"Album Upload
+timeout previously, search for files that might have uploaded successfully"_ — even SmugMug's
 client reconciles rather than blindly retrying. It also sets per-upload timeouts from measured
 bandwidth, and runs uploads on a pool separate from rendering.
 
@@ -70,12 +70,12 @@ bandwidth, and runs uploads on a pool separate from rendering.
 completion channel; `run_headless_export` (`:1352`) is a working template for calling it outside
 the command layer. A publish session does the same with a temp output folder.
 
-**Chunking.** Process in chunks of 8 — render chunk *n+1* while uploading chunk *n*, so the GPU and
+**Chunking.** Process in chunks of 8 — render chunk _n+1_ while uploading chunk _n_, so the GPU and
 the network overlap and the spool stays bounded at ~16 images (~320 MB at 45 MP). Tuning constant.
 
 **Spool.** `app_cache_dir/publish-spool/<session_uuid>/` — cache, not data: regenerable, and the OS
 already treats it as disposable. Write a `session.json` marker with pid and start time; delete each
-file *immediately* on upload success so the footprint tracks outstanding work; remove the directory
+file _immediately_ on upload success so the footprint tracks outstanding work; remove the directory
 via a `Drop` guard on every exit path, mirroring `ExportTaskGuard` (`:307-409`). `Drop` can't run
 after SIGKILL, so also sweep at startup for sessions >24 h old or with a dead pid. Never surfaced
 to the user.
@@ -89,7 +89,7 @@ values are wrong when sizes vary 20× and uplinks 100×. Cancellation reuses the
 from `cancel_export` (`:1455`).
 
 **Ambiguous failures.** A timeout may or may not have committed; blind retry risks a duplicate,
-giving up risks a missing photo. Retry with the same request id; if exhausted, mark *ambiguous*,
+giving up risks a missing photo. Retry with the same request id; if exhausted, mark _ambiguous_,
 not failed; at session end call `reconcile()` to list the album and match by filename and size;
 record what's found, re-queue what isn't. Per-image failures never abort the batch, and the state
 file records only confirmed successes.
@@ -132,8 +132,9 @@ pub struct PublishItem<'a> {
 }
 ```
 
-`publish_image` takes a **path**, not bytes — SmugMug reads once to hash for `Content-MD5` and
-streams once to send, which is its business. `DestinationCapabilities` (`supports_replace`,
+`publish_image` takes a **path**, not bytes — SmugMug reads the file once, hashes it for
+`Content-MD5` and sends that buffer, which is its business. It buffers rather than streams: the
+project's `reqwest` has no `stream` feature, and three concurrent 5–25 MB buffers are cheap. `DestinationCapabilities` (`supports_replace`,
 `supports_reconcile`, `supports_nested_containers`, `max_bytes`, `accepted_mime_types`) means the
 session never special-cases on `id()`. `async-trait` is required: `dyn` async traits aren't
 object-safe without boxing on Rust 1.98.
@@ -150,11 +151,20 @@ interrupted publish resumes.
 
 ```jsonc
 {
-  "version": 1, "destination": "smugmug", "account": "markallison",
-  "containers": { "<album_id>": { "remote_uri": "/api/v2/album/AbCdEf", "web_url": "…",
-                                  "last_published": "2026-09-12T10:14:02Z" } },
-  "images":     { "<virtual_path>": { "remote_uri": "/api/v2/image/XyZ123-0", "web_url": "…",
-                                      "fingerprint": "b3:9f2c…", "last_published": "…" } }
+  "version": 1,
+  "destination": "smugmug",
+  "account": "markallison",
+  "containers": {
+    "<album_id>": { "remote_uri": "/api/v2/album/AbCdEf", "web_url": "…", "last_published": "2026-09-12T10:14:02Z" },
+  },
+  "images": {
+    "<virtual_path>": {
+      "remote_uri": "/api/v2/image/XyZ123-0",
+      "web_url": "…",
+      "fingerprint": "b3:9f2c…",
+      "last_published": "…",
+    },
+  },
 }
 ```
 
@@ -163,7 +173,7 @@ interrupted publish resumes.
 
 **The fingerprint is Lightroom's `metadataThatTriggersRepublish`:**
 `blake3(source_mtime, source_size, adjustments_json, relevant_export_settings)` — `blake3` is
-already a dependency. Match ⇒ skip *before* rendering, so an unchanged album costs one file read
+already a dependency. Match ⇒ skip _before_ rendering, so an unchanged album costs one file read
 and no GPU work. `relevant_export_settings` excludes destination and filename-template fields,
 which don't affect pixels.
 
@@ -171,13 +181,17 @@ which don't affect pixels.
 
 ```
 src-tauri/src/publish/
-  mod.rs        trait, registry, PublishContext, PublishError, commands
-  session.rs    chunked render→upload driver, progress events, cancellation
-  spool.rs      temp dir lifecycle, Drop guard, startup sweep
-  state.rs      remote ID map, fingerprints, atomic persistence
-  oauth1.rs     OAuth 1.0a signing — generic, no SmugMug specifics
-  smugmug/      mod.rs · auth.rs (OAuth + keyring) · api.rs (album lookup/create)
-                upload.rs (raw-body POST, retry, reconcile) · model.rs
+  mod.rs               PublishDestination trait, re-exports
+  types.rs             PublishContext, PublishItem, PublishError and friends
+  registry.rs          destination list, single running-session slot
+  commands.rs          Tauri commands, startup spool sweep
+  session.rs           chunked render→upload driver, progress events, cancellation
+  spool.rs             temp dir lifecycle, Drop guard, startup sweep
+  state.rs             remote ID map, fingerprints, atomic persistence
+  oauth1.rs            OAuth 1.0a signing — generic, no SmugMug specifics
+  credential_store.rs  keyring access for consumer keys and tokens
+  smugmug/             mod.rs · auth.rs (OAuth flow) · api.rs (album lookup/create)
+                       upload.rs (raw-body POST, retry, reconcile) · model.rs
 
 src/components/panel/right/publish/
   PublishPanel.tsx · SmugMugAuthCard.tsx · PublishProgress.tsx
@@ -217,7 +231,7 @@ X-Smug-ImageUri:         /api/v2/image/XyZ123-0    (only when replacing)
 X-Smug-UploadRequestId:  <uuid, stable across retries>
 X-Smug-RetryCount:       <0, 1, 2, …>
 
-<raw file bytes, streamed from the spool>
+<raw file bytes, read from the spool>
 ```
 
 ## Frontend
@@ -235,27 +249,29 @@ surfaced.
 
 ## Integration surface
 
-| File | Change | Lines | Conflict risk |
-| --- | --- | --- | --- |
-| `src-tauri/Cargo.toml` | 5 deps: `async-trait`, `hmac`, `sha1`, `md-5`, `keyring` | ~5 | Low |
-| `src-tauri/src/lib.rs` | `mod publish;` + spool sweep in setup | 2 | Very low |
-| `src-tauri/src/lib.rs` | commands in `generate_handler![]` (line 2093) | ~8 | **Medium — both sides append** |
-| `src-tauri/src/app_state.rs` | `publish_registry` field + init | ~3 | Low |
-| `src/App.tsx` | import + mount `PublishPanel` | ~6 | Medium — busy file |
-| `src/store/useUIStore.ts` | `isPublishPanelVisible` | 2 | Low |
-| `src/components/views/LibraryView.tsx` | toolbar button | ~4 | Low |
-| `i18next.config.ts` | `extract.ignore` for the publish directory | 3 | Low |
-| `src/@types/i18next.d.ts` | `PublishTranslations` in the type augmentation | ~4 | Low |
-| **`src-tauri/src/export_processing.rs`** | **none** | **0** | **None** |
-| `src/i18n/**` | **none** | 0 | None |
+| File                                     | Change                                                                                                       | Lines | Conflict risk                  |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------ | ----- | ------------------------------ |
+| `src-tauri/Cargo.toml`                   | deps `async-trait`, `hmac`, `sha1`, `md-5`, `bytes`, `keyring`; dev-deps `tokio`, `wiremock` (with comments) | 21    | Low                            |
+| `src-tauri/src/lib.rs`                   | `mod publish;` + spool sweep in setup + registry init                                                        | 3     | Very low                       |
+| `src-tauri/src/lib.rs`                   | commands in `generate_handler![]`                                                                            | 10    | **Medium — both sides append** |
+| `src-tauri/src/app_state.rs`             | `publish_registry` field                                                                                     | 1     | Low                            |
+| `src/App.tsx`                            | import + `registerPublishResources()`                                                                        | 3     | Medium — busy file             |
+| `src/store/useUIStore.ts`                | `isPublishPanelVisible`                                                                                      | 2     | Low                            |
+| `src/components/views/LibraryView.tsx`   | import + mount `PublishDock`                                                                                 | 2     | Low                            |
+| `i18next.config.ts`                      | `extract.ignore` for the publish directory                                                                   | 3     | Low                            |
+| `src/@types/i18next.d.ts`                | `PublishTranslations` in the type augmentation                                                               | 5     | Low                            |
+| **`src-tauri/src/export_processing.rs`** | **none**                                                                                                     | **0** | **None**                       |
+| `src/i18n/**`                            | **none**                                                                                                     | 0     | None                           |
 
 **~50 lines across 8 existing files** (`scripts/check-fork-surface.sh` prints the live figure;
 `Cargo.lock` follows `Cargo.toml` and is not counted). Everything else is new, and new files never
 conflict.
 
-**i18n with zero edits:** `publish.i18n.ts` calls `i18n.addResourceBundle('en', 'translation',
-{ publish: {…} }, true, true)` at import time, instead of editing thirteen locale JSONs — thirteen
-conflict sites per merge.
+**i18n with zero locale edits:** `registerPublishResources()` in `publish.i18n.ts`, called once from
+`App.tsx`, runs `i18n.addResourceBundle(lang, 'translation', { publish: {…} }, true, true)` instead
+of editing thirteen locale JSONs — thirteen conflict sites per merge. Runtime registration alone
+fails CI's `i18next-cli extract --ci`, so `i18next.config.ts` ignores the publish directory, and
+`PublishTranslations` joins the `i18next.d.ts` augmentation so keys stay type-checked.
 
 **`generate_handler!`** is the one guaranteed recurring conflict: Tauri permits one
 `invoke_handler` and both sides append. Chosen: ~8 commands in a contiguous block behind a
@@ -283,8 +299,9 @@ for `oauth1.rs`, with a table-driven percent-encoding test. Property test for fi
 stability. Round-trip, migration and interrupted-write tests for the state file. Guard-runs-on-
 every-exit-path and sweep tests for the spool. `wiremock` fixtures for `api.rs`/`upload.rs` and the
 retry scenarios (500-then-success, 429 with `Retry-After`, timeout-then-found,
-timeout-then-absent) — no live network in CI. Manual end-to-end against a real account. The export
-pipeline is untouched, so its tests remain valid unchanged — worth stating in the PR.
+timeout-then-absent) — no live network in CI. Manual end-to-end against a real account. The project
+had no Rust tests before this; `publish` founds the harness (`[dev-dependencies]`, `#[cfg(test)]`
+modules) rather than extending one. The export pipeline is untouched, not "still tested".
 
 ## Phasing
 
@@ -296,14 +313,14 @@ pipeline is untouched, so its tests remain valid unchanged — worth stating in 
 
 ## Risks
 
-| Risk | Mitigation |
-| --- | --- |
+| Risk                                                                                                   | Mitigation                                                                     |
+| ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
 | **OAuth signing bugs — high likelihood**, percent-encoding and header-vs-query being the classic traps | RFC vectors before any SmugMug call; build `oauth1.rs` standalone and prove it |
-| Duplicates after timeout — inherent to the protocol | Stable request id + end-of-session `reconcile()` |
-| Spool left after a hard kill | `Drop` guard + startup sweep; cache dir limits the blast radius |
-| Upstream declines | The fork strategy above; nothing wasted |
-| `keyring` unavailable on some Linux setups | Explicit error, no plaintext fallback |
-| SmugMug rate limits, undocumented | Concurrency 3, honour `Retry-After`, log limit headers |
+| Duplicates after timeout — inherent to the protocol                                                    | Stable request id + end-of-session `reconcile()`                               |
+| Spool left after a hard kill                                                                           | `Drop` guard + startup sweep; cache dir limits the blast radius                |
+| Upstream declines                                                                                      | The fork strategy above; nothing wasted                                        |
+| `keyring` unavailable on some Linux setups                                                             | Explicit error, no plaintext fallback                                          |
+| SmugMug rate limits, undocumented                                                                      | Concurrency 3, honour `Retry-After`, log limit headers                         |
 
 Open, not blocking: whether to respect the library view's rating/colour filters (leaning yes, with
 the count shown first); whether AI tags (`tagging.rs`) feed `X-Smug-Keywords` (probably, off by
