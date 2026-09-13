@@ -64,6 +64,7 @@ import { useAppInitialization } from './hooks/useAppInitialization';
 import { useAndroidBackHandler } from './hooks/useAndroidBackHandler';
 import './i18n';
 import { registerPublishResources } from './components/panel/right/publish/publish.i18n';
+import PublishPanel from './components/panel/right/publish/PublishPanel';
 
 import {
   Invokes,
@@ -749,6 +750,8 @@ function App() {
           return <PresetsPanel onNavigateToCommunity={() => setUI({ activeView: 'community' })} />;
         case Panel.Tethering:
           return <TetheringPanel onLibraryRefresh={handleLibraryRefresh} onImageSelect={handleImageSelect} />;
+        case Panel.Publish:
+          return <PublishPanel />;
         default:
           return null;
       }

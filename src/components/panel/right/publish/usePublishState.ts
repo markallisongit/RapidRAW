@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-shell';
+import { create } from 'zustand';
+import { useShallow } from 'zustand/react/shallow';
 
 import { ExportSettings } from '../../../ui/ExportImportProperties';
 
@@ -92,29 +94,96 @@ export const displayError = (error: unknown, localFileMessage: string): string =
   return message;
 };
 
+interface DestinationEntry {
+  destination: DestinationInfo | null;
+  authStatus: AuthStatus | null;
+  authError: string | null;
+  challenge: AuthChallenge | null;
+}
+
+const EMPTY_DESTINATION: DestinationEntry = {
+  destination: null,
+  authStatus: null,
+  authError: null,
+  challenge: null,
+};
+
+interface PublishStore {
+  destinations: Record<string, DestinationEntry>;
+  /** One for the app: the backend runs a single session, and its events name no destination. */
+  session: PublishSessionState;
+}
+
 /**
- * The publish commands and session events for one destination. Listeners are
- * held for the lifetime of the component, so a session keeps reporting while
- * the panel is hidden.
+ * Outside the component because the panel is a tab, and a tab unmounts while
+ * another is active. The backend reports a session only through events and
+ * cannot be asked what one is doing after the fact, so progress and a pending
+ * authorisation have to outlive the panel.
+ */
+const usePublishStore = create<PublishStore>(() => ({ destinations: {}, session: IDLE_SESSION }));
+
+const updateDestination = (destinationId: string, patch: Partial<DestinationEntry>) =>
+  usePublishStore.setState((state) => ({
+    destinations: {
+      ...state.destinations,
+      [destinationId]: { ...(state.destinations[destinationId] ?? EMPTY_DESTINATION), ...patch },
+    },
+  }));
+
+const updateSession = (update: (current: PublishSessionState) => PublishSessionState) =>
+  usePublishStore.setState((state) => ({ session: update(state.session) }));
+
+let isListening = false;
+
+/** Registered once and never removed, for the same reason the store is global. */
+const listenForSessionEvents = () => {
+  if (isListening) return;
+  isListening = true;
+
+  const finish = (phase: SessionPhase) => (event: { payload: SessionSummary }) =>
+    updateSession((current) => ({ ...current, phase, summary: event.payload }));
+
+  listen<PublishProgressEvent>('publish-progress', (event) => {
+    const { completed, total, current_file, state } = event.payload;
+    updateSession((current) => ({
+      ...current,
+      phase: current.phase === 'cancelling' ? 'cancelling' : 'running',
+      completed,
+      total,
+      items: [...current.items, { file: current_file, state }],
+    }));
+  });
+  listen<SessionSummary>('publish-complete', finish('complete'));
+  listen<SessionSummary>('publish-cancelled', finish('cancelled'));
+  listen<string>('publish-error', (event) => {
+    updateSession((current) => ({ ...current, phase: 'error', error: event.payload }));
+  });
+};
+
+/**
+ * The publish commands and session events for one destination.
  */
 export function usePublishState(destinationId: string, isActive: boolean) {
-  const [destination, setDestination] = useState<DestinationInfo | null>(null);
-  const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
-  const [authError, setAuthError] = useState<string | null>(null);
-  const [challenge, setChallenge] = useState<AuthChallenge | null>(null);
-  const [session, setSession] = useState<PublishSessionState>(IDLE_SESSION);
+  const { destination, authStatus, authError, challenge } = usePublishStore(
+    useShallow((state) => state.destinations[destinationId] ?? EMPTY_DESTINATION),
+  );
+  const session = usePublishStore((state) => state.session);
+
+  useEffect(listenForSessionEvents, []);
 
   const refreshAuth = useCallback(async () => {
-    setAuthError(null);
+    updateDestination(destinationId, { authError: null });
     try {
       const [destinations, status] = await Promise.all([
         invoke<DestinationInfo[]>('publish_get_destinations'),
         invoke<AuthStatus>('publish_get_auth_status', { destinationId }),
       ]);
-      setDestination(destinations.find((d) => d.id === destinationId) ?? null);
-      setAuthStatus(status);
+      updateDestination(destinationId, {
+        destination: destinations.find((d) => d.id === destinationId) ?? null,
+        authStatus: status,
+      });
     } catch (error) {
-      setAuthError(String(error));
+      updateDestination(destinationId, { authError: String(error) });
     }
   }, [destinationId]);
 
@@ -122,37 +191,10 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     if (isActive && authStatus === null) refreshAuth();
   }, [isActive, authStatus, refreshAuth]);
 
-  useEffect(() => {
-    const finish = (phase: SessionPhase) => (event: { payload: SessionSummary }) =>
-      setSession((current) => ({ ...current, phase, summary: event.payload }));
-
-    const listeners = [
-      listen<PublishProgressEvent>('publish-progress', (event) => {
-        const { completed, total, current_file, state } = event.payload;
-        setSession((current) => ({
-          ...current,
-          phase: current.phase === 'cancelling' ? 'cancelling' : 'running',
-          completed,
-          total,
-          items: [...current.items, { file: current_file, state }],
-        }));
-      }),
-      listen<SessionSummary>('publish-complete', finish('complete')),
-      listen<SessionSummary>('publish-cancelled', finish('cancelled')),
-      listen<string>('publish-error', (event) => {
-        setSession((current) => ({ ...current, phase: 'error', error: event.payload }));
-      }),
-    ];
-
-    return () => {
-      listeners.forEach((p) => p.then((unlisten) => unlisten()));
-    };
-  }, []);
-
   const setCredentials = useCallback(
     async (key: string, secret: string) => {
       await invoke('publish_set_credentials', { destinationId, key, secret });
-      setChallenge(null);
+      updateDestination(destinationId, { challenge: null });
       await refreshAuth();
     },
     [destinationId, refreshAuth],
@@ -160,7 +202,7 @@ export function usePublishState(destinationId: string, isActive: boolean) {
 
   const beginAuth = useCallback(async () => {
     const next = await invoke<AuthChallenge>('publish_begin_auth', { destinationId });
-    setChallenge(next);
+    updateDestination(destinationId, { challenge: next });
     await open(next.authorize_url);
   }, [destinationId]);
 
@@ -175,7 +217,7 @@ export function usePublishState(destinationId: string, isActive: boolean) {
       } finally {
         // A verifier is spent whether or not the exchange succeeded, so a
         // retry needs a fresh challenge either way.
-        setChallenge(null);
+        updateDestination(destinationId, { challenge: null });
       }
       await refreshAuth();
     },
@@ -189,28 +231,28 @@ export function usePublishState(destinationId: string, isActive: boolean) {
 
   const publish = useCallback(
     async (target: PublishTarget) => {
-      setSession({ ...IDLE_SESSION, phase: 'starting' });
+      updateSession(() => ({ ...IDLE_SESSION, phase: 'starting' }));
       try {
         await invoke('publish_album', { destinationId, ...target });
-        setSession((current) => (current.phase === 'starting' ? { ...current, phase: 'running' } : current));
+        updateSession((current) => (current.phase === 'starting' ? { ...current, phase: 'running' } : current));
       } catch (error) {
-        setSession({ ...IDLE_SESSION, phase: 'error', error: String(error) });
+        updateSession(() => ({ ...IDLE_SESSION, phase: 'error', error: String(error) }));
       }
     },
     [destinationId],
   );
 
   const cancel = useCallback(async () => {
-    setSession((current) => ({ ...current, phase: 'cancelling' }));
+    updateSession((current) => ({ ...current, phase: 'cancelling' }));
     try {
       await invoke<boolean>('publish_cancel');
     } catch (error) {
       console.error('Failed to cancel publishing:', error);
-      setSession((current) => (current.phase === 'cancelling' ? { ...current, phase: 'running' } : current));
+      updateSession((current) => (current.phase === 'cancelling' ? { ...current, phase: 'running' } : current));
     }
   }, []);
 
-  const dismissSession = useCallback(() => setSession(IDLE_SESSION), []);
+  const dismissSession = useCallback(() => updateSession(() => IDLE_SESSION), []);
 
   return {
     destination,

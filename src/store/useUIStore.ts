@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { platform } from '@tauri-apps/plugin-os';
 import {
   ImageFile,
   Panel,
@@ -94,6 +95,7 @@ const ALL_PANELS: Panel[] = [
   Panel.Metadata,
   Panel.FolderTree,
   Panel.Export,
+  Panel.Publish,
   Panel.Tethering,
   Panel.Adjustments,
   Panel.Crop,
@@ -106,6 +108,7 @@ const DEFAULT_PANEL_DEFAULT_REGIONS: Record<Panel, PanelRegion> = {
   [Panel.Metadata]: 'leftTop',
   [Panel.FolderTree]: 'leftTop',
   [Panel.Export]: 'leftTop',
+  [Panel.Publish]: 'leftTop',
   [Panel.Tethering]: 'leftTop',
   [Panel.Adjustments]: 'rightTop',
   [Panel.Crop]: 'rightTop',
@@ -118,11 +121,24 @@ export const DEFAULT_PANEL_WIDTH = 350;
 export const DEFAULT_PANEL_SECTION_HEIGHT = 450;
 export const DEFAULT_BOTTOM_PANEL_HEIGHT = 144;
 
+// Publishing keeps credentials in the system keyring, which has no Android backend.
+const isPublishSupported = (() => {
+  try {
+    return platform() !== 'android';
+  } catch {
+    return true;
+  }
+})();
+
 export function reconcileWorkspace(
   savedWorkspace: WorkspaceState | undefined,
   isTetheringSupported: boolean,
 ): WorkspaceState {
-  const allowedPanels = new Set(ALL_PANELS.filter((p) => p !== Panel.Tethering || isTetheringSupported));
+  const allowedPanels = new Set(
+    ALL_PANELS.filter(
+      (p) => (p !== Panel.Tethering || isTetheringSupported) && (p !== Panel.Publish || isPublishSupported),
+    ),
+  );
 
   const defaultWorkspace: WorkspaceState = {
     leftPanelWidth: DEFAULT_PANEL_WIDTH,
@@ -130,7 +146,13 @@ export function reconcileWorkspace(
     leftTopHeight: DEFAULT_PANEL_SECTION_HEIGHT,
     rightTopHeight: DEFAULT_PANEL_SECTION_HEIGHT,
     panelLayout: {
-      leftTop: [Panel.Metadata, Panel.FolderTree, Panel.Export, ...(isTetheringSupported ? [Panel.Tethering] : [])],
+      leftTop: [
+        Panel.Metadata,
+        Panel.FolderTree,
+        Panel.Export,
+        ...(isPublishSupported ? [Panel.Publish] : []),
+        ...(isTetheringSupported ? [Panel.Tethering] : []),
+      ],
       leftBottom: [],
       rightTop: [Panel.Adjustments, Panel.Crop, Panel.Masks, Panel.Ai, Panel.Presets],
       rightBottom: [],
@@ -217,7 +239,6 @@ export interface UIState {
   isLayoutReady: boolean;
   uiVisibility: UiVisibility;
   isLibraryExportPanelVisible: boolean;
-  isPublishPanelVisible: boolean;
   isSettingsOpen: boolean;
 
   leftPanelWidth: number;
@@ -286,7 +307,6 @@ export const useUIStore = create<UIState>((set, get) => ({
   isLayoutReady: false,
   uiVisibility: { filmstrip: true, leftPanel: true, rightPanel: true },
   isLibraryExportPanelVisible: false,
-  isPublishPanelVisible: false,
   isSettingsOpen: false,
 
   leftPanelWidth: DEFAULT_PANEL_WIDTH,
@@ -297,7 +317,7 @@ export const useUIStore = create<UIState>((set, get) => ({
   compactEditorPanelHeightOverride: null,
 
   panelLayout: {
-    leftTop: [Panel.Metadata, Panel.FolderTree, Panel.Export],
+    leftTop: [Panel.Metadata, Panel.FolderTree, Panel.Export, Panel.Publish],
     leftBottom: [],
     rightTop: [Panel.Adjustments, Panel.Crop, Panel.Masks, Panel.Ai, Panel.Presets],
     rightBottom: [],

@@ -13,8 +13,6 @@ import i18n from 'i18next';
 export const publishResources = {
   panel: {
     title: 'Publish',
-    close: 'Close',
-    openPanel: 'Publish album',
     loading: 'Checking your SmugMug connection…',
     retry: 'Try again',
   },

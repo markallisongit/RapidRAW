@@ -13,6 +13,7 @@ import {
   FileInput,
   Camera,
   Folder as FolderIcon,
+  Send,
   type LucideIcon,
 } from 'lucide-react';
 import { Panel, PanelRegion } from '../ui/AppProperties';
@@ -28,6 +29,7 @@ export const PANEL_ICONS: Record<Panel, LucideIcon> = {
   [Panel.Export]: FileInput,
   [Panel.FolderTree]: FolderIcon,
   [Panel.Tethering]: Camera,
+  [Panel.Publish]: Send,
 };
 
 const PANEL_TITLES: Record<Panel, string> = {
@@ -40,6 +42,7 @@ const PANEL_TITLES: Record<Panel, string> = {
   [Panel.Export]: 'editor.switcher.tooltips.export',
   [Panel.FolderTree]: 'library.folders.sourcesTitle',
   [Panel.Tethering]: 'editor.switcher.tooltips.tethering',
+  [Panel.Publish]: 'publish.panel.title',
 };
 
 function PanelTab({ panel, region, side }: { panel: Panel; region: PanelRegion; side: 'left' | 'right' }) {

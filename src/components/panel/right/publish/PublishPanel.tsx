@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useShallow } from 'zustand/react/shallow';
 import { motion } from 'framer-motion';
-import { AlertTriangle, ArrowUpRight, Loader, Send, UploadCloud, X } from 'lucide-react';
+import { AlertTriangle, ArrowUpRight, Loader, UploadCloud } from 'lucide-react';
 
 import Button from '../../../ui/Button';
 import Dropdown from '../../../ui/Dropdown';
@@ -19,7 +19,7 @@ import { TextColors, TextVariants, TextWeights } from '../../../../types/typogra
 import { useExportSettings } from '../../../../hooks/useExportSettings';
 import { useLibraryStore } from '../../../../store/useLibraryStore';
 import { useSettingsStore } from '../../../../store/useSettingsStore';
-import { DEFAULT_PANEL_WIDTH, useUIStore } from '../../../../store/useUIStore';
+import { useUIStore } from '../../../../store/useUIStore';
 import PublishProgress from './PublishProgress';
 import SmugMugAuthCard from './SmugMugAuthCard';
 import { PublishPreview, PublishTarget, displayError, usePublishState } from './usePublishState';
@@ -96,54 +96,10 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   );
 }
 
-/**
- * The library's entry point: a button level with the bottom bar while closed,
- * the panel beside the grid while open. Desktop only — the keyring the
- * credentials live in has no Android backend.
- */
-export function PublishDock() {
+/** Session and authorisation state live in `usePublishState`'s store, so switching tabs loses neither. */
+export default function PublishPanel() {
   const { t } = useTranslation();
-  const { isPublishPanelVisible, activeView, setUI } = useUIStore(
-    useShallow((state) => ({
-      isPublishPanelVisible: state.isPublishPanelVisible,
-      activeView: state.activeView,
-      setUI: state.setUI,
-    })),
-  );
-  const hasRoots = useLibraryStore((state) => state.rootPaths.length > 0);
-  const isVisible = isPublishPanelVisible && hasRoots && activeView !== 'community';
-
-  return (
-    <div
-      className={isVisible ? 'shrink-0 h-full ml-2' : 'shrink-0 flex flex-col justify-end'}
-      style={isVisible ? { width: DEFAULT_PANEL_WIDTH } : undefined}
-    >
-      <PublishPanel isVisible={isVisible} onClose={() => setUI({ isPublishPanelVisible: false })} />
-      {!isVisible && hasRoots && activeView !== 'community' && (
-        <button
-          className="ml-2 h-12 w-12 bg-bg-secondary rounded-lg flex items-center justify-center text-text-secondary hover:text-text-primary transition-colors"
-          onClick={() => setUI({ isPublishPanelVisible: true })}
-          data-tooltip={t('publish.panel.openPanel')}
-        >
-          <Send size={18} />
-        </button>
-      )}
-    </div>
-  );
-}
-
-interface PublishPanelProps {
-  isVisible: boolean;
-  onClose: () => void;
-}
-
-/**
- * Stays mounted while hidden so a running session keeps its progress: the
- * backend reports a session only through events, and has no way to ask what
- * one is doing after the fact.
- */
-export default function PublishPanel({ isVisible, onClose }: PublishPanelProps) {
-  const { t } = useTranslation();
+  const isVisible = useUIStore((state) => Object.values(state.activePanels).includes(Panel.Publish));
   const api = usePublishState(DESTINATION_ID, isVisible);
   const { authStatus, authError, destination, session } = api;
   const destinationName = destination?.display_name ?? 'SmugMug';
@@ -367,18 +323,9 @@ export default function PublishPanel({ isVisible, onClose }: PublishPanelProps) 
   };
 
   return (
-    <div className={isVisible ? 'h-full bg-bg-secondary rounded-lg flex flex-col' : 'hidden'}>
+    <div className="flex flex-col h-full">
       <div className="p-3 flex justify-between items-center shrink-0 border-b border-surface">
-        <Text variant={TextVariants.title} className="flex items-center gap-2">
-          <Send size={18} /> {t('publish.panel.title')}
-        </Text>
-        <button
-          className="p-1 rounded-md text-text-secondary hover:text-text-primary hover:bg-surface"
-          onClick={onClose}
-          data-tooltip={t('publish.panel.close')}
-        >
-          <X size={18} />
-        </button>
+        <Text variant={TextVariants.title}>{t('publish.panel.title')}</Text>
       </div>
 
       {session.phase !== 'idle' ? (

@@ -133,6 +133,7 @@ export enum Panel {
   Presets = 'presets',
   FolderTree = 'folderTree',
   Tethering = 'tethering',
+  Publish = 'publish',
 }
 
 export type PanelRegion = 'leftTop' | 'leftBottom' | 'rightTop' | 'rightBottom';
