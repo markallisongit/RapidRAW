@@ -3,6 +3,7 @@ pub mod credential_store;
 pub mod oauth1;
 pub mod registry;
 pub mod session;
+pub mod settings;
 pub mod smugmug;
 pub mod spool;
 pub mod state;
@@ -12,8 +13,8 @@ use async_trait::async_trait;
 
 pub use registry::PublishRegistry;
 pub use types::{
-    AuthChallenge, AuthStatus, ConsumerCredentials, DestinationCapabilities, LocalContainer,
-    PublishContext, PublishError, PublishItem, RemoteContainerId, RemoteImageId,
+    AuthChallenge, AuthStatus, ConsumerCredentials, ContainerPrivacy, DestinationCapabilities,
+    LocalContainer, PublishContext, PublishError, PublishItem, RemoteContainerId, RemoteImageId,
 };
 
 /// A place photos can be published to.
@@ -31,6 +32,11 @@ pub trait PublishDestination: Send + Sync {
     async fn begin_auth(&self, ctx: &PublishContext) -> Result<AuthChallenge, PublishError>;
     async fn complete_auth(&self, verifier: &str, ctx: &PublishContext)
     -> Result<(), PublishError>;
+
+    /// Forgets the access token, leaving the consumer credentials, the state
+    /// and its links alone, so reconnecting the same account resumes where
+    /// it left off. Idempotent.
+    async fn disconnect(&self, ctx: &PublishContext) -> Result<(), PublishError>;
 
     /// Idempotent.
     async fn ensure_container(

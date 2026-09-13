@@ -68,6 +68,10 @@ pub fn account_key(nickname: &str) -> String {
     format!("smugmug:{nickname}")
 }
 
+/// Keyring account naming which nickname is connected. `connected:` leads, as
+/// `consumer:` does, so no nickname's token entry can collide with it.
+const CONNECTED_ACCOUNT_KEY: &str = "connected:smugmug";
+
 /// Tidies the six-digit verifier the user pastes back from the browser.
 ///
 /// Pasting picks up surrounding whitespace far more often than not, and an
@@ -122,6 +126,29 @@ impl SmugMugAuth {
                 Ok(Some((pair.token, pair.token_secret)))
             }
             None => Ok(None),
+        }
+    }
+
+    /// Idempotent: a token that is already gone is not an error.
+    pub fn delete_tokens(account: &str) -> Result<(), PublishError> {
+        store::delete(account)
+    }
+
+    /// The nickname of the connected account, which names its token entry.
+    /// `None` before the first connection and after a disconnect.
+    ///
+    /// In the keyring beside the tokens rather than in the state file, whose
+    /// account records whom the links belong to: connecting a different
+    /// account must not rewrite that, or the publish guard could never
+    /// notice the difference.
+    pub fn connected_account() -> Result<Option<String>, PublishError> {
+        store::get(CONNECTED_ACCOUNT_KEY)
+    }
+
+    pub fn set_connected_account(nickname: Option<&str>) -> Result<(), PublishError> {
+        match nickname {
+            Some(nickname) => store::set(CONNECTED_ACCOUNT_KEY, nickname),
+            None => store::delete(CONNECTED_ACCOUNT_KEY),
         }
     }
 

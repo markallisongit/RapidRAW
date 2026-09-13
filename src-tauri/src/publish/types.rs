@@ -41,6 +41,25 @@ pub struct DestinationCapabilities {
     /// Per-file upload ceiling, when the destination publishes one.
     pub max_bytes: Option<u64>,
     pub accepted_mime_types: &'static [&'static str],
+    /// The privacy levels a new container can be created with, so the Publish
+    /// Manager offers only what the destination can honour.
+    pub supported_privacy: &'static [ContainerPrivacy],
+}
+
+/// Who can see a container the destination creates. Destination-neutral: each
+/// destination maps it onto its own vocabulary.
+///
+/// Applies only when creating. Finding or linking an existing container never
+/// changes its privacy, which the user may have set deliberately on the
+/// service itself.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ContainerPrivacy {
+    /// The default, matching SmugMug's own Lightroom plugin.
+    #[default]
+    Public,
+    /// Reachable by anyone with the link, but not listed.
+    Unlisted,
+    Private,
 }
 
 /// A local album as the session sees it, before any destination mapping.
@@ -96,6 +115,13 @@ pub struct PublishContext {
     pub consumer: Option<ConsumerCredentials>,
     /// Set when the user cancels; checked between retries and uploads.
     pub cancel: Arc<AtomicBool>,
+    /// The privacy of a container [`ensure_container`](crate::publish::PublishDestination::ensure_container)
+    /// has to create, from the destination's settings.
+    ///
+    /// A field here rather than an argument, because it changes the trait
+    /// less: no destination method gains a parameter, and a later create path
+    /// reads the same field instead of threading an options value through.
+    pub new_container_privacy: ContainerPrivacy,
 }
 
 /// One image to publish, borrowed from the session's spool.

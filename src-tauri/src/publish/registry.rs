@@ -140,8 +140,8 @@ mod tests {
     use crate::publish::PublishDestination;
     use crate::publish::registry::PublishRegistry;
     use crate::publish::types::{
-        AuthChallenge, AuthStatus, DestinationCapabilities, LocalContainer, PublishContext,
-        PublishError, PublishItem, RemoteContainerId, RemoteImageId,
+        AuthChallenge, AuthStatus, ContainerPrivacy, DestinationCapabilities, LocalContainer,
+        PublishContext, PublishError, PublishItem, RemoteContainerId, RemoteImageId,
     };
 
     struct StubDestination;
@@ -163,6 +163,7 @@ mod tests {
                 supports_nested_containers: false,
                 max_bytes: None,
                 accepted_mime_types: &["image/jpeg"],
+                supported_privacy: &[ContainerPrivacy::Public],
             }
         }
 
@@ -179,6 +180,10 @@ mod tests {
             _verifier: &str,
             _ctx: &PublishContext,
         ) -> Result<(), PublishError> {
+            unimplemented!()
+        }
+
+        async fn disconnect(&self, _ctx: &PublishContext) -> Result<(), PublishError> {
             unimplemented!()
         }
 

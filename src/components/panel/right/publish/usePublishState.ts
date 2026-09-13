@@ -7,7 +7,7 @@ import { useShallow } from 'zustand/react/shallow';
 
 import { ExportSettings } from '../../../ui/ExportImportProperties';
 
-// Mirrors the serde shapes in src-tauri/src/publish/{types,session,commands}.rs.
+// Mirrors the serde shapes in src-tauri/src/publish/{types,session,settings,commands}.rs.
 
 export type AuthStatus =
   { status: 'NotConfigured' } | { status: 'NotAuthorised' } | { status: 'Connected'; account: string };
@@ -15,6 +15,14 @@ export type AuthStatus =
 export interface AuthChallenge {
   authorize_url: string;
   instructions_key: string;
+}
+
+export type ContainerPrivacy = 'Public' | 'Unlisted' | 'Private';
+
+export interface DestinationSettings {
+  export_preset_id: string | null;
+  /** Applied only when an album is created, never to one found or linked. */
+  new_album_privacy: ContainerPrivacy;
 }
 
 export interface DestinationInfo {
@@ -26,6 +34,7 @@ export interface DestinationInfo {
     supports_nested_containers: boolean;
     max_bytes: number | null;
     accepted_mime_types: string[];
+    supported_privacy: ContainerPrivacy[];
   };
 }
 
@@ -224,6 +233,23 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     [destinationId, refreshAuth],
   );
 
+  const getSettings = useCallback(
+    () => invoke<DestinationSettings>('publish_get_settings', { destinationId }),
+    [destinationId],
+  );
+
+  const setSettings = useCallback(
+    (settings: DestinationSettings) => invoke('publish_set_settings', { destinationId, settings }),
+    [destinationId],
+  );
+
+  /** Keeps the API key and every link, so reconnecting resumes where it left off. */
+  const disconnect = useCallback(async () => {
+    await invoke('publish_disconnect', { destinationId });
+    updateDestination(destinationId, { challenge: null });
+    await refreshAuth();
+  }, [destinationId, refreshAuth]);
+
   const preview = useCallback(
     (target: PublishTarget) => invoke<PublishPreview>('publish_preview', { destinationId, ...target }),
     [destinationId],
@@ -265,6 +291,9 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     beginAuth,
     reopenAuthPage,
     completeAuth,
+    getSettings,
+    setSettings,
+    disconnect,
     preview,
     publish,
     cancel,

@@ -6,13 +6,11 @@
 //! directory is a worse outcome than an error message, and silently
 //! downgrading the guarantee is not ours to do.
 
-use std::path::Path;
-
 use crate::publish::oauth1::{parse_query, percent_encode};
-use crate::publish::state::PublishState;
 use crate::publish::{ConsumerCredentials, PublishError};
 
 /// Keyring service name, matching the bundle identifier in `tauri.conf.json`.
+#[cfg_attr(test, allow(dead_code))]
 pub const KEYRING_SERVICE: &str = "io.github.CyberTimon.RapidRAW";
 
 /// Keyring account holding a destination's consumer credentials.
@@ -39,19 +37,18 @@ pub fn store_consumer(
     store::set(&consumer_key(destination_id), &encode_consumer(consumer))
 }
 
-/// Stores the credentials the user entered, trimmed, and disconnects the
-/// account when they belong to a different application.
+/// Stores the credentials the user entered, trimmed, and says whether they
+/// belong to a different application, in which case the caller disconnects.
 ///
-/// An access token is minted for one consumer key, so keeping the old
-/// account after the key changes would report Connected and then fail every
+/// An access token is minted for one consumer key, so keeping the account
+/// connected after the key changes would report Connected and then fail every
 /// call with a signature error. A stored pair that cannot be read counts as
 /// different: re-entering the credentials is how the user repairs it.
 pub fn replace_consumer(
-    state_dir: &Path,
     destination_id: &str,
     key: &str,
     secret: &str,
-) -> Result<(), PublishError> {
+) -> Result<bool, PublishError> {
     let consumer = ConsumerCredentials {
         key: key.trim().to_string(),
         secret: secret.trim().to_string(),
@@ -67,14 +64,7 @@ pub fn replace_consumer(
         Ok(Some(previous)) if previous.key == consumer.key
     );
     store_consumer(destination_id, &consumer)?;
-    if unchanged {
-        return Ok(());
-    }
-
-    if PublishState::account_in(state_dir, destination_id)?.is_some() {
-        PublishState::set_account_in(state_dir, destination_id, None)?;
-    }
-    Ok(())
+    Ok(!unchanged)
 }
 
 /// Form encoding, like the token entries, so a key or secret containing `&`
@@ -103,9 +93,12 @@ fn decode_consumer(blob: &str) -> Result<ConsumerCredentials, PublishError> {
     }
 }
 
-pub use store::{get, set};
+pub use store::{delete, get, set};
 
-#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+#[cfg(all(
+    not(test),
+    any(target_os = "windows", target_os = "macos", target_os = "linux")
+))]
 mod store {
     use super::{KEYRING_SERVICE, PublishError};
 
@@ -145,11 +138,23 @@ mod store {
     pub fn set(account: &str, secret: &str) -> Result<(), PublishError> {
         entry(account)?.set_password(secret).map_err(unavailable)
     }
+
+    /// Deleting what is not there is not an error: the outcome the caller
+    /// wanted, no entry, is already true.
+    pub fn delete(account: &str) -> Result<(), PublishError> {
+        match entry(account)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(unavailable(error)),
+        }
+    }
 }
 
 /// `keyring` has no backend here, and the publish panel is desktop-only, so
 /// reaching this is a bug rather than something a user can hit.
-#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    not(test),
+    not(any(target_os = "windows", target_os = "macos", target_os = "linux"))
+))]
 mod store {
     use super::PublishError;
 
@@ -166,6 +171,43 @@ mod store {
     pub fn set(_account: &str, _secret: &str) -> Result<(), PublishError> {
         Err(unsupported())
     }
+
+    pub fn delete(_account: &str) -> Result<(), PublishError> {
+        Err(unsupported())
+    }
+}
+
+/// An in-memory keyring, so tests never read or write the developer's real
+/// one. Per thread, which isolates tests from each other: the test runner
+/// gives each its own thread, and `#[tokio::test]` runs on that thread.
+#[cfg(test)]
+mod store {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    use super::PublishError;
+
+    thread_local! {
+        static ENTRIES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    }
+
+    pub fn get(account: &str) -> Result<Option<String>, PublishError> {
+        Ok(ENTRIES.with(|entries| entries.borrow().get(account).cloned()))
+    }
+
+    pub fn set(account: &str, secret: &str) -> Result<(), PublishError> {
+        ENTRIES.with(|entries| {
+            entries
+                .borrow_mut()
+                .insert(account.to_string(), secret.to_string())
+        });
+        Ok(())
+    }
+
+    pub fn delete(account: &str) -> Result<(), PublishError> {
+        ENTRIES.with(|entries| entries.borrow_mut().remove(account));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +223,40 @@ mod tests {
         let decoded = decode_consumer(&encode_consumer(&consumer)).unwrap();
         assert_eq!(decoded.key, consumer.key);
         assert_eq!(decoded.secret, consumer.secret);
+    }
+
+    #[test]
+    fn replacing_the_consumer_reports_whether_the_application_changed() {
+        assert!(
+            replace_consumer("dest", " key-1 ", "secret-1\n").unwrap(),
+            "nothing was stored before"
+        );
+        let stored = load_consumer("dest").unwrap().unwrap();
+        assert_eq!(
+            (stored.key.as_str(), stored.secret.as_str()),
+            ("key-1", "secret-1")
+        );
+
+        assert!(
+            !replace_consumer("dest", "key-1", "secret-2").unwrap(),
+            "a new secret for the same key keeps the token"
+        );
+        assert_eq!(load_consumer("dest").unwrap().unwrap().secret, "secret-2");
+
+        assert!(replace_consumer("dest", "key-2", "secret-2").unwrap());
+    }
+
+    #[test]
+    fn an_unreadable_stored_consumer_counts_as_a_different_application() {
+        set(&consumer_key("dest"), "garbage").unwrap();
+        assert!(replace_consumer("dest", "key", "secret").unwrap());
+    }
+
+    #[test]
+    fn a_blank_key_or_secret_is_refused_and_stores_nothing() {
+        assert!(replace_consumer("dest", "  ", "secret").is_err());
+        assert!(replace_consumer("dest", "key", "").is_err());
+        assert!(load_consumer("dest").unwrap().is_none());
     }
 
     #[test]

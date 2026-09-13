@@ -256,9 +256,8 @@ impl PublishState {
 
     /// The recorded account, without loading or migrating anything else.
     ///
-    /// Reading and writing the account needs no album tree, so connecting and
-    /// disconnecting never have to load — and could never mis-migrate — the
-    /// image records.
+    /// Reading the account needs no album tree, so checking a connection never
+    /// has to load — and could never mis-migrate — the image records.
     pub fn account_in(dir: &Path, destination_id: &str) -> Result<Option<String>, PublishError> {
         #[derive(Deserialize)]
         struct AccountProbe {
@@ -271,23 +270,25 @@ impl PublishState {
         }
     }
 
-    /// Replaces the recorded account and leaves every other part of the file,
-    /// its version included, exactly as it was.
-    pub fn set_account_in(
-        dir: &Path,
-        destination_id: &str,
-        account: Option<String>,
-    ) -> Result<(), PublishError> {
-        let path = state_file(dir, destination_id)?;
-        let mut document = match read_versioned(&path)? {
-            Some((_, bytes)) => decode::<Value>(&path, &bytes)?,
-            None => serde_json::to_value(Self::empty(destination_id))
-                .map_err(|e| PublishError::Io(format!("encoding publish state: {e}")))?,
-        };
-        document["account"] = account.map_or(Value::Null, Value::String);
-        let encoded = serde_json::to_vec_pretty(&document)
-            .map_err(|e| PublishError::Io(format!("encoding publish state: {e}")))?;
-        write_atomically(&path, &encoded)
+    /// Checks that `connected` is the account the links belong to, and records
+    /// it when nothing is linked yet.
+    ///
+    /// Refused when the links belong to someone else: their remote ids name
+    /// albums and images in that other account, so publishing would try to
+    /// replace images in albums the connected account does not own.
+    pub fn claim_account(&mut self, connected: &str) -> Result<(), PublishError> {
+        match self.account.as_deref() {
+            Some(recorded) if recorded != connected && !self.links.is_empty() => {
+                Err(PublishError::NotAuthorised(format!(
+                    "the linked albums belong to the account \"{recorded}\", but \
+                     \"{connected}\" is connected. Reconnect as {recorded} to publish them"
+                )))
+            }
+            _ => {
+                self.account = Some(connected.to_string());
+                Ok(())
+            }
+        }
     }
 
     #[cfg(test)]
@@ -643,7 +644,7 @@ fn decode<T: serde::de::DeserializeOwned>(path: &Path, bytes: &[u8]) -> Result<T
 /// kill at any point leaves either the previous file or the new one, never a
 /// truncated file — and a stranded `.tmp` is ignored by
 /// [`PublishState::load_from`] and overwritten by the next save.
-fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), PublishError> {
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), PublishError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| PublishError::Io(format!("creating {}: {e}", parent.display())))?;
@@ -838,6 +839,15 @@ pub fn state_dir(app_handle: &AppHandle) -> Result<PathBuf, PublishError> {
 
 /// `<dir>/<destination_id>.json`.
 fn state_file(dir: &Path, destination_id: &str) -> Result<PathBuf, PublishError> {
+    destination_file(dir, destination_id, "json")
+}
+
+/// `<dir>/<destination_id>.<extension>`, for every per-destination file.
+pub(crate) fn destination_file(
+    dir: &Path,
+    destination_id: &str,
+    extension: &str,
+) -> Result<PathBuf, PublishError> {
     // Destination ids are `&'static str` constants today, but this path is
     // derived from one, so check rather than trust: a `../` in an id would
     // write outside the state directory.
@@ -850,7 +860,7 @@ fn state_file(dir: &Path, destination_id: &str) -> Result<PathBuf, PublishError>
             "destination id {destination_id:?} is not usable as a file name"
         )));
     }
-    Ok(dir.join(format!("{destination_id}.json")))
+    Ok(dir.join(format!("{destination_id}.{extension}")))
 }
 
 #[cfg(test)]
@@ -1345,7 +1355,7 @@ mod tests {
     }
 
     #[test]
-    fn the_account_is_read_and_written_without_touching_records() {
+    fn the_account_is_read_without_migrating_anything() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("smugmug.json");
         assert_eq!(
@@ -1353,35 +1363,19 @@ mod tests {
             None
         );
 
-        PublishState::set_account_in(dir.path(), "smugmug", Some("alice".into())).unwrap();
-        assert_eq!(
-            PublishState::account_in(dir.path(), "smugmug")
-                .unwrap()
-                .as_deref(),
-            Some("alice")
-        );
-        assert_eq!(
-            PublishState::load_from(&path, "smugmug", &AlbumMembership::default())
-                .unwrap()
-                .account(),
-            Some("alice"),
-            "a first write creates a v2 file"
-        );
-
         write_v1(
             &path,
             serde_json::json!({ "/p/a.raf": v1_image("/img/a", "b3:a") }),
         );
-        PublishState::set_account_in(dir.path(), "smugmug", None).unwrap();
+        let before = std::fs::read(&path).unwrap();
 
-        let written = read_json(&path);
-        assert_eq!(written["version"], 1, "no migration without the album tree");
-        assert!(written["account"].is_null());
-        assert_eq!(written["images"]["/p/a.raf"]["remote_uri"], "/img/a");
         assert_eq!(
-            written["containers"]["iceland"]["remote_uri"],
-            "/api/v2/album/Ice"
+            PublishState::account_in(dir.path(), "smugmug")
+                .unwrap()
+                .as_deref(),
+            Some("markallison")
         );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]
@@ -1526,6 +1520,44 @@ mod tests {
     }
 
     #[test]
+    fn an_unlinked_state_takes_the_connected_account() {
+        let mut state = PublishState::empty("smugmug");
+        state.claim_account("alice").unwrap();
+        assert_eq!(state.account(), Some("alice"));
+
+        state
+            .claim_account("bob")
+            .expect("nothing is linked, so nothing belongs to alice yet");
+        assert_eq!(state.account(), Some("bob"));
+    }
+
+    #[test]
+    fn links_belonging_to_another_account_are_refused() {
+        let mut state = published("iceland", &[]);
+        state.claim_account("alice").unwrap();
+
+        state
+            .claim_account("alice")
+            .expect("the same account publishes on");
+        let error = state.claim_account("bob").unwrap_err();
+
+        assert!(matches!(error, PublishError::NotAuthorised(_)), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("alice") && message.contains("bob"),
+            "{message}"
+        );
+        assert_eq!(state.account(), Some("alice"), "a refusal records nothing");
+    }
+
+    #[test]
+    fn links_with_no_recorded_account_are_claimed() {
+        let mut state = published("iceland", &[]);
+        state.claim_account("alice").unwrap();
+        assert_eq!(state.account(), Some("alice"));
+    }
+
+    #[test]
     fn unknown_future_version_is_rejected_not_silently_reset() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("smugmug.json");
@@ -1542,8 +1574,8 @@ mod tests {
             "an unreadable version must not reset to empty: that republishes the whole library"
         );
         assert!(
-            PublishState::set_account_in(dir.path(), "smugmug", None).is_err(),
-            "nor may writing the account overwrite it"
+            PublishState::account_in(dir.path(), "smugmug").is_err(),
+            "nor may its account be trusted"
         );
     }
 

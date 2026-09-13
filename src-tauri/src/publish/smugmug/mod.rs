@@ -20,9 +20,9 @@ use crate::publish::smugmug::model::TokenPair;
 use crate::publish::smugmug::upload::SmugMugUploader;
 use crate::publish::state::PublishState;
 use crate::publish::{
-    AuthChallenge, AuthStatus, ConsumerCredentials, DestinationCapabilities, LocalContainer,
-    PublishContext, PublishDestination, PublishError, PublishItem, RemoteContainerId,
-    RemoteImageId,
+    AuthChallenge, AuthStatus, ConsumerCredentials, ContainerPrivacy, DestinationCapabilities,
+    LocalContainer, PublishContext, PublishDestination, PublishError, PublishItem,
+    RemoteContainerId, RemoteImageId,
 };
 
 /// Also the name of the state file, so it must not change once shipped.
@@ -57,10 +57,15 @@ impl SmugMugDestination {
         }
     }
 
-    /// The nickname of the account this install last connected, which names
-    /// both the keyring entry and the state file's id map.
+    /// The nickname of the connected account, which names its token entry.
+    ///
+    /// Falls back to the state file's account for an install connected before
+    /// the keyring recorded it, which is where phase 1 kept it.
     fn connected_nickname(ctx: &PublishContext) -> Result<Option<String>, PublishError> {
-        PublishState::account_in(&ctx.state_dir, DESTINATION_ID)
+        match SmugMugAuth::connected_account()? {
+            Some(nickname) => Ok(Some(nickname)),
+            None => PublishState::account_in(&ctx.state_dir, DESTINATION_ID),
+        }
     }
 
     /// Reuses the cached clients while the consumer credentials match. A new
@@ -94,6 +99,33 @@ impl SmugMugDestination {
         });
         *cached = Some(Arc::clone(&connection));
         Ok(connection)
+    }
+
+    /// Stores a freshly authorised account's tokens and makes it the connected
+    /// one. Never touches the state file: its recorded account says whom the
+    /// links belong to, which reconnecting as someone else must not rewrite.
+    fn remember_connection(
+        &self,
+        ctx: &PublishContext,
+        nickname: &str,
+        access: &TokenPair,
+    ) -> Result<(), PublishError> {
+        let previous = Self::connected_nickname(ctx)?;
+
+        // Tokens before the pointer: a pointer naming an account whose tokens
+        // were never stored would report Connected and then fail every call.
+        SmugMugAuth::store_tokens(&account_key(nickname), &access.token, &access.token_secret)?;
+        SmugMugAuth::set_connected_account(Some(nickname))?;
+        *self.connection.lock().map_err(|_| poisoned())? = None;
+
+        // One account at a time: the previous one's token would otherwise sit
+        // in the keyring, and resurface through the phase 1 fallback.
+        match previous {
+            Some(previous) if previous != nickname => {
+                SmugMugAuth::delete_tokens(&account_key(&previous))
+            }
+            _ => Ok(()),
+        }
     }
 
     fn consumer(ctx: &PublishContext) -> Result<&ConsumerCredentials, PublishError> {
@@ -150,6 +182,12 @@ impl PublishDestination for SmugMugDestination {
             // Deliberately narrow: these are the two formats the upload path
             // is exercised against. Widening it belongs with that task.
             accepted_mime_types: &["image/jpeg", "image/png"],
+            // SmugMug's own three levels, which map one to one.
+            supported_privacy: &[
+                ContainerPrivacy::Public,
+                ContainerPrivacy::Unlisted,
+                ContainerPrivacy::Private,
+            ],
         }
     }
 
@@ -204,16 +242,22 @@ impl PublishDestination for SmugMugDestination {
         let access = exchange_verifier(consumer, &temporary, &verifier).await?;
         let nickname = fetch_nickname(consumer, &access).await?;
 
-        // Keyring first: a state file naming an account whose tokens were
-        // never stored would report Connected and then fail on every call.
-        SmugMugAuth::store_tokens(&account_key(&nickname), &access.token, &access.token_secret)?;
-        *self.connection.lock().map_err(|_| poisoned())? = None;
+        self.remember_connection(ctx, &nickname, &access)
+    }
 
-        PublishState::set_account_in(&ctx.state_dir, DESTINATION_ID, Some(nickname))
+    /// The pointer goes last, so a disconnect that fails part way can simply
+    /// be repeated: the account it names is still the one to forget.
+    async fn disconnect(&self, ctx: &PublishContext) -> Result<(), PublishError> {
+        *self.connection.lock().map_err(|_| poisoned())? = None;
+        if let Some(nickname) = Self::connected_nickname(ctx)? {
+            SmugMugAuth::delete_tokens(&account_key(&nickname))?;
+        }
+        SmugMugAuth::set_connected_account(None)
     }
 
     /// Albums go directly under the account's root node until the panel
-    /// offers a choice of folder.
+    /// offers a choice of folder. A created album takes
+    /// [`PublishContext::new_container_privacy`]; a found one keeps its own.
     async fn ensure_container(
         &self,
         local: &LocalContainer,
@@ -223,7 +267,7 @@ impl PublishDestination for SmugMugDestination {
         let root = connection.api.auth_user().await?.node_uri;
         connection
             .api
-            .ensure_album(&root, &flattened_name(local))
+            .ensure_album(&root, &flattened_name(local), ctx.new_container_privacy)
             .await
     }
 
@@ -251,7 +295,157 @@ impl PublishDestination for SmugMugDestination {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
+    use crate::publish::credential_store;
+    use crate::publish::state::AlbumMembership;
+
+    fn context(state_dir: &Path) -> PublishContext {
+        PublishContext {
+            state_dir: state_dir.to_path_buf(),
+            consumer: Some(ConsumerCredentials {
+                key: "consumer-key".into(),
+                secret: "consumer-secret".into(),
+            }),
+            cancel: Arc::new(AtomicBool::new(false)),
+            new_container_privacy: ContainerPrivacy::Public,
+        }
+    }
+
+    fn tokens(name: &str) -> TokenPair {
+        TokenPair {
+            token: format!("{name}-token"),
+            token_secret: format!("{name}-secret"),
+        }
+    }
+
+    /// A state whose links belong to `account`.
+    fn linked_state(dir: &Path, account: &str) {
+        let mut state = PublishState::empty(DESTINATION_ID);
+        state.record_link(
+            "iceland",
+            &RemoteContainerId("/api/v2/album/Ice".into()),
+            None,
+        );
+        state.claim_account(account).unwrap();
+        state.save_in(dir).unwrap();
+    }
+
+    fn recorded_account(dir: &Path) -> Option<String> {
+        PublishState::load_in(dir, DESTINATION_ID, &AlbumMembership::default())
+            .unwrap()
+            .account()
+            .map(str::to_string)
+    }
+
+    async fn status(destination: &SmugMugDestination, ctx: &PublishContext) -> String {
+        match destination.auth_status(ctx).await.unwrap() {
+            AuthStatus::Connected { account } => format!("Connected as {account}"),
+            other => format!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_forgets_the_token_and_keeps_the_consumer_and_the_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let destination = SmugMugDestination::new();
+        credential_store::store_consumer(DESTINATION_ID, ctx.consumer.as_ref().unwrap()).unwrap();
+        linked_state(dir.path(), "alice");
+        destination
+            .remember_connection(&ctx, "alice", &tokens("alice"))
+            .unwrap();
+        assert_eq!(status(&destination, &ctx).await, "Connected as alice");
+        let state_before = std::fs::read(dir.path().join("smugmug.json")).unwrap();
+
+        destination.disconnect(&ctx).await.unwrap();
+
+        assert_eq!(status(&destination, &ctx).await, "NotAuthorised");
+        assert_eq!(
+            SmugMugAuth::load_tokens(&account_key("alice")).unwrap(),
+            None
+        );
+        assert_eq!(
+            credential_store::load_consumer(DESTINATION_ID)
+                .unwrap()
+                .map(|c| c.key),
+            Some("consumer-key".into())
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("smugmug.json")).unwrap(),
+            state_before
+        );
+        assert!(
+            destination.connection(&ctx).is_err(),
+            "no cached client outlives the token"
+        );
+        destination
+            .disconnect(&ctx)
+            .await
+            .expect("disconnecting twice is harmless");
+    }
+
+    #[tokio::test]
+    async fn reconnecting_the_same_account_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let destination = SmugMugDestination::new();
+        linked_state(dir.path(), "alice");
+        destination
+            .remember_connection(&ctx, "alice", &tokens("alice"))
+            .unwrap();
+
+        destination.disconnect(&ctx).await.unwrap();
+        destination
+            .remember_connection(&ctx, "alice", &tokens("alice-again"))
+            .unwrap();
+
+        assert_eq!(status(&destination, &ctx).await, "Connected as alice");
+        assert_eq!(recorded_account(dir.path()).as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn connecting_another_account_leaves_the_recorded_owner_and_drops_the_old_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let destination = SmugMugDestination::new();
+        linked_state(dir.path(), "alice");
+        destination
+            .remember_connection(&ctx, "alice", &tokens("alice"))
+            .unwrap();
+
+        destination
+            .remember_connection(&ctx, "bob", &tokens("bob"))
+            .unwrap();
+
+        assert_eq!(status(&destination, &ctx).await, "Connected as bob");
+        assert_eq!(
+            recorded_account(dir.path()).as_deref(),
+            Some("alice"),
+            "the links still belong to alice, so the publish guard can refuse bob"
+        );
+        assert_eq!(
+            SmugMugAuth::load_tokens(&account_key("alice")).unwrap(),
+            None
+        );
+    }
+
+    /// Phase 1 named the connected account only in the state file.
+    #[tokio::test]
+    async fn an_install_connected_before_the_keyring_pointer_stays_connected() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let destination = SmugMugDestination::new();
+        linked_state(dir.path(), "alice");
+        SmugMugAuth::store_tokens(&account_key("alice"), "t", "s").unwrap();
+
+        assert_eq!(status(&destination, &ctx).await, "Connected as alice");
+
+        destination.disconnect(&ctx).await.unwrap();
+        assert_eq!(status(&destination, &ctx).await, "NotAuthorised");
+    }
 
     #[test]
     fn groups_are_folded_into_the_album_name() {

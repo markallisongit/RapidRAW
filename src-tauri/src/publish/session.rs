@@ -35,7 +35,7 @@ use crate::publish::state::{
     fingerprints,
 };
 use crate::publish::{
-    LocalContainer, PublishContext, PublishDestination, PublishError, PublishItem,
+    AuthStatus, LocalContainer, PublishContext, PublishDestination, PublishError, PublishItem,
     RemoteContainerId, RemoteImageId,
 };
 
@@ -241,6 +241,21 @@ pub fn tauri_event_sink(app_handle: tauri::AppHandle) -> EventSink {
     })
 }
 
+/// Refuses when the destination is connected to a different account from the
+/// one the state's links belong to, and records the connected account when
+/// nothing is linked yet. Not being connected passes: a preview needs no
+/// connection, and a publish fails on its first call without one.
+pub async fn check_account(
+    destination: &dyn PublishDestination,
+    ctx: &PublishContext,
+    state: &mut PublishState,
+) -> Result<(), PublishError> {
+    match destination.auth_status(ctx).await? {
+        AuthStatus::Connected { account } => state.claim_account(&account),
+        AuthStatus::NotConfigured | AuthStatus::NotAuthorised => Ok(()),
+    }
+}
+
 pub struct PublishSession<'a> {
     destination: &'a dyn PublishDestination,
     pipeline: &'a dyn RenderPipeline,
@@ -306,6 +321,9 @@ impl<'a> PublishSession<'a> {
             completed: 0,
             total: request.paths.len(),
         };
+        // Before anything remote: another account's ids would name albums and
+        // images it does not own.
+        check_account(self.destination, self.ctx, &mut run.state).await?;
         if self.cancelled() {
             run.summary.cancelled = true;
             return Ok(run.summary);
@@ -922,7 +940,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::publish::{AuthChallenge, AuthStatus, DestinationCapabilities, state::PublishState};
+    use crate::publish::{
+        AuthChallenge, ContainerPrivacy, DestinationCapabilities, state::PublishState,
+    };
 
     const DESTINATION: &str = "stub";
     /// The album every test publishes unless it names another.
@@ -1059,11 +1079,14 @@ mod tests {
         cancel_on_upload: Option<(usize, Arc<AtomicBool>)>,
         spool_base: PathBuf,
         peak: AtomicU64,
+        /// What `auth_status` reports: `None` is not connected.
+        account: Option<String>,
     }
 
     impl StubDestination {
         fn new(spool_base: &Path) -> Self {
             Self {
+                account: Some("stub".into()),
                 log: Mutex::new(Vec::new()),
                 uploads: Mutex::new(Vec::new()),
                 containers: Mutex::new(Vec::new()),
@@ -1073,6 +1096,11 @@ mod tests {
                 spool_base: spool_base.to_path_buf(),
                 peak: AtomicU64::new(0),
             }
+        }
+
+        fn connected_as(mut self, account: Option<&str>) -> Self {
+            self.account = account.map(str::to_string);
+            self
         }
 
         fn script(self, name: &str, outcomes: Vec<Scripted>) -> Self {
@@ -1110,12 +1138,16 @@ mod tests {
                 supports_nested_containers: false,
                 max_bytes: None,
                 accepted_mime_types: &["image/jpeg"],
+                supported_privacy: &[ContainerPrivacy::Public],
             }
         }
 
         async fn auth_status(&self, _ctx: &PublishContext) -> Result<AuthStatus, PublishError> {
-            Ok(AuthStatus::Connected {
-                account: "stub".into(),
+            Ok(match &self.account {
+                Some(account) => AuthStatus::Connected {
+                    account: account.clone(),
+                },
+                None => AuthStatus::NotAuthorised,
             })
         }
 
@@ -1129,6 +1161,10 @@ mod tests {
             _ctx: &PublishContext,
         ) -> Result<(), PublishError> {
             Err(PublishError::Rejected("the stub needs no auth".into()))
+        }
+
+        async fn disconnect(&self, _ctx: &PublishContext) -> Result<(), PublishError> {
+            unimplemented!()
         }
 
         async fn ensure_container(
@@ -1222,6 +1258,7 @@ mod tests {
                 state_dir: dir.path().join("state"),
                 consumer: None,
                 cancel: Arc::new(AtomicBool::new(false)),
+                new_container_privacy: ContainerPrivacy::Public,
             };
             Self {
                 dir,
@@ -1313,6 +1350,66 @@ mod tests {
             paths,
             albums: AlbumMembership::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn publishing_into_another_account_is_refused_before_anything_is_touched() {
+        let harness = Harness::new();
+        let pipeline = StubPipeline::new(&harness.spool_base());
+        let destination = StubDestination::new(&harness.spool_base()).connected_as(Some("bob"));
+        let mut state = harness.state();
+        state.record_link(ALBUM, &RemoteContainerId(album_uri(ALBUM)), None);
+        state.claim_account("alice").unwrap();
+        state.save_in(&harness.ctx.state_dir).unwrap();
+        let before = std::fs::read(harness.state_file()).unwrap();
+
+        let recorder = Arc::clone(&harness.events);
+        let events: EventSink = Arc::new(move |event| recorder.lock().unwrap().push(event));
+        let result = PublishSession::new(
+            &destination,
+            &pipeline,
+            &harness.ctx,
+            harness.spool_base(),
+            events,
+        )
+        .run(request(ALBUM, paths(1..=2)))
+        .await;
+
+        let error = result.expect_err("bob must not publish into alice's albums");
+        assert!(matches!(error, PublishError::NotAuthorised(_)), "{error}");
+        assert_eq!(harness.terminal_event(), "publish-error");
+        assert!(
+            destination.log.lock().unwrap().is_empty(),
+            "no album was looked up and nothing was uploaded"
+        );
+        assert_eq!(std::fs::read(harness.state_file()).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn the_first_publish_records_the_connected_account() {
+        let harness = Harness::new();
+        let pipeline = StubPipeline::new(&harness.spool_base());
+        let destination = StubDestination::new(&harness.spool_base()).connected_as(Some("alice"));
+
+        harness.run(&destination, &pipeline, paths(1..=1)).await;
+
+        assert_eq!(harness.state().account(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn the_account_check_passes_when_not_connected_and_refuses_another_account() {
+        let harness = Harness::new();
+        let mut state = harness.state();
+        state.record_link(ALBUM, &RemoteContainerId(album_uri(ALBUM)), None);
+        state.claim_account("alice").unwrap();
+
+        let disconnected = StubDestination::new(&harness.spool_base()).connected_as(None);
+        check_account(&disconnected, &harness.ctx, &mut state)
+            .await
+            .expect("a preview needs no connection");
+
+        let bob = StubDestination::new(&harness.spool_base()).connected_as(Some("bob"));
+        assert!(check_account(&bob, &harness.ctx, &mut state).await.is_err());
     }
 
     #[test]

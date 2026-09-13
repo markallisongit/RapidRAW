@@ -15,8 +15,10 @@ use tauri::{AppHandle, State};
 use crate::AppState;
 use crate::export_processing::ExportSettings;
 use crate::publish::session::{
-    ExportPipeline, PublishPreview, PublishRequest, PublishSession, preview, tauri_event_sink,
+    ExportPipeline, PublishPreview, PublishRequest, PublishSession, check_account, preview,
+    tauri_event_sink,
 };
+use crate::publish::settings::DestinationSettings;
 use crate::publish::state::{PublishState, state_dir};
 use crate::publish::{
     AuthChallenge, AuthStatus, DestinationCapabilities, PublishContext, PublishDestination,
@@ -55,21 +57,22 @@ pub async fn publish_get_auth_status(
     Ok(destination.auth_status(&ctx).await?)
 }
 
+/// Disconnects when the credentials belong to a different application, whose
+/// access token the new key could never sign with.
 #[tauri::command]
-pub fn publish_set_credentials(
+pub async fn publish_set_credentials(
     destination_id: String,
     key: String,
     secret: String,
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> Result<(), String> {
-    destination(&state, &destination_id)?;
-    Ok(credential_store::replace_consumer(
-        &state_dir(&app_handle)?,
-        &destination_id,
-        &key,
-        &secret,
-    )?)
+    let destination = destination(&state, &destination_id)?;
+    if credential_store::replace_consumer(&destination_id, &key, &secret)? {
+        let ctx = context(&app_handle, &destination_id, idle_cancel())?;
+        destination.disconnect(&ctx).await?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -95,8 +98,60 @@ pub async fn publish_complete_auth(
     Ok(destination.complete_auth(&verifier, &ctx).await?)
 }
 
+#[tauri::command]
+pub fn publish_get_settings(
+    destination_id: String,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<DestinationSettings, String> {
+    destination(&state, &destination_id)?;
+    Ok(DestinationSettings::load_in(
+        &state_dir(&app_handle)?,
+        &destination_id,
+    )?)
+}
+
+/// Refuses a privacy the destination cannot create an album with, rather
+/// than storing a choice that would fail at the first new album.
+#[tauri::command]
+pub fn publish_set_settings(
+    destination_id: String,
+    settings: DestinationSettings,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<(), String> {
+    let destination = destination(&state, &destination_id)?;
+    if !destination
+        .capabilities()
+        .supported_privacy
+        .contains(&settings.new_album_privacy)
+    {
+        return Err(format!(
+            "{} cannot create albums with {:?} privacy",
+            destination.display_name(),
+            settings.new_album_privacy
+        ));
+    }
+    Ok(settings.save_in(&state_dir(&app_handle)?, &destination_id)?)
+}
+
+/// Refused while publishing: the session would lose its token part way
+/// through and fail every remaining photo.
+#[tauri::command]
+pub async fn publish_disconnect(
+    destination_id: String,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<(), String> {
+    let destination = destination(&state, &destination_id)?;
+    let _session = state.publish_registry.begin_session()?;
+    let ctx = context(&app_handle, &destination_id, idle_cancel())?;
+    Ok(destination.disconnect(&ctx).await?)
+}
+
 /// Counts new, changed and unchanged photos. Never renders or uploads, and
-/// needs no connection: it reads only the state file and the photos.
+/// needs no connection: it reads only the state file, the photos and, when
+/// connected, which account that is.
 #[tauri::command]
 pub async fn publish_preview(
     destination_id: String,
@@ -106,10 +161,14 @@ pub async fn publish_preview(
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> Result<PublishPreview, String> {
-    destination(&state, &destination_id)?;
+    let destination = destination(&state, &destination_id)?;
     let request = album(&app_handle, &album_id)?;
-    let publish_state =
-        PublishState::load_in(&state_dir(&app_handle)?, &destination_id, &request.albums)?;
+    let ctx = context(&app_handle, &destination_id, idle_cancel())?;
+    let mut publish_state =
+        PublishState::load_in(&ctx.state_dir, &destination_id, &request.albums)?;
+    // Refused like the publish it previews. The claim this may record is
+    // never saved: a preview writes nothing.
+    check_account(destination.as_ref(), &ctx, &mut publish_state).await?;
     let pipeline = ExportPipeline::new(app_handle, export_settings, output_format, idle_cancel());
 
     // A stat and a sidecar read per photo is too much blocking for an async
@@ -210,8 +269,11 @@ fn context(
     destination_id: &str,
     cancel: Arc<AtomicBool>,
 ) -> Result<PublishContext, PublishError> {
+    let state_dir = state_dir(app_handle)?;
     Ok(PublishContext {
-        state_dir: state_dir(app_handle)?,
+        new_container_privacy: DestinationSettings::load_in(&state_dir, destination_id)?
+            .new_album_privacy,
+        state_dir,
         consumer: credential_store::load_consumer(destination_id)?,
         cancel,
     })

@@ -15,7 +15,7 @@ use crate::publish::smugmug::model::{
     AuthUser, ChildNode, RemoteImageSummary, parse_album_images, parse_auth_user,
     parse_created_node, parse_node_children,
 };
-use crate::publish::{PublishError, RemoteContainerId};
+use crate::publish::{ContainerPrivacy, PublishError, RemoteContainerId};
 
 /// Overridden only in tests, where a local mock server stands in.
 pub const API_BASE: &str = "https://api.smugmug.com";
@@ -104,13 +104,16 @@ impl SmugMugApi {
     /// Creates an album under `parent_node`. Not idempotent on its own — see
     /// [`ensure_album`](Self::ensure_album).
     ///
-    /// Privacy is deliberately not set, so the album inherits it from the
-    /// folder the user chose. Naming a default here would risk publishing
-    /// photos more widely than the parent they were asked to go under.
+    /// Sends `Privacy` explicitly, which is what SmugMug's own Lightroom plugin
+    /// does: `SmNode.create` sets `PUBLIC` when nothing else was chosen. Here
+    /// the user chose it in the Publish Manager and sees it before the album
+    /// is created, and SmugMug still caps an album at its parent's effective
+    /// privacy, so it cannot publish more widely than the folder allows.
     pub async fn create_album(
         &self,
         parent_node: &str,
         name: &str,
+        privacy: ContainerPrivacy,
     ) -> Result<RemoteContainerId, PublishError> {
         let url = format!("{}{parent_node}!children", self.base_url);
 
@@ -119,6 +122,7 @@ impl SmugMugApi {
                 "Type": "Album",
                 "Name": name,
                 "UrlName": album_url_name(name, attempt),
+                "Privacy": smugmug_privacy(privacy),
             });
             match self.post_create(&url, &body).await? {
                 Created::Node(payload) => return album_of(&parse_created_node(&payload)?),
@@ -133,14 +137,18 @@ impl SmugMugApi {
 
     /// Find-or-create, which is what makes republishing an album safe to
     /// repeat: the second call returns the first call's album.
+    ///
+    /// `privacy` reaches only a newly created album: one that already exists
+    /// keeps whatever privacy it has.
     pub async fn ensure_album(
         &self,
         parent_node: &str,
         name: &str,
+        privacy: ContainerPrivacy,
     ) -> Result<RemoteContainerId, PublishError> {
         match self.find_child_album(parent_node, name).await? {
             Some(existing) => Ok(existing),
-            None => self.create_album(parent_node, name).await,
+            None => self.create_album(parent_node, name, privacy).await,
         }
     }
 
@@ -241,6 +249,16 @@ fn album_of(node: &ChildNode) -> Result<RemoteContainerId, PublishError> {
         })
 }
 
+/// SmugMug's name for each privacy level. Spelled out rather than borrowed
+/// from `ContainerPrivacy`'s serde names, which belong to the settings file.
+fn smugmug_privacy(privacy: ContainerPrivacy) -> &'static str {
+    match privacy {
+        ContainerPrivacy::Public => "Public",
+        ContainerPrivacy::Unlisted => "Unlisted",
+        ContainerPrivacy::Private => "Private",
+    }
+}
+
 /// A `UrlName` SmugMug will accept: letters, digits and dashes only, starting
 /// with an upper-case letter or a digit.
 ///
@@ -280,8 +298,8 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::publish::RemoteImageId;
     use crate::publish::oauth1::Credentials;
+    use crate::publish::{ContainerPrivacy, RemoteImageId};
 
     const ROOT: &str = "/api/v2/node/rootnode";
 
@@ -383,8 +401,14 @@ mod tests {
         forbid_creation(&server).await;
 
         let api = api(&server);
-        let first = api.ensure_album(ROOT, "Iceland 2026").await.unwrap();
-        let second = api.ensure_album(ROOT, "Iceland 2026").await.unwrap();
+        let first = api
+            .ensure_album(ROOT, "Iceland 2026", ContainerPrivacy::Public)
+            .await
+            .unwrap();
+        let second = api
+            .ensure_album(ROOT, "Iceland 2026", ContainerPrivacy::Public)
+            .await
+            .unwrap();
 
         assert_eq!(first, second);
         assert_eq!(first, RemoteContainerId(album_uri("Iceland 2026")));
@@ -408,7 +432,7 @@ mod tests {
             .await;
 
         let album = api(&server)
-            .ensure_album(ROOT, "Iceland 2026")
+            .ensure_album(ROOT, "Iceland 2026", ContainerPrivacy::Public)
             .await
             .unwrap();
 
@@ -433,7 +457,7 @@ mod tests {
             .await;
 
         let album = api(&server)
-            .ensure_album(ROOT, "Iceland 2026")
+            .ensure_album(ROOT, "Iceland 2026", ContainerPrivacy::Public)
             .await
             .unwrap();
 
@@ -462,7 +486,7 @@ mod tests {
             .await;
 
         let album = api(&server)
-            .ensure_album(ROOT, "Iceland 2026")
+            .ensure_album(ROOT, "Iceland 2026", ContainerPrivacy::Public)
             .await
             .unwrap();
 
@@ -487,7 +511,7 @@ mod tests {
             .await;
 
         let album = api(&server)
-            .ensure_album(ROOT, "Iceland 2026")
+            .ensure_album(ROOT, "Iceland 2026", ContainerPrivacy::Public)
             .await
             .unwrap();
 
@@ -521,7 +545,7 @@ mod tests {
         forbid_creation(&server).await;
 
         let album = api(&server)
-            .ensure_album(ROOT, "Iceland 2026")
+            .ensure_album(ROOT, "Iceland 2026", ContainerPrivacy::Public)
             .await
             .unwrap();
 
@@ -587,11 +611,68 @@ mod tests {
             .await;
 
         let album = api(&server)
-            .ensure_album(ROOT, "Iceland 2026")
+            .ensure_album(ROOT, "Iceland 2026", ContainerPrivacy::Public)
             .await
             .unwrap();
 
         assert_eq!(album, RemoteContainerId(album_uri("Iceland 2026")));
+    }
+
+    #[tokio::test]
+    async fn a_new_album_is_created_with_the_configured_privacy() {
+        for (privacy, expected) in [
+            (ContainerPrivacy::Public, "Public"),
+            (ContainerPrivacy::Unlisted, "Unlisted"),
+            (ContainerPrivacy::Private, "Private"),
+        ] {
+            let server = MockServer::start().await;
+            mount_children(&server, children_page(vec![], None)).await;
+            Mock::given(method("POST"))
+                .and(path(format!("{ROOT}!children")))
+                .and(body_partial_json(
+                    json!({ "Name": "Iceland 2026", "Privacy": expected }),
+                ))
+                .respond_with(
+                    ResponseTemplate::new(201)
+                        .set_body_raw(created_node("Iceland 2026"), "application/json"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            api(&server)
+                .ensure_album(ROOT, "Iceland 2026", privacy)
+                .await
+                .unwrap_or_else(|e| panic!("{expected}: {e}"));
+        }
+    }
+
+    /// Privacy is the user's choice for albums RapidRAW creates. One that
+    /// already exists may have been set deliberately on SmugMug.
+    #[tokio::test]
+    async fn finding_an_existing_album_sends_no_privacy() {
+        let server = MockServer::start().await;
+        mount_children(
+            &server,
+            children_page(vec![child("Iceland 2026", "Album")], None),
+        )
+        .await;
+        forbid_creation(&server).await;
+
+        api(&server)
+            .ensure_album(ROOT, "Iceland 2026", ContainerPrivacy::Private)
+            .await
+            .unwrap();
+
+        for request in server.received_requests().await.unwrap() {
+            assert_eq!(request.method.as_str(), "GET", "{}", request.url);
+            assert!(
+                !request.url.as_str().contains("Privacy")
+                    && !String::from_utf8_lossy(&request.body).contains("Privacy"),
+                "{}",
+                request.url
+            );
+        }
     }
 
     #[tokio::test]
