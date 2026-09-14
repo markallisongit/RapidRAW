@@ -36,6 +36,7 @@ interface DestinationSectionProps {
   onOpenManager: (section: ManagerSection | null) => void;
   onLinkAlbum: (albumId: string | null) => void;
   onPublish: (albumId: string) => void;
+  onRecreate: (link: LinkInfo) => void;
   onRemoveDeleted: (links: LinkInfo[]) => void;
   onRelink: (link: LinkInfo) => void;
   onUnlink: (link: LinkInfo) => void;
@@ -50,6 +51,7 @@ export default function DestinationSection({
   onOpenManager,
   onLinkAlbum,
   onPublish,
+  onRecreate,
   onRemoveDeleted,
   onRelink,
   onUnlink,
@@ -155,6 +157,7 @@ export default function DestinationSection({
             key={link.album_id}
             link={link}
             onPublish={() => onPublish(link.album_id)}
+            onRecreate={() => onRecreate(link)}
             onRelink={() => onRelink(link)}
             onSelect={() => api.selectAlbum(link.album_id)}
             onUnlink={() => onUnlink(link)}

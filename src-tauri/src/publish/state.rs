@@ -25,7 +25,9 @@ use tauri::{AppHandle, Manager};
 
 use crate::export_processing::{ExportSettings, ResizeOptions, WatermarkSettings};
 use crate::file_management::AlbumItem;
-use crate::publish::{PublishError, RemoteContainerId, RemoteImageId, RemoteNode};
+use crate::publish::{
+    ContainerSnapshot, PublishError, RemoteContainerId, RemoteImageId, RemoteNode,
+};
 
 /// Subdirectory of `app_data_dir` holding one file per destination.
 const STATE_DIR_NAME: &str = "publish";
@@ -123,6 +125,26 @@ pub struct SettingsImpact {
     pub photos: usize,
     /// Links holding at least one of them.
     pub albums: usize,
+}
+
+/// Changes made by a read-only refresh from a destination.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RefreshReport {
+    pub links_checked: usize,
+    pub renamed: usize,
+    pub broken: usize,
+    pub restored: usize,
+    pub images_missing: usize,
+}
+
+impl RefreshReport {
+    pub fn include(&mut self, other: Self) {
+        self.links_checked += other.links_checked;
+        self.renamed += other.renamed;
+        self.broken += other.broken;
+        self.restored += other.restored;
+        self.images_missing += other.images_missing;
+    }
 }
 
 /// A photo's publish inputs, hashed apart so a settings change can be told
@@ -367,6 +389,7 @@ impl PublishState {
         if let Some(link) = self.links.get_mut(album_id) {
             link.remote_name = Some(remote.name.clone());
             link.web_url = remote.web_url.clone();
+            link.broken = false;
         }
         Ok(())
     }
@@ -375,6 +398,70 @@ impl PublishState {
     /// touched. `false` when the album was not linked.
     pub fn unlink_album(&mut self, album_id: &str) -> bool {
         self.links.remove(album_id).is_some()
+    }
+
+    /// Applies one destination snapshot without ever inventing local records.
+    /// A missing container keeps its image records in case the link is
+    /// restored; missing images in a live container are forgotten so the next
+    /// publish adds those photos again rather than replacing deleted ids.
+    pub fn apply_snapshot<F>(
+        &mut self,
+        album_id: &str,
+        snapshot: Option<&ContainerSnapshot>,
+        image_identity: F,
+    ) -> Result<RefreshReport, PublishError>
+    where
+        F: Fn(&RemoteImageId) -> String,
+    {
+        let link = self
+            .links
+            .get_mut(album_id)
+            .ok_or_else(|| PublishError::Rejected(format!("album {album_id} is not linked")))?;
+        let mut report = RefreshReport {
+            links_checked: 1,
+            ..RefreshReport::default()
+        };
+
+        let Some(snapshot) = snapshot else {
+            if !link.broken {
+                link.broken = true;
+                report.broken = 1;
+            }
+            return Ok(report);
+        };
+
+        if link
+            .remote_name
+            .as_deref()
+            .is_some_and(|name| name != snapshot.name)
+        {
+            report.renamed = 1;
+        }
+        link.remote_name = Some(snapshot.name.clone());
+        link.web_url = snapshot.web_url.clone();
+        if link.broken {
+            link.broken = false;
+            report.restored = 1;
+        }
+
+        let remote_images: HashMap<String, &RemoteImageId> = snapshot
+            .images
+            .iter()
+            .map(|image| (image_identity(image), image))
+            .collect();
+        let before = link.images.len();
+        link.images.retain(|_, image| {
+            let recorded = RemoteImageId(image.remote_uri.clone());
+            let Some(current) = remote_images.get(&image_identity(&recorded)) else {
+                return false;
+            };
+            // Keep the freshest URI for replacement even when the stable
+            // identity matched across a destination-specific revision.
+            image.remote_uri.clone_from(&current.0);
+            true
+        });
+        report.images_missing = before - link.images.len();
+        Ok(report)
     }
 
     /// Stamps the link's `last_published`. A no-op for an unlinked album.
@@ -1007,6 +1094,10 @@ mod tests {
         }
     }
 
+    fn exact_image_identity(image: &RemoteImageId) -> String {
+        image.0.clone()
+    }
+
     fn record(state: &mut PublishState, album_id: &str, path: &str, uri: &str, fp: &Fingerprints) {
         state
             .record_image(album_id, path, &RemoteImageId(uri.into()), fp, None)
@@ -1235,6 +1326,126 @@ mod tests {
         assert!(
             state.image_for("a", "/p/a.raf").is_none(),
             "records of images in the old album must not be replaced into the new one"
+        );
+    }
+
+    #[test]
+    fn a_missing_container_is_broken_until_it_returns_without_losing_images() {
+        let mut state = published("a", &[("/p/a.raf", "/img/1", prints("e1", "s1"))]);
+
+        let missing = state
+            .apply_snapshot("a", None, exact_image_identity)
+            .unwrap();
+        assert_eq!(
+            missing,
+            RefreshReport {
+                links_checked: 1,
+                broken: 1,
+                ..RefreshReport::default()
+            }
+        );
+        assert!(state.link("a").unwrap().broken);
+        assert!(state.image_for("a", "/p/a.raf").is_some());
+        assert_eq!(
+            state
+                .apply_snapshot("a", None, exact_image_identity)
+                .unwrap()
+                .broken,
+            0
+        );
+
+        let restored = state
+            .apply_snapshot(
+                "a",
+                Some(&ContainerSnapshot {
+                    name: "A".into(),
+                    web_url: Some("https://example.test/a".into()),
+                    images: vec![RemoteImageId("/img/1".into())],
+                }),
+                exact_image_identity,
+            )
+            .unwrap();
+        assert_eq!(restored.restored, 1);
+        assert!(!state.link("a").unwrap().broken);
+        assert!(state.image_for("a", "/p/a.raf").is_some());
+    }
+
+    #[test]
+    fn refresh_updates_a_rename_and_drops_only_recorded_images_that_are_missing() {
+        let mut state = published(
+            "a",
+            &[
+                ("/p/a.raf", "/img/1", prints("e1", "s1")),
+                ("/p/b.raf", "/img/2", prints("e2", "s1")),
+            ],
+        );
+        state
+            .link_album("a", &remote_album("a", "Old name"))
+            .unwrap();
+
+        let report = state
+            .apply_snapshot(
+                "a",
+                Some(&ContainerSnapshot {
+                    name: "New name".into(),
+                    web_url: Some("https://example.test/new-name".into()),
+                    // `/img/3` was added outside RapidRAW and stays ignored.
+                    images: vec![
+                        RemoteImageId("/img/1".into()),
+                        RemoteImageId("/img/3".into()),
+                    ],
+                }),
+                exact_image_identity,
+            )
+            .unwrap();
+
+        assert_eq!(report.renamed, 1);
+        assert_eq!(report.images_missing, 1);
+        let link = state.link("a").unwrap();
+        assert_eq!(link.remote_name.as_deref(), Some("New name"));
+        assert_eq!(
+            link.web_url.as_deref(),
+            Some("https://example.test/new-name")
+        );
+        assert!(state.image_for("a", "/p/a.raf").is_some());
+        assert!(state.image_for("a", "/p/b.raf").is_none());
+        assert_eq!(
+            state.classify("a", "/p/b.raf", &prints("e2", "s1")),
+            PublishAction::New,
+            "a remotely deleted image uploads as new next time"
+        );
+    }
+
+    #[test]
+    fn refresh_keeps_a_record_when_destination_specific_image_revisions_differ() {
+        let mut state = published(
+            "a",
+            &[("/p/a.raf", "/api/v2/image/Key-2", prints("e1", "s1"))],
+        );
+        let without_revision = |image: &RemoteImageId| {
+            image
+                .0
+                .rsplit_once('-')
+                .map_or_else(|| image.0.clone(), |(identity, _)| identity.to_string())
+        };
+
+        let report = state
+            .apply_snapshot(
+                "a",
+                Some(&ContainerSnapshot {
+                    name: "A".into(),
+                    web_url: None,
+                    images: vec![RemoteImageId("/api/v2/image/Key-0".into())],
+                }),
+                without_revision,
+            )
+            .unwrap();
+
+        assert_eq!(report.images_missing, 0);
+        assert_eq!(
+            state.image_for("a", "/p/a.raf").unwrap().remote_uri,
+            "/api/v2/image/Key-0",
+            "the current URI is retained for the next replacement"
         );
     }
 

@@ -15,9 +15,9 @@ use async_trait::async_trait;
 
 pub use registry::PublishRegistry;
 pub use types::{
-    AuthChallenge, AuthStatus, ConsumerCredentials, ContainerPrivacy, DestinationCapabilities,
-    LocalContainer, PublishContext, PublishError, PublishItem, RemoteContainerId, RemoteImageId,
-    RemoteNode, RemoteNodeId, RemoteNodeKind,
+    AuthChallenge, AuthStatus, ConsumerCredentials, ContainerPrivacy, ContainerSnapshot,
+    DestinationCapabilities, LocalContainer, PublishContext, PublishError, PublishItem,
+    RemoteContainerId, RemoteImageId, RemoteNode, RemoteNodeId, RemoteNodeKind,
 };
 
 /// A place photos can be published to.
@@ -72,6 +72,21 @@ pub trait PublishDestination: Send + Sync {
         id: &RemoteContainerId,
         ctx: &PublishContext,
     ) -> Result<RemoteNode, PublishError>;
+
+    /// What the container currently looks like remotely. `Ok(None)` when it
+    /// no longer exists. Read-only: inspecting never changes the destination.
+    async fn inspect_container(
+        &self,
+        container: &RemoteContainerId,
+        ctx: &PublishContext,
+    ) -> Result<Option<ContainerSnapshot>, PublishError>;
+
+    /// Stable identity used when comparing a previously returned image id
+    /// with a fresh container listing. Most destinations have stable ids;
+    /// those whose URI carries a mutable revision suffix override this.
+    fn image_identity(&self, image: &RemoteImageId) -> String {
+        image.0.clone()
+    }
 
     async fn publish_image(
         &self,

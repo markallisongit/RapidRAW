@@ -91,6 +91,14 @@ export interface SettingsImpact {
   albums: number;
 }
 
+export interface RefreshReport {
+  links_checked: number;
+  renamed: number;
+  broken: number;
+  restored: number;
+  images_missing: number;
+}
+
 export type ItemState = 'skipped' | 'uploaded' | 'updated' | 'failed' | 'ambiguous';
 
 export interface PublishProgressEvent {
@@ -174,6 +182,9 @@ interface DestinationEntry {
   settings: DestinationSettings | null;
   links: LinkInfo[] | null;
   linksError: unknown;
+  isRefreshing: boolean;
+  refreshReport: RefreshReport | null;
+  refreshError: unknown;
   /** By local album id. */
   previews: Record<string, LinkPreview>;
   /** The link the panel summarises, kept while its tab is not showing. */
@@ -188,6 +199,9 @@ const EMPTY_DESTINATION: DestinationEntry = {
   settings: null,
   links: null,
   linksError: null,
+  isRefreshing: false,
+  refreshReport: null,
+  refreshError: null,
   previews: {},
   selectedAlbumId: null,
 };
@@ -279,8 +293,20 @@ const listenForSessionEvents = () => {
  * The publish commands and session events for one destination.
  */
 export function usePublishState(destinationId: string, isActive: boolean) {
-  const { destination, authStatus, authError, challenge, settings, links, linksError, previews, selectedAlbumId } =
-    usePublishStore(useShallow((state) => state.destinations[destinationId] ?? EMPTY_DESTINATION));
+  const {
+    destination,
+    authStatus,
+    authError,
+    challenge,
+    settings,
+    links,
+    linksError,
+    isRefreshing,
+    refreshReport,
+    refreshError,
+    previews,
+    selectedAlbumId,
+  } = usePublishStore(useShallow((state) => state.destinations[destinationId] ?? EMPTY_DESTINATION));
   const session = usePublishStore((state) => state.session);
 
   useEffect(listenForSessionEvents, []);
@@ -390,6 +416,23 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     }
   }, [destinationId]);
 
+  /** Reads remote state only; any changes are made to RapidRAW's local records. */
+  const refreshRemote = useCallback(
+    async (albumId: string | null = null) => {
+      updateDestination(destinationId, { isRefreshing: true, refreshError: null });
+      try {
+        const report = await invoke<RefreshReport>('publish_refresh', { destinationId, albumId });
+        updateDestination(destinationId, { isRefreshing: false, refreshReport: report });
+        await refreshLinks();
+        return report;
+      } catch (error) {
+        updateDestination(destinationId, { isRefreshing: false, refreshError: error });
+        throw error;
+      }
+    },
+    [destinationId, refreshLinks],
+  );
+
   /** Rejects with a `LinkError`. Linking to a different remote album drops the old one's photo records. */
   const linkAlbum = useCallback(
     async (albumId: string, target: LinkTarget) => {
@@ -491,6 +534,9 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     settings,
     links,
     linksError,
+    isRefreshing,
+    refreshReport,
+    refreshError,
     previews,
     selectedAlbumId,
     session,
@@ -504,6 +550,7 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     disconnect,
     listRemote,
     refreshLinks,
+    refreshRemote,
     linkAlbum,
     unlink,
     selectAlbum,

@@ -20,10 +20,12 @@ use crate::publish::preset::{
 };
 use crate::publish::session::{
     ExportPipeline, PublishPreview, PublishRequest, PublishSession, SettingsChangePolicy,
-    check_account, preview, tauri_event_sink,
+    check_account, preview, refresh_destination, tauri_event_sink,
 };
 use crate::publish::settings::DestinationSettings;
-use crate::publish::state::{AlbumMembership, PublishState, SettingsImpact, state_dir};
+use crate::publish::state::{
+    AlbumMembership, PublishState, RefreshReport, SettingsImpact, state_dir,
+};
 use crate::publish::{
     AuthChallenge, AuthStatus, DestinationCapabilities, PublishContext, PublishDestination,
     PublishError, RemoteNode, RemoteNodeId, credential_store, spool,
@@ -179,6 +181,32 @@ pub fn publish_list_links(
     let tree = crate::file_management::get_albums(app_handle.clone())?;
     let publish_state = load_state(&app_handle, &destination_id, &tree)?;
     Ok(list_links(&publish_state, &tree))
+}
+
+/// Refreshes one linked album, or every link when `album_id` is absent.
+/// This reads the destination and updates only RapidRAW's local state.
+#[tauri::command]
+pub async fn publish_refresh(
+    destination_id: String,
+    album_id: Option<String>,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<RefreshReport, String> {
+    let destination = destination(&state, &destination_id)?;
+    let _session = state.publish_registry.begin_session()?;
+    let tree = crate::file_management::get_albums(app_handle.clone())?;
+    let ctx = context(&app_handle, &destination_id, idle_cancel())?;
+    let mut publish_state = load_state(&app_handle, &destination_id, &tree)?;
+    check_account(destination.as_ref(), &ctx, &mut publish_state).await?;
+    let report = refresh_destination(
+        destination.as_ref(),
+        &ctx,
+        &mut publish_state,
+        album_id.as_deref(),
+    )
+    .await?;
+    publish_state.save_in(&ctx.state_dir)?;
+    Ok(report)
 }
 
 /// Refused while publishing, as is unlinking: the session saves the state it

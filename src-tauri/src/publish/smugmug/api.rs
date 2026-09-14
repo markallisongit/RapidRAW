@@ -15,7 +15,7 @@ use crate::publish::smugmug::model::{
     Album, AuthUser, ChildNode, RemoteImageSummary, parse_album, parse_album_images,
     parse_auth_user, parse_created_node, parse_node_children,
 };
-use crate::publish::{ContainerPrivacy, PublishError, RemoteContainerId};
+use crate::publish::{ContainerPrivacy, ContainerSnapshot, PublishError, RemoteContainerId};
 
 /// Overridden only in tests, where a local mock server stands in.
 pub const API_BASE: &str = "https://api.smugmug.com";
@@ -122,6 +122,31 @@ impl SmugMugApi {
         parse_album(&self.get_signed(&url).await?)
     }
 
+    /// The album and the ids of every image it currently contains. A missing
+    /// album is not an API failure for refresh; importantly, its image endpoint
+    /// is not queried after the 404.
+    pub async fn inspect_container(
+        &self,
+        container: &RemoteContainerId,
+    ) -> Result<Option<ContainerSnapshot>, PublishError> {
+        let url = format!("{}{}", self.base_url, container.0);
+        let Some(body) = self.get_signed_optional(&url).await? else {
+            return Ok(None);
+        };
+        let album = parse_album(&body)?;
+        let images = self
+            .list_album_images(container)
+            .await?
+            .into_iter()
+            .map(|image| image.image_uri)
+            .collect();
+        Ok(Some(ContainerSnapshot {
+            name: album.name,
+            web_url: album.web_uri,
+            images,
+        }))
+    }
+
     /// Creates an album under `parent_node`. Never reuses one of the same name:
     /// [`find_child_album`](Self::find_child_album) is asked first, so the
     /// user can link to it instead.
@@ -212,6 +237,21 @@ impl SmugMugApi {
             .map_err(transport)?;
 
         body_or_error(response).await
+    }
+
+    async fn get_signed_optional(&self, url: &str) -> Result<Option<String>, PublishError> {
+        let response = self
+            .client
+            .get(url)
+            .header("Authorization", self.authorization("GET", url))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(transport)?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        body_or_error(response).await.map(Some)
     }
 
     /// A 409 is handled here rather than by `body_or_error` because it is not
@@ -571,6 +611,72 @@ mod tests {
         for request in server.received_requests().await.unwrap() {
             assert_eq!(request.method.as_str(), "GET", "{}", request.url);
         }
+    }
+
+    #[tokio::test]
+    async fn inspecting_a_deleted_album_returns_none_without_listing_images() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/album/AbCdEf"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/album/AbCdEf!images"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let snapshot = api(&server)
+            .inspect_container(&RemoteContainerId("/api/v2/album/AbCdEf".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot, None);
+    }
+
+    #[tokio::test]
+    async fn inspecting_an_album_reads_its_current_name_url_and_every_image() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/album/AbCdEf"))
+            .respond_with(ok(json!({
+                "Response": { "Album": {
+                    "Name": "Iceland renamed",
+                    "Uri": "/api/v2/album/AbCdEf",
+                    "WebUri": "https://example.test/iceland-renamed",
+                    "Uris": { "Node": { "Uri": "/api/v2/node/1c3l4nd" } }
+                }},
+                "Code": 200
+            })
+            .to_string()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/album/AbCdEf!images"))
+            .respond_with(ok(images_page(&["DSC_0001.jpg"], None)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let snapshot = api(&server)
+            .inspect_container(&RemoteContainerId("/api/v2/album/AbCdEf".into()))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(snapshot.name, "Iceland renamed");
+        assert_eq!(
+            snapshot.web_url.as_deref(),
+            Some("https://example.test/iceland-renamed")
+        );
+        assert_eq!(
+            snapshot.images,
+            [RemoteImageId("/api/v2/image/DSC0001jpg-0".into())]
+        );
     }
 
     #[tokio::test]

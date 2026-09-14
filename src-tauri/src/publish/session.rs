@@ -31,8 +31,8 @@ use crate::export_processing::{ExportAdjustmentsMode, ExportSettings};
 use crate::file_management::AlbumItem;
 use crate::publish::spool::Spool;
 use crate::publish::state::{
-    AlbumMembership, Fingerprints, PublishAction, PublishState, RelevantExportSettings,
-    fingerprints,
+    AlbumMembership, Fingerprints, PublishAction, PublishState, RefreshReport,
+    RelevantExportSettings, fingerprints,
 };
 use crate::publish::{
     AuthStatus, LocalContainer, PublishContext, PublishDestination, PublishError, PublishItem,
@@ -277,6 +277,45 @@ pub async fn check_account(
     }
 }
 
+/// Reconciles one link, or every link, with the destination's current
+/// read-only view. Callers decide when to persist so a failed multi-link
+/// refresh never writes a partial result.
+pub async fn refresh_destination(
+    destination: &dyn PublishDestination,
+    ctx: &PublishContext,
+    state: &mut PublishState,
+    album_id: Option<&str>,
+) -> Result<RefreshReport, PublishError> {
+    if !destination.capabilities().supports_reconcile {
+        return Err(PublishError::Rejected(format!(
+            "{} does not support refreshing linked albums",
+            destination.display_name()
+        )));
+    }
+
+    let targets: Vec<(String, RemoteContainerId)> = state
+        .links()
+        .filter(|(id, _)| album_id.is_none_or(|wanted| wanted == id.as_str()))
+        .map(|(id, link)| (id.clone(), RemoteContainerId(link.remote_uri.clone())))
+        .collect();
+    if let Some(album_id) = album_id
+        && targets.is_empty()
+    {
+        return Err(PublishError::Rejected(format!(
+            "album {album_id} is not linked"
+        )));
+    }
+
+    let mut report = RefreshReport::default();
+    for (album_id, container) in targets {
+        let snapshot = destination.inspect_container(&container, ctx).await?;
+        report.include(state.apply_snapshot(&album_id, snapshot.as_ref(), |image| {
+            destination.image_identity(image)
+        })?);
+    }
+    Ok(report)
+}
+
 pub struct PublishSession<'a> {
     destination: &'a dyn PublishDestination,
     pipeline: &'a dyn RenderPipeline,
@@ -356,6 +395,21 @@ impl<'a> PublishSession<'a> {
         if self.cancelled() {
             run.summary.cancelled = true;
             return Ok(run.summary);
+        }
+
+        // One remote listing immediately before classification prevents a
+        // publish from replacing a deleted image or rendering for an album
+        // that has disappeared. Save before the broken-link refusal below so
+        // the panel shows what the session discovered.
+        if capabilities.supports_reconcile {
+            refresh_destination(
+                self.destination,
+                self.ctx,
+                &mut run.state,
+                Some(&request.album.album_id),
+            )
+            .await?;
+            run.save()?;
         }
 
         let container = match run.state.link(&request.album.album_id) {
@@ -1000,8 +1054,8 @@ mod tests {
 
     use super::*;
     use crate::publish::{
-        AuthChallenge, ContainerPrivacy, DestinationCapabilities, RemoteNode, RemoteNodeId,
-        state::PublishState,
+        AuthChallenge, ContainerPrivacy, ContainerSnapshot, DestinationCapabilities, RemoteNode,
+        RemoteNodeId, state::PublishState,
     };
 
     const DESTINATION: &str = "stub";
@@ -1141,6 +1195,8 @@ mod tests {
         peak: AtomicU64,
         /// What `auth_status` reports: `None` is not connected.
         account: Option<String>,
+        supports_reconcile: bool,
+        container_exists: bool,
     }
 
     impl StubDestination {
@@ -1155,6 +1211,8 @@ mod tests {
                 cancel_on_upload: None,
                 spool_base: spool_base.to_path_buf(),
                 peak: AtomicU64::new(0),
+                supports_reconcile: false,
+                container_exists: true,
             }
         }
 
@@ -1168,6 +1226,17 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(name.to_string(), outcomes.into());
+            self
+        }
+
+        fn with_reconcile(mut self) -> Self {
+            self.supports_reconcile = true;
+            self
+        }
+
+        fn with_missing_container(mut self) -> Self {
+            self.supports_reconcile = true;
+            self.container_exists = false;
             self
         }
 
@@ -1194,7 +1263,7 @@ mod tests {
         fn capabilities(&self) -> DestinationCapabilities {
             DestinationCapabilities {
                 supports_replace: true,
-                supports_reconcile: true,
+                supports_reconcile: self.supports_reconcile,
                 supports_nested_containers: false,
                 max_bytes: None,
                 accepted_mime_types: &["image/jpeg"],
@@ -1257,6 +1326,21 @@ mod tests {
             _ctx: &PublishContext,
         ) -> Result<RemoteNode, PublishError> {
             unimplemented!()
+        }
+
+        async fn inspect_container(
+            &self,
+            _container: &RemoteContainerId,
+            _ctx: &PublishContext,
+        ) -> Result<Option<ContainerSnapshot>, PublishError> {
+            if !self.container_exists {
+                return Ok(None);
+            }
+            Ok(Some(ContainerSnapshot {
+                name: "Album".into(),
+                web_url: None,
+                images: Vec::new(),
+            }))
         }
 
         async fn publish_image(
@@ -1892,6 +1976,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_publish_refresh_stops_on_a_deleted_container_before_rendering() {
+        let harness = Harness::new();
+        let pipeline = StubPipeline::new(&harness.spool_base());
+        let destination = StubDestination::new(&harness.spool_base()).with_missing_container();
+        harness.link(ALBUM);
+
+        let recorder = Arc::clone(&harness.events);
+        let events: EventSink = Arc::new(move |event| recorder.lock().unwrap().push(event));
+        let result = PublishSession::new(
+            &destination,
+            &pipeline,
+            &harness.ctx,
+            harness.spool_base(),
+            events,
+        )
+        .run(
+            request(ALBUM, paths(1..=2)),
+            SettingsChangePolicy::Republish,
+        )
+        .await;
+
+        let error = result.expect_err("a deleted remote album stops the session");
+        assert!(matches!(error, PublishError::Rejected(_)), "{error}");
+        assert!(harness.state().link(ALBUM).unwrap().broken);
+        assert_eq!(pipeline.renders.load(Ordering::SeqCst), 0);
+        assert!(destination.uploaded_names().is_empty());
+        assert_eq!(harness.terminal_event(), "publish-error");
+    }
+
+    #[tokio::test]
     async fn a_broken_link_is_not_published_into() {
         let harness = Harness::new();
         let pipeline = StubPipeline::new(&harness.spool_base());
@@ -2014,6 +2128,7 @@ mod tests {
         let harness = Harness::new();
         let pipeline = StubPipeline::new(&harness.spool_base());
         let mut destination = StubDestination::new(&harness.spool_base())
+            .with_reconcile()
             .script(&file_name(2), vec![Scripted::Ambiguous])
             .script(&file_name(4), vec![Scripted::Ambiguous]);
         destination.landed = [file_name(2)].into();
@@ -2062,6 +2177,7 @@ mod tests {
         let harness = Harness::new();
         let pipeline = StubPipeline::new(&harness.spool_base());
         let destination = StubDestination::new(&harness.spool_base())
+            .with_reconcile()
             .script(&file_name(1), vec![Scripted::Fail])
             .script(
                 &file_name(2),

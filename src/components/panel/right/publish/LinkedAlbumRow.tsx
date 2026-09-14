@@ -4,6 +4,7 @@ import { open } from '@tauri-apps/plugin-shell';
 import clsx from 'clsx';
 import {
   AlertTriangle,
+  ArrowRight,
   Check,
   Circle,
   CircleDashed,
@@ -11,6 +12,7 @@ import {
   Link2,
   Loader,
   MoreHorizontal,
+  Plus,
   RefreshCw,
   Settings2,
   Unlink,
@@ -106,6 +108,7 @@ interface LinkedAlbumRowProps {
   isSelected: boolean;
   onSelect: () => void;
   onPublish: () => void;
+  onRecreate: () => void;
   onRelink: () => void;
   onUnlink: () => void;
 }
@@ -119,6 +122,7 @@ export default function LinkedAlbumRow({
   isSelected,
   onSelect,
   onPublish,
+  onRecreate,
   onRelink,
   onUnlink,
 }: LinkedAlbumRowProps) {
@@ -129,7 +133,16 @@ export default function LinkedAlbumRow({
   const StatusIcon = status?.icon;
   const showsRemoteName = link.remote_name !== null && link.remote_name !== link.album_name;
 
-  const showMenu = (x: number, y: number) =>
+  const showMenu = (x: number, y: number) => {
+    if (link.broken) {
+      showContextMenu(x, y, [
+        { icon: Link2, label: t('publish.links.menu.relink', { context: destinationId }), onClick: onRelink },
+        { icon: Plus, label: t('publish.links.menu.recreate', { context: destinationId }), onClick: onRecreate },
+        { type: OPTION_SEPARATOR },
+        { icon: Unlink, label: t('publish.links.menu.unlink'), isDestructive: true, onClick: onUnlink },
+      ]);
+      return;
+    }
     showContextMenu(x, y, [
       {
         icon: UploadCloud,
@@ -147,6 +160,7 @@ export default function LinkedAlbumRow({
       { icon: Link2, label: t('publish.links.menu.relink', { context: destinationId }), onClick: onRelink },
       { icon: Unlink, label: t('publish.links.menu.unlink'), isDestructive: true, onClick: onUnlink },
     ]);
+  };
 
   return (
     <div
@@ -177,8 +191,11 @@ export default function LinkedAlbumRow({
           {name}
         </Text>
         {showsRemoteName && (
-          <Text variant={TextVariants.small} className="truncate">
-            {link.remote_name}
+          <Text variant={TextVariants.small} className="flex items-center gap-1 truncate">
+            <ArrowRight size={11} className="shrink-0" />
+            <span className="truncate">
+              {t('publish.links.remoteName', { name: link.remote_name, destination: destinationName })}
+            </span>
           </Text>
         )}
       </div>

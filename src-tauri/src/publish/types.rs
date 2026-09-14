@@ -24,6 +24,18 @@ pub struct RemoteContainerId(pub String);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoteImageId(pub String);
 
+/// What a linked container currently looks like at the destination.
+///
+/// Images that exist remotely but are not recorded locally are intentionally
+/// just identifiers: refresh uses them only to retain matching records and
+/// never imports or changes them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerSnapshot {
+    pub name: String,
+    pub web_url: Option<String>,
+    pub images: Vec<RemoteImageId>,
+}
+
 /// Opaque destination-side identifier for anything in the container tree,
 /// folder or album, e.g. `/api/v2/node/1c3l4nd`. Not a [`RemoteContainerId`]:
 /// a destination may name an album's place in the tree and the album itself

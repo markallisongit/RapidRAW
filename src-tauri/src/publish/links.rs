@@ -169,9 +169,9 @@ mod tests {
     use crate::file_management::AlbumItem;
     use crate::publish::state::PublishState;
     use crate::publish::{
-        AuthChallenge, AuthStatus, ContainerPrivacy, DestinationCapabilities, PublishContext,
-        PublishDestination, PublishError, PublishItem, RemoteContainerId, RemoteImageId,
-        RemoteNode, RemoteNodeId, RemoteNodeKind,
+        AuthChallenge, AuthStatus, ContainerPrivacy, ContainerSnapshot, DestinationCapabilities,
+        PublishContext, PublishDestination, PublishError, PublishItem, RemoteContainerId,
+        RemoteImageId, RemoteNode, RemoteNodeId, RemoteNodeKind,
     };
 
     fn album_node(key: &str, name: &str) -> RemoteNode {
@@ -289,6 +289,14 @@ mod tests {
                 .find(|album| album.container.as_ref() == Some(id))
                 .cloned()
                 .ok_or_else(|| PublishError::Rejected("HTTP 404 Not Found".into()))
+        }
+
+        async fn inspect_container(
+            &self,
+            _container: &RemoteContainerId,
+            _ctx: &PublishContext,
+        ) -> Result<Option<ContainerSnapshot>, PublishError> {
+            unimplemented!()
         }
 
         async fn publish_image(

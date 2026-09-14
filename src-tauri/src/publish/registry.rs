@@ -140,8 +140,9 @@ mod tests {
     use crate::publish::PublishDestination;
     use crate::publish::registry::PublishRegistry;
     use crate::publish::types::{
-        AuthChallenge, AuthStatus, ContainerPrivacy, DestinationCapabilities, PublishContext,
-        PublishError, PublishItem, RemoteContainerId, RemoteImageId, RemoteNode, RemoteNodeId,
+        AuthChallenge, AuthStatus, ContainerPrivacy, ContainerSnapshot, DestinationCapabilities,
+        PublishContext, PublishError, PublishItem, RemoteContainerId, RemoteImageId, RemoteNode,
+        RemoteNodeId,
     };
 
     struct StubDestination;
@@ -216,6 +217,14 @@ mod tests {
             _id: &RemoteContainerId,
             _ctx: &PublishContext,
         ) -> Result<RemoteNode, PublishError> {
+            unimplemented!()
+        }
+
+        async fn inspect_container(
+            &self,
+            _container: &RemoteContainerId,
+            _ctx: &PublishContext,
+        ) -> Result<Option<ContainerSnapshot>, PublishError> {
             unimplemented!()
         }
 

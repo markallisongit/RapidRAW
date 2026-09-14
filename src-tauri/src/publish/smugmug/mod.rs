@@ -20,9 +20,9 @@ use crate::publish::smugmug::model::{ChildNode, TokenPair};
 use crate::publish::smugmug::upload::SmugMugUploader;
 use crate::publish::state::PublishState;
 use crate::publish::{
-    AuthChallenge, AuthStatus, ConsumerCredentials, ContainerPrivacy, DestinationCapabilities,
-    PublishContext, PublishDestination, PublishError, PublishItem, RemoteContainerId,
-    RemoteImageId, RemoteNode, RemoteNodeId, RemoteNodeKind,
+    AuthChallenge, AuthStatus, ConsumerCredentials, ContainerPrivacy, ContainerSnapshot,
+    DestinationCapabilities, PublishContext, PublishDestination, PublishError, PublishItem,
+    RemoteContainerId, RemoteImageId, RemoteNode, RemoteNodeId, RemoteNodeKind,
 };
 
 /// Also the name of the state file, so it must not change once shipped.
@@ -181,6 +181,22 @@ fn album_node(node: &ChildNode) -> Result<RemoteNode, PublishError> {
         })
 }
 
+/// SmugMug appends a numeric URI suffix that can change when an image is
+/// replaced (`…/ImageKey-0`, `…/ImageKey-1`, …). The image key before that
+/// suffix is the stable identity; the fresh full URI is still retained for
+/// the next replacement request.
+fn image_identity(image: &RemoteImageId) -> String {
+    let locator = image.0.rsplit('/').next().unwrap_or(image.0.as_str());
+    match locator.rsplit_once('-') {
+        Some((identity, revision))
+            if !revision.is_empty() && revision.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            identity.to_string()
+        }
+        _ => locator.to_string(),
+    }
+}
+
 #[async_trait]
 impl PublishDestination for SmugMugDestination {
     fn id(&self) -> &'static str {
@@ -334,6 +350,18 @@ impl PublishDestination for SmugMugDestination {
             web_url: album.web_uri,
             has_children: false,
         })
+    }
+
+    async fn inspect_container(
+        &self,
+        container: &RemoteContainerId,
+        ctx: &PublishContext,
+    ) -> Result<Option<ContainerSnapshot>, PublishError> {
+        self.connection(ctx)?.api.inspect_container(container).await
+    }
+
+    fn image_identity(&self, image: &RemoteImageId) -> String {
+        image_identity(image)
     }
 
     async fn publish_image(
@@ -510,6 +538,27 @@ mod tests {
 
         destination.disconnect(&ctx).await.unwrap();
         assert_eq!(status(&destination, &ctx).await, "NotAuthorised");
+    }
+
+    #[test]
+    fn image_identity_ignores_only_smugmugs_numeric_uri_revision() {
+        assert_eq!(
+            image_identity(&RemoteImageId("/api/v2/image/XyZ123-0".into())),
+            "XyZ123"
+        );
+        assert_eq!(
+            image_identity(&RemoteImageId("/api/v2/image/XyZ123-12".into())),
+            "XyZ123"
+        );
+        assert_eq!(
+            image_identity(&RemoteImageId("/api/v2/album/AbCdEf/image/XyZ123-2".into())),
+            "XyZ123",
+            "SmugMug also returns the album-image form from upload calls"
+        );
+        assert_eq!(
+            image_identity(&RemoteImageId("/api/v2/image/key-final".into())),
+            "key-final"
+        );
     }
 
     #[test]

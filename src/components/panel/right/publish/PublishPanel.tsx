@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useShallow } from 'zustand/react/shallow';
-import { Settings } from 'lucide-react';
+import { RefreshCw, Settings } from 'lucide-react';
 
 import ConfirmModal from '../../../modals/ConfirmModal';
 import Text from '../../../ui/Text';
@@ -17,7 +17,13 @@ import PublishManagerModal from './manager/PublishManagerModal';
 import { formatSupport } from './output';
 import PublishProgress from './PublishProgress';
 import PublishSummary, { SettingsChangeQuestion } from './PublishSummary';
-import { LinkInfo, SettingsChangePolicy, usePublishManager, usePublishState } from './usePublishState';
+import {
+  LinkInfo,
+  SettingsChangePolicy,
+  displayError,
+  usePublishManager,
+  usePublishState,
+} from './usePublishState';
 
 const DESTINATION_ID = 'smugmug';
 const NO_PRESETS: ExportPreset[] = [];
@@ -49,7 +55,18 @@ export default function PublishPanel() {
   const { t } = useTranslation();
   const isVisible = useUIStore((state) => Object.values(state.activePanels).includes(Panel.Publish));
   const api = usePublishState(DESTINATION_ID, isVisible);
-  const { authStatus, destination, session, settings, links, previews, selectedAlbumId } = api;
+  const {
+    authStatus,
+    destination,
+    session,
+    settings,
+    links,
+    previews,
+    selectedAlbumId,
+    isRefreshing,
+    refreshReport,
+    refreshError,
+  } = api;
   const { refreshLinks, refreshPreviews, selectAlbum } = api;
   const destinationName = destination?.display_name ?? 'SmugMug';
   const { openManager } = usePublishManager();
@@ -110,6 +127,21 @@ export default function PublishPanel() {
   );
   const unlinkedActiveAlbum = activeAlbum && links && !isLinked(activeAlbum.id) ? activeAlbum : null;
   const selectedLink = links?.find((link) => link.album_id === selectedAlbumId) ?? null;
+  const refreshMessage = useMemo(() => {
+    if (!refreshReport) return null;
+    const parts = [t('publish.refresh.checked', { count: refreshReport.links_checked, context: DESTINATION_ID })];
+    if (refreshReport.renamed > 0) parts.push(t('publish.refresh.renamed', { count: refreshReport.renamed }));
+    if (refreshReport.broken > 0) parts.push(t('publish.refresh.broken', { count: refreshReport.broken }));
+    if (refreshReport.restored > 0) parts.push(t('publish.refresh.restored', { count: refreshReport.restored }));
+    if (refreshReport.images_missing > 0) {
+      parts.push(t('publish.refresh.imagesMissing', { count: refreshReport.images_missing }));
+    }
+    return `${parts.join(' · ')}${
+      refreshReport.images_missing > 0
+        ? ` — ${t('publish.refresh.uploadNext', { count: refreshReport.images_missing })}`
+        : ''
+    }`;
+  }, [refreshReport, t]);
 
   /** Checks again first, so the settings question counts what is true now. */
   const startPublish = async (albumId: string) => {
@@ -166,6 +198,13 @@ export default function PublishPanel() {
             onLinkAlbum={(albumId) => setFlow({ albumId, isRelink: false })}
             onOpenManager={(section) => openManager(DESTINATION_ID, section)}
             onPublish={startPublish}
+            onRecreate={(link) => {
+              const name = link.remote_name ?? link.album_name;
+              if (!name) return;
+              api.linkAlbum(link.album_id, { kind: 'CreateNew', name }).catch((error) => {
+                console.error('Publish recreate:', error);
+              });
+            }}
             onRemoveDeleted={(deleted) => setConfirm({ kind: 'removeDeleted', links: deleted })}
             onRelink={(link) => setConfirm({ kind: 'relink', link })}
             onUnlink={(link) => setConfirm({ kind: 'unlink', link })}
@@ -225,15 +264,37 @@ export default function PublishPanel() {
     <div className="flex flex-col h-full">
       <div className="p-3 flex justify-between items-center shrink-0 border-b border-surface">
         <Text variant={TextVariants.title}>{t('publish.panel.title')}</Text>
-        <button
-          aria-label={t('publish.manager.title')}
-          className="p-1.5 rounded-md text-text-secondary hover:text-text-primary hover:bg-surface transition-colors"
-          data-tooltip={t('publish.manager.title')}
-          onClick={() => openManager(DESTINATION_ID)}
-        >
-          <Settings size={18} />
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            aria-label={t('publish.refresh.action', { destination: destinationName })}
+            className="p-1.5 rounded-md text-text-secondary hover:text-text-primary hover:bg-surface transition-colors disabled:opacity-40 disabled:pointer-events-none"
+            data-tooltip={t('publish.refresh.action', { destination: destinationName })}
+            disabled={!isConnected || !isIdle || !links?.length || isRefreshing}
+            onClick={() => void api.refreshRemote().catch(() => {})}
+          >
+            <RefreshCw size={18} className={isRefreshing ? 'animate-spin' : undefined} />
+          </button>
+          <button
+            aria-label={t('publish.manager.title')}
+            className="p-1.5 rounded-md text-text-secondary hover:text-text-primary hover:bg-surface transition-colors"
+            data-tooltip={t('publish.manager.title')}
+            onClick={() => openManager(DESTINATION_ID)}
+          >
+            <Settings size={18} />
+          </button>
+        </div>
       </div>
+
+      {(refreshMessage || refreshError) && (
+        <Text
+          variant={TextVariants.small}
+          className={`px-3 py-2 border-b border-surface ${refreshError ? 'text-red-400' : 'text-text-secondary'}`}
+        >
+          {refreshError
+            ? t('publish.refresh.failed', { error: displayError(refreshError, t('publish.errors.localFile')) })
+            : refreshMessage}
+        </Text>
+      )}
 
       {renderBody()}
 
