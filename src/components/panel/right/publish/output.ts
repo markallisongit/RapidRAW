@@ -1,13 +1,6 @@
 import type { TFunction } from 'i18next';
 
-import {
-  ExportPreset,
-  ExportSettings,
-  FILE_FORMATS,
-  FileFormat,
-  FileFormats,
-  WatermarkAnchor,
-} from '../../../ui/ExportImportProperties';
+import { ExportPreset, FILE_FORMATS, FileFormat, FileFormats } from '../../../ui/ExportImportProperties';
 import { DestinationInfo } from './usePublishState';
 
 /** The Export panel's own record of its settings, never offered as a destination's preset. */
@@ -31,30 +24,6 @@ type OutputValues = Omit<ExportPreset, 'id' | 'name'>;
 /** Falls back to JPEG, as the Export panel and the backend's `output_format` do. */
 export const formatOf = (fileFormat: string): FileFormat =>
   FILE_FORMATS.find((f) => f.id === fileFormat) ?? FILE_FORMATS[0];
-
-/** The same `ExportSettings` the Export panel builds from these values. */
-export const toExportSettings = (s: OutputValues): ExportSettings => ({
-  filenameTemplate: s.filenameTemplate,
-  jpegQuality: s.jpegQuality,
-  keepMetadata: s.keepMetadata,
-  preserveTimestamps: s.preserveTimestamps,
-  preserveFolders: s.preserveFolders,
-  destinationType: s.destinationType,
-  subfolder: s.subfolder,
-  resize: s.enableResize ? { mode: s.resizeMode, value: s.resizeValue, dontEnlarge: s.dontEnlarge } : null,
-  stripGps: s.stripGps,
-  exportMasks: s.exportMasks,
-  watermark:
-    s.enableWatermark && s.watermarkPath
-      ? {
-          path: s.watermarkPath,
-          anchor: s.watermarkAnchor as WatermarkAnchor,
-          scale: s.watermarkScale,
-          spacing: s.watermarkSpacing,
-          opacity: s.watermarkOpacity,
-        }
-      : null,
-});
 
 /** One line: format, quality, size and watermark, e.g. "JPEG · 85% quality · Long Edge 2560 px". */
 export const describeOutput = (s: OutputValues, t: TFunction): string => {

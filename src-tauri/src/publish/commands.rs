@@ -13,7 +13,6 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::AppState;
-use crate::export_processing::ExportSettings;
 use crate::file_management::AlbumItem;
 use crate::publish::links::{LinkError, LinkInfo, LinkTarget, link_album, list_links};
 use crate::publish::preset::{
@@ -234,25 +233,16 @@ pub fn publish_unlink(
 /// destination's preset. Never renders or uploads, and needs no connection:
 /// it reads only the state file, the photos and, when connected, which
 /// account that is.
-///
-/// `export_settings` and `output_format` are the Export panel's, used only
-/// while the destination has no preset. Interim: removed by #21.
 #[tauri::command]
 pub async fn publish_preview(
     destination_id: String,
     album_id: String,
-    export_settings: Option<ExportSettings>,
-    output_format: Option<String>,
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> Result<PublishPreview, PresetError> {
     let destination = destination(&state, &destination_id)?;
     let request = album(&app_handle, &album_id)?;
-    let output = output(
-        &app_handle,
-        &destination_id,
-        interim(export_settings, output_format),
-    )?;
+    let output = output(&app_handle, &destination_id)?;
     let ctx = context(&app_handle, &destination_id, idle_cancel())?;
     let mut publish_state =
         PublishState::load_in(&ctx.state_dir, &destination_id, &request.albums)?;
@@ -286,25 +276,19 @@ pub async fn publish_preview(
 ///
 /// Renders with the destination's preset. `on_settings_change` decides
 /// whether photos whose only change is that preset upload again, and is
-/// required so that never happens without the user having been asked.
-/// `export_settings` and `output_format` are as for [`publish_preview`].
+/// required so that never happens without the user having been asked. The
+/// album must be linked: publishing never finds or creates one by name.
 #[tauri::command]
 pub async fn publish_album(
     destination_id: String,
     album_id: String,
-    export_settings: Option<ExportSettings>,
-    output_format: Option<String>,
     on_settings_change: SettingsChangePolicy,
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> Result<(), PresetError> {
     let destination = destination(&state, &destination_id)?;
     let request = album(&app_handle, &album_id)?;
-    let output = output(
-        &app_handle,
-        &destination_id,
-        interim(export_settings, output_format),
-    )?;
+    let output = output(&app_handle, &destination_id)?;
     let spool_base = spool::spool_root(&app_handle)?;
     let session = state.publish_registry.begin_session()?;
     let ctx = context(&app_handle, &destination_id, session.cancel_flag())?;
@@ -417,33 +401,13 @@ fn album(app_handle: &AppHandle, album_id: &str) -> Result<PublishRequest, Strin
         .ok_or_else(|| format!("no album with id {album_id}"))
 }
 
-/// What `destination_id` publishes with. Interim: removed by #21, along with
-/// `interim`.
-fn output(
-    app_handle: &AppHandle,
-    destination_id: &str,
-    interim: Option<PublishOutput>,
-) -> Result<PublishOutput, PresetError> {
+/// What `destination_id` publishes with: its preset, which must be chosen.
+fn output(app_handle: &AppHandle, destination_id: &str) -> Result<PublishOutput, PresetError> {
     let settings = DestinationSettings::load_in(&state_dir(app_handle)?, destination_id)?;
     destination_output(
         settings.export_preset_id.as_deref(),
         &export_presets(app_handle)?,
-        interim,
     )
-}
-
-/// Interim: removed by #21. The Export panel's settings, when the panel sent
-/// them.
-fn interim(
-    export_settings: Option<ExportSettings>,
-    output_format: Option<String>,
-) -> Option<PublishOutput> {
-    export_settings
-        .zip(output_format)
-        .map(|(export_settings, output_format)| PublishOutput {
-            export_settings,
-            output_format,
-        })
 }
 
 fn export_presets(

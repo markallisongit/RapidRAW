@@ -17,7 +17,10 @@ export default function NewAlbumsSection({ destination, privacy, isRequested, on
   const { t } = useTranslation();
 
   return (
-    <ManagerSection title={t('publish.manager.newAlbums.heading')} isRequested={isRequested}>
+    <ManagerSection
+      title={t('publish.manager.newAlbums.heading', { context: destination.id })}
+      isRequested={isRequested}
+    >
       <div className="space-y-1">
         <Text as="span" variant={TextVariants.label} className="block">
           {t('publish.manager.newAlbums.privacyLabel')}
@@ -33,7 +36,7 @@ export default function NewAlbumsSection({ destination, privacy, isRequested, on
         />
       </div>
       <Text variant={TextVariants.small}>
-        {t('publish.manager.newAlbums.note', { destination: destination.display_name })}
+        {t('publish.manager.newAlbums.note', { destination: destination.display_name, context: destination.id })}
       </Text>
     </ManagerSection>
   );

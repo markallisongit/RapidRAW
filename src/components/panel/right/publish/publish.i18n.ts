@@ -9,6 +9,12 @@ import i18n from 'i18next';
  *    keys in every locale file.
  *  - the `PublishTranslations` intersection in src/@types/i18next.d.ts, so
  *    `t('publish.*')` type-checks against the CustomTypeOptions resources.
+ *
+ * Strings about the destination's albums use its own word for them. They are
+ * called with `context: destinationId`, and a destination whose word differs
+ * adds `_<id>` variants (SmugMug's albums are galleries); the rest fall back
+ * to the plain key. Whole sentences, not an interpolated noun, so articles and
+ * grammar stay right in every language.
  */
 export const publishResources = {
   panel: {
@@ -84,8 +90,11 @@ export const publishResources = {
     },
     newAlbums: {
       heading: 'New albums',
+      heading_smugmug: 'New galleries',
       privacyLabel: 'Privacy',
       note: 'Applies only to albums RapidRAW creates. Albums that already exist on {{destination}} keep their privacy.',
+      note_smugmug:
+        'Applies only to galleries RapidRAW creates. Galleries that already exist on {{destination}} keep their privacy.',
       privacy: {
         Public: 'Public',
         Unlisted: 'Unlisted',
@@ -98,6 +107,8 @@ export const publishResources = {
       message_other: '{{count}} photos already published to {{destination}}, in {{albums}}, used different settings.',
       albums_one: '{{count}} album',
       albums_other: '{{count}} albums',
+      albums_smugmug_one: '{{count}} gallery',
+      albums_smugmug_other: '{{count}} galleries',
       republish: 'Republish them next time',
       keep: 'Keep existing uploads',
     },
@@ -108,38 +119,148 @@ export const publishResources = {
     notConnected: '{{destination}} is not connected.',
     connect: 'Connect {{destination}}',
   },
-  connected: {
-    heading: 'Account',
-    account: 'Connected as {{account}}',
+  destination: {
+    noPreset: 'Choose the output preset photos are rendered with before publishing to {{destination}}.',
+    presetDeleted: 'The output preset for {{destination}} has been deleted. Choose another before publishing.',
+    choosePreset: 'Choose an output preset',
+    unsupportedFormat: '{{destination}} accepts {{formats}} only. Choose a preset that uses one of those.',
   },
-  album: {
-    heading: 'Album',
-    placeholder: 'Choose an album',
+  links: {
+    loading: 'Loading linked albums…',
+    failed: 'Could not load linked albums: {{error}}',
+    empty:
+      'Link a RapidRAW album to an album on {{destination}}. Publishing then sends only the photos that are new or have changed.',
+    empty_smugmug:
+      'Link a RapidRAW album to a gallery on {{destination}}. Publishing then sends only the photos that are new or have changed.',
+    publishAlbum: 'Publish an album…',
+    publishThisAlbum: 'Publish “{{name}}”…',
+    deletedLinks_one: '{{count}} link belongs to a deleted album',
+    deletedLinks_other: '{{count}} links belong to deleted albums',
+    removeDeleted: 'Remove',
+    actions: 'Actions for {{name}}',
+    status: {
+      upToDate: 'Up to date',
+      changed_one: '{{count}} changed',
+      changed_other: '{{count}} changed',
+      new_one: '{{count}} new',
+      new_other: '{{count}} new',
+      settings_one: '{{count}} affected by settings',
+      settings_other: '{{count}} affected by settings',
+      broken: 'Not found on {{destination}}',
+      notPublished: 'Not published yet',
+      checking: 'Checking…',
+      failed: 'Could not check',
+    },
+    menu: {
+      publish: 'Publish',
+      open: 'Open on {{destination}}',
+      relink: 'Link to a different album…',
+      relink_smugmug: 'Link to a different gallery…',
+      unlink: 'Unlink',
+    },
+    confirmUnlink: {
+      title: 'Unlink “{{name}}”?',
+      message:
+        'Its photos stay on {{destination}}. RapidRAW forgets what it published there, so linking this album again uploads every photo as new.',
+    },
+    confirmRemoveDeleted: {
+      title_one: 'Remove the link to a deleted album?',
+      title_other: 'Remove {{count}} links to deleted albums?',
+      message_one:
+        'Its RapidRAW album was deleted, so it can never be published again. Nothing is deleted on {{destination}}.',
+      message_other:
+        'Their RapidRAW albums were deleted, so they can never be published again. Nothing is deleted on {{destination}}.',
+    },
+    confirmRelink: {
+      title: 'Link “{{name}}” to a different album?',
+      title_smugmug: 'Link “{{name}}” to a different gallery?',
+      message:
+        'Its photos upload again, as new photos, into the album you choose. Nothing is removed from “{{remote}}” on {{destination}}.',
+      message_smugmug:
+        'Its photos upload again, as new photos, into the gallery you choose. Nothing is removed from “{{remote}}” on {{destination}}.',
+      messageUnnamed:
+        'Its photos upload again, as new photos, into the album you choose. Nothing is removed from its current album on {{destination}}.',
+      messageUnnamed_smugmug:
+        'Its photos upload again, as new photos, into the gallery you choose. Nothing is removed from its current gallery on {{destination}}.',
+      confirm: 'Choose an album',
+      confirm_smugmug: 'Choose a gallery',
+    },
+  },
+  link: {
+    title: 'Publish an album',
+    relinkTitle: 'Link to a different album',
+    relinkTitle_smugmug: 'Link to a different gallery',
+    back: 'Back',
+    cancel: 'Cancel',
+    chooseAlbum: 'Choose a RapidRAW album',
     noAlbums: 'Create an album in the library first. Publishing works on albums, not folders.',
-    mapping: 'Publishes to “{{name}}” at the top level of your SmugMug site, creating it if needed.',
-    empty: 'This album has no photos.',
+    linked: 'Linked',
+    chooseTarget: 'Where should “{{name}}” go?',
+    createNew: 'Create a new {{destination}} album',
+    createNew_smugmug: 'Create a new {{destination}} gallery',
+    linkExisting: 'Link to an existing album',
+    linkExisting_smugmug: 'Link to an existing gallery',
+    nameLabel: 'Album name',
+    privacy: 'New albums are <strong>{{privacy}}</strong>.',
+    privacy_smugmug: 'New galleries are <strong>{{privacy}}</strong>.',
+    changePrivacy: 'Change in Publish Manager',
+    create: 'Create and link',
+    creating: 'Creating…',
+    linkTo: 'Link to “{{name}}”',
+    chooseRemote: 'Choose an album',
+    chooseRemote_smugmug: 'Choose a gallery',
+    linking: 'Linking…',
+    nothingUploads: 'Nothing uploads until you click Publish.',
+    alreadyExists: 'An album called “{{name}}” already exists on {{destination}}. Link to it instead?',
+    alreadyExists_smugmug: 'A gallery called “{{name}}” already exists on {{destination}}. Link to it instead?',
+    linkInstead: 'Link to it',
+    alreadyLinked: 'That album is already linked to “{{name}}”.',
+    alreadyLinked_smugmug: 'That gallery is already linked to “{{name}}”.',
+    alreadyLinkedDeleted: 'That album is already linked to a RapidRAW album that has been deleted. Unlink it first.',
+    alreadyLinkedDeleted_smugmug:
+      'That gallery is already linked to a RapidRAW album that has been deleted. Unlink it first.',
+  },
+  browser: {
+    loading: 'Loading albums…',
+    loading_smugmug: 'Loading galleries…',
+    failed: 'Could not load albums: {{error}}',
+    failed_smugmug: 'Could not load galleries: {{error}}',
+    empty: 'Nothing here to link to.',
+    linkedTo: 'Linked to “{{name}}”',
+    linkedToDeleted: 'Linked to a deleted album',
   },
   settings: {
-    heading: 'Output',
-    current: 'Publishing with your current export settings:',
-    preset: 'Publishing with the “{{name}}” preset:',
-    choosePreset: 'Choose an output preset',
-    changePreset: 'Change in Publish Manager',
     quality: '{{quality}}% quality',
-    resize: 'fit to {{value}} px',
     fullSize: 'full size',
     watermark: 'watermark',
-    openExport: 'Change in the Export panel',
-    unsupportedFormat: '{{destination}} accepts {{formats}} only. Choose one of those in the Export panel.',
-    unsupportedPresetFormat: '{{destination}} accepts {{formats}} only. Choose a preset that uses one of those.',
   },
-  preview: {
-    heading: 'Changes',
+  summary: {
+    mapping: '{{album}} → {{destination}} “{{remote}}”',
+    mappingUnnamed: '{{album}} → {{destination}}',
+    new_one: '{{count}} new',
+    new_other: '{{count}} new',
+    update_one: '{{count}} to update',
+    update_other: '{{count}} to update',
+    settings_one: '{{count}} with changed settings',
+    settings_other: '{{count}} with changed settings',
+    unchanged_one: '{{count}} unchanged',
+    unchanged_other: '{{count}} unchanged',
+    empty: 'This album has no photos.',
     checking: 'Checking for changes…',
-    counts: '{{unchanged}} unchanged, {{update}} to update, {{new}} new',
+    failed: 'Could not check for changes: {{error}}',
     unreadable_one: '{{count}} photo could not be read and will be reported as failed.',
     unreadable_other: '{{count}} photos could not be read and will be reported as failed.',
-    failed: 'Could not check for changes: {{error}}',
+    preset: 'Preset: {{name}} · {{output}}',
+    broken: 'This album was not found on {{destination}}. Link it to a different album to publish it.',
+    broken_smugmug: 'Its gallery was not found on {{destination}}. Link it to a different gallery to publish it.',
+  },
+  settingsChange: {
+    title: 'Output settings changed',
+    message_one: '{{count}} photo in this album was published with different settings.',
+    message_other: '{{count}} photos in this album were published with different settings.',
+    republish: 'Republish them too',
+    keep: 'Only upload edited and new photos',
+    cancel: 'Cancel',
   },
   actions: {
     publish_one: 'Publish {{count}} photo',

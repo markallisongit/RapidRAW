@@ -1,290 +1,225 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useShallow } from 'zustand/react/shallow';
-import { motion } from 'framer-motion';
-import { AlertTriangle, ArrowUpRight, Loader, Settings, UploadCloud } from 'lucide-react';
+import { Settings } from 'lucide-react';
 
-import Button from '../../../ui/Button';
-import Dropdown from '../../../ui/Dropdown';
+import ConfirmModal from '../../../modals/ConfirmModal';
 import Text from '../../../ui/Text';
 import { AlbumItem, Panel } from '../../../ui/AppProperties';
-import { TextColors, TextVariants, TextWeights } from '../../../../types/typography';
-import { useExportSettings } from '../../../../hooks/useExportSettings';
+import { ExportPreset } from '../../../ui/ExportImportProperties';
+import { TextVariants } from '../../../../types/typography';
 import { useLibraryStore } from '../../../../store/useLibraryStore';
 import { useSettingsStore } from '../../../../store/useSettingsStore';
 import { useUIStore } from '../../../../store/useUIStore';
+import DestinationSection from './DestinationSection';
+import LinkAlbumFlow from './LinkAlbumFlow';
 import PublishManagerModal from './manager/PublishManagerModal';
-import { LAST_USED_PRESET_ID, describeOutput, formatOf, formatSupport, toExportSettings } from './output';
+import { formatSupport } from './output';
 import PublishProgress from './PublishProgress';
-import {
-  PublishPreview,
-  PublishTarget,
-  displayError,
-  isPresetMissing,
-  usePublishManager,
-  usePublishState,
-} from './usePublishState';
+import PublishSummary, { SettingsChangeQuestion } from './PublishSummary';
+import { LinkInfo, SettingsChangePolicy, usePublishManager, usePublishState } from './usePublishState';
 
 const DESTINATION_ID = 'smugmug';
+const NO_PRESETS: ExportPreset[] = [];
 
-interface PublishableAlbum {
-  id: string;
-  label: string;
-  /** The name the backend gives the remote album: groups folded in. */
-  remoteName: string;
-  images: string[];
+const findAlbum = (items: AlbumItem[], albumId: string): { id: string; name: string } | null => {
+  for (const item of items) {
+    if (item.type === 'album' && item.id === albumId) return { id: item.id, name: item.name };
+    if (item.type === 'group') {
+      const found = findAlbum(item.children, albumId);
+      if (found) return found;
+    }
+  }
+  return null;
+};
+
+/** The link flow in progress: the album it starts on, if any, and whether that album is linked already. */
+interface Flow {
+  albumId: string | null;
+  isRelink: boolean;
 }
 
-const flattenAlbums = (items: AlbumItem[], parents: string[] = []): PublishableAlbum[] =>
-  items.flatMap((item) =>
-    item.type === 'album'
-      ? [
-          {
-            id: item.id,
-            label: [...parents, item.name].join(' › '),
-            remoteName: [...parents, item.name].join(' - '),
-            images: item.images,
-          },
-        ]
-      : flattenAlbums(item.children, [...parents, item.name]),
-  );
+type Confirm =
+  | { kind: 'unlink'; link: LinkInfo }
+  | { kind: 'relink'; link: LinkInfo }
+  | { kind: 'removeDeleted'; links: LinkInfo[] };
 
-function Warning({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="flex items-start gap-2 bg-yellow-500/10 rounded-md p-3">
-      <AlertTriangle size={16} className="shrink-0 mt-0.5 text-yellow-400" />
-      <Text variant={TextVariants.small} color={TextColors.primary}>
-        {children}
-      </Text>
-    </div>
-  );
-}
-
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <div>
-      <Text variant={TextVariants.heading} className="mb-2">
-        {title}
-      </Text>
-      <div className="space-y-2">{children}</div>
-    </div>
-  );
-}
-
-/** Session and authorisation state live in `usePublishState`'s store, so switching tabs loses neither. */
+/** Session, authorisation, links and previews live in `usePublishState`'s store, so switching tabs loses none of them. */
 export default function PublishPanel() {
   const { t } = useTranslation();
   const isVisible = useUIStore((state) => Object.values(state.activePanels).includes(Panel.Publish));
   const api = usePublishState(DESTINATION_ID, isVisible);
-  const { authStatus, authError, destination, session, settings } = api;
+  const { authStatus, destination, session, settings, links, previews, selectedAlbumId } = api;
+  const { refreshLinks, refreshPreviews, selectAlbum } = api;
   const destinationName = destination?.display_name ?? 'SmugMug';
   const { openManager } = usePublishManager();
 
-  const appSettings = useSettingsStore((state) => state.appSettings);
-  const setPanel = useUIStore((state) => state.setPanel);
+  const presets = useSettingsStore((state) => state.appSettings?.exportPresets) ?? NO_PRESETS;
   const { albumTree, activeAlbumId } = useLibraryStore(
     useShallow((state) => ({ albumTree: state.albumTree, activeAlbumId: state.activeAlbumId })),
   );
 
-  // Interim, until #21 requires a preset: with none chosen, publishing uses
-  // the Export panel's last-used settings, through the same hook and defaults.
-  const { currentSettingsObject, handleApplyPreset } = useExportSettings();
-  const lastUsedPreset = appSettings?.exportPresets?.find((p) => p.id === LAST_USED_PRESET_ID);
-  useEffect(() => {
-    if (lastUsedPreset) handleApplyPreset(lastUsedPreset);
-  }, [lastUsedPreset, handleApplyPreset]);
-
-  const albums = useMemo(() => flattenAlbums(albumTree), [albumTree]);
-  const [selectedAlbumId, setSelectedAlbumId] = useState<string | null>(null);
-  useEffect(() => {
-    if (activeAlbumId && albums.some((a) => a.id === activeAlbumId)) setSelectedAlbumId(activeAlbumId);
-  }, [activeAlbumId, albums]);
-  const album = albums.find((a) => a.id === selectedAlbumId) ?? null;
-
+  const isConnected = authStatus?.status === 'Connected';
+  const isIdle = session.phase === 'idle';
   const presetId = settings?.export_preset_id ?? null;
-  const preset = presetId === null ? null : (appSettings?.exportPresets?.find((p) => p.id === presetId) ?? null);
-  // What publishing renders with; unknown when the chosen preset has been deleted.
-  const output = presetId === null ? currentSettingsObject : preset;
-  const outputFormat = formatOf(currentSettingsObject.fileFormat).extensions[0];
-  const support = formatSupport(destination, output?.fileFormat ?? currentSettingsObject.fileFormat);
-  const isFormatAccepted = support.isAccepted;
+  const preset = presetId === null ? null : (presets.find((p) => p.id === presetId) ?? null);
+  const canCheck = isConnected && preset !== null && formatSupport(destination, preset.fileFormat).isAccepted;
 
-  const target: PublishTarget | null = useMemo(
-    () => (album ? { albumId: album.id, exportSettings: toExportSettings(currentSettingsObject), outputFormat } : null),
-    [album, currentSettingsObject, outputFormat],
+  const [flow, setFlow] = useState<Flow | null>(null);
+  const [confirm, setConfirm] = useState<Confirm | null>(null);
+  const [question, setQuestion] = useState<{ albumId: string; count: number } | null>(null);
+  const [isStarting, setIsStarting] = useState(false);
+
+  // Names, deletions and broken links can change with the album tree and after a publish.
+  useEffect(() => {
+    if (isVisible && isConnected && isIdle) refreshLinks();
+  }, [isVisible, isConnected, isIdle, albumTree, refreshLinks]);
+
+  // Checked again whenever the links, the preset or its settings change, and each time the tab
+  // is shown, which is how edits made in other panels come to be counted.
+  useEffect(() => {
+    if (!isVisible || !canCheck || !isIdle || !links) return;
+    refreshPreviews(links.filter((link) => link.album_name !== null && !link.broken).map((link) => link.album_id));
+    // An empty run stops this one between albums.
+    return () => void refreshPreviews([]);
+  }, [isVisible, canCheck, isIdle, links, preset, refreshPreviews]);
+
+  const linksRef = useRef(links);
+  linksRef.current = links;
+  // Links whose RapidRAW album was deleted are never selected: there is nothing left to publish.
+  const isLinked = useCallback(
+    (albumId: string | null) =>
+      !!albumId && !!linksRef.current?.some((l) => l.album_id === albumId && l.album_name !== null),
+    [],
   );
 
-  const isConnected = authStatus?.status === 'Connected';
-  const [preview, setPreview] = useState<PublishPreview | null>(null);
-  const [previewError, setPreviewError] = useState<string | null>(null);
-  const [isPreviewing, setIsPreviewing] = useState(false);
+  // The album selected in Sources is the one summarised, when it is linked.
+  useEffect(() => {
+    if (isLinked(activeAlbumId)) selectAlbum(activeAlbumId);
+  }, [activeAlbumId, isLinked, selectAlbum]);
 
   useEffect(() => {
-    setPreview(null);
-    setPreviewError(null);
-    if (!isVisible || !isConnected || !target || !output || !isFormatAccepted || session.phase !== 'idle') return;
+    if (!links || isLinked(selectedAlbumId)) return;
+    const firstLive = links.find((link) => link.album_name !== null);
+    selectAlbum(isLinked(activeAlbumId) ? activeAlbumId : (firstLive?.album_id ?? null));
+  }, [links, selectedAlbumId, activeAlbumId, isLinked, selectAlbum]);
 
-    let isCurrent = true;
-    setIsPreviewing(true);
-    api
-      .preview(target)
-      .then((counts) => isCurrent && setPreview(counts))
-      .catch(
-        (error) =>
-          isCurrent &&
-          setPreviewError(
-            isPresetMissing(error)
-              ? t('publish.errors.presetMissing')
-              : displayError(error, t('publish.errors.localFile')),
-          ),
-      )
-      .finally(() => isCurrent && setIsPreviewing(false));
-    return () => {
-      isCurrent = false;
-    };
-  }, [isVisible, isConnected, target, album?.images, output, isFormatAccepted, session.phase, api.preview, t]);
+  const activeAlbum = useMemo(
+    () => (activeAlbumId ? findAlbum(albumTree, activeAlbumId) : null),
+    [albumTree, activeAlbumId],
+  );
+  const unlinkedActiveAlbum = activeAlbum && links && !isLinked(activeAlbum.id) ? activeAlbum : null;
+  const selectedLink = links?.find((link) => link.album_id === selectedAlbumId) ?? null;
 
-  // Interim, until #21 asks: settings-only changes republish, as they always have.
-  const toPublish = preview ? preview.new + preview.update + preview.settings_changed : 0;
-  const canPublish =
-    isConnected && !!album && album.images.length > 0 && output !== null && isFormatAccepted && !isPreviewing;
+  /** Checks again first, so the settings question counts what is true now. */
+  const startPublish = async (albumId: string) => {
+    selectAlbum(albumId);
+    setIsStarting(true);
+    try {
+      const counts = await api.preview(albumId);
+      if (counts.settings_changed > 0) {
+        setQuestion({ albumId, count: counts.settings_changed });
+      } else {
+        // With nothing whose only change is its settings, there is nothing to ask about.
+        await api.publish(albumId, 'KeepExisting');
+      }
+    } catch {
+      // The preview's error is shown in the summary.
+    } finally {
+      setIsStarting(false);
+    }
+  };
+
+  const answer = (policy: SettingsChangePolicy) => {
+    if (!question) return;
+    setQuestion(null);
+    api.publish(question.albumId, policy);
+  };
 
   const renderBody = () => {
-    if (authError) {
+    if (!isIdle) return <PublishProgress api={api} destinationName={destinationName} />;
+
+    if (flow && links) {
       return (
-        <div className="space-y-3">
-          <Text color={TextColors.error}>{displayError(authError, t('publish.errors.localFile'))}</Text>
-          <Button className="bg-surface text-text-primary shadow-none" onClick={api.refreshAuth}>
-            {t('publish.panel.retry')}
-          </Button>
-        </div>
-      );
-    }
-    if (!authStatus) {
-      return (
-        <Text className="flex items-center gap-2 italic">
-          <Loader size={16} className="animate-spin" /> {t('publish.panel.loading')}
-        </Text>
-      );
-    }
-    if (authStatus.status !== 'Connected') {
-      const hasKey = authStatus.status === 'NotAuthorised';
-      return (
-        <div className="space-y-3">
-          <Text>
-            {hasKey
-              ? t('publish.prompt.notConnected', { destination: destinationName })
-              : t('publish.prompt.notSetUp', { destination: destinationName })}
-          </Text>
-          <Button onClick={() => openManager(DESTINATION_ID, hasKey ? 'account' : 'apiKey')}>
-            <Settings size={16} />
-            {hasKey
-              ? t('publish.prompt.connect', { destination: destinationName })
-              : t('publish.prompt.setUp', { destination: destinationName })}
-          </Button>
-        </div>
+        <LinkAlbumFlow
+          albumTree={albumTree}
+          api={api}
+          destinationName={destinationName}
+          initialAlbumId={flow.albumId}
+          isRelink={flow.isRelink}
+          links={links}
+          onCancel={() => setFlow(null)}
+          onChangePrivacy={() => openManager(DESTINATION_ID, 'newAlbums')}
+          onDone={() => setFlow(null)}
+          privacy={settings?.new_album_privacy ?? 'Public'}
+        />
       );
     }
 
     return (
       <>
-        <Section title={t('publish.connected.heading')}>
-          <Text color={TextColors.primary}>{t('publish.connected.account', { account: authStatus.account })}</Text>
-        </Section>
-
-        <Section title={t('publish.album.heading')}>
-          {albums.length === 0 ? (
-            <Text>{t('publish.album.noAlbums')}</Text>
-          ) : (
-            <>
-              <Dropdown
-                className="w-full"
-                options={albums.map((a) => ({ label: a.label, value: a.id }))}
-                placeholder={t('publish.album.placeholder')}
-                value={selectedAlbumId}
-                onChange={setSelectedAlbumId}
-              />
-              {album && (
-                <Text variant={TextVariants.small}>
-                  {album.images.length === 0
-                    ? t('publish.album.empty')
-                    : t('publish.album.mapping', { name: album.remoteName })}
-                </Text>
-              )}
-            </>
-          )}
-        </Section>
-
-        <Section title={t('publish.settings.heading')}>
-          {output ? (
-            <>
-              <Text>
-                {preset ? t('publish.settings.preset', { name: preset.name }) : t('publish.settings.current')}
-              </Text>
-              <Text color={TextColors.primary} weight={TextWeights.medium}>
-                {describeOutput(output, t)}
-              </Text>
-            </>
-          ) : (
-            <Warning>{t('publish.errors.presetMissing')}</Warning>
-          )}
-          {!isFormatAccepted && (
-            <Warning>
-              {t(preset ? 'publish.settings.unsupportedPresetFormat' : 'publish.settings.unsupportedFormat', {
-                destination: destinationName,
-                formats: support.acceptedNames,
-              })}
-            </Warning>
-          )}
-          {presetId === null && (
-            <button
-              className="flex items-center gap-1 text-sm text-accent hover:underline"
-              onClick={() => setPanel(Panel.Export)}
-            >
-              {t('publish.settings.openExport')}
-              <ArrowUpRight size={14} />
-            </button>
-          )}
-          <button
-            className="flex items-center gap-1 text-sm text-accent hover:underline"
-            onClick={() => openManager(DESTINATION_ID, 'output')}
-          >
-            {preset ? t('publish.settings.changePreset') : t('publish.settings.choosePreset')}
-            <ArrowUpRight size={14} />
-          </button>
-        </Section>
-
-        {album && album.images.length > 0 && output && isFormatAccepted && (
-          <Section title={t('publish.preview.heading')}>
-            {isPreviewing ? (
-              <Text className="flex items-center gap-2 italic">
-                <Loader size={14} className="animate-spin" /> {t('publish.preview.checking')}
-              </Text>
-            ) : previewError ? (
-              <Text color={TextColors.error}>{t('publish.preview.failed', { error: previewError })}</Text>
-            ) : (
-              preview && (
-                <>
-                  <Text color={TextColors.primary}>
-                    {t('publish.preview.counts', {
-                      unchanged: preview.skip,
-                      update: preview.update + preview.settings_changed,
-                      new: preview.new,
-                    })}
-                  </Text>
-                  {preview.unreadable > 0 && (
-                    <Text variant={TextVariants.small} color={TextColors.error}>
-                      {t('publish.preview.unreadable', { count: preview.unreadable })}
-                    </Text>
-                  )}
-                </>
-              )
-            )}
-          </Section>
+        <div className="grow overflow-y-auto p-3">
+          <DestinationSection
+            api={api}
+            canCheck={canCheck}
+            destinationName={destinationName}
+            onLinkAlbum={(albumId) => setFlow({ albumId, isRelink: false })}
+            onOpenManager={(section) => openManager(DESTINATION_ID, section)}
+            onPublish={startPublish}
+            onRemoveDeleted={(deleted) => setConfirm({ kind: 'removeDeleted', links: deleted })}
+            onRelink={(link) => setConfirm({ kind: 'relink', link })}
+            onUnlink={(link) => setConfirm({ kind: 'unlink', link })}
+            preset={preset}
+            unlinkedActiveAlbum={unlinkedActiveAlbum}
+          />
+        </div>
+        {canCheck && selectedLink && preset && (
+          <PublishSummary
+            destinationId={DESTINATION_ID}
+            destinationName={destinationName}
+            entry={previews[selectedLink.album_id]}
+            isStarting={isStarting}
+            link={selectedLink}
+            onPublish={() => startPublish(selectedLink.album_id)}
+            preset={preset}
+          />
         )}
       </>
     );
   };
+
+  const confirmText = (): { title: string; message: string; confirm: string } => {
+    if (confirm?.kind === 'removeDeleted') {
+      return {
+        title: t('publish.links.confirmRemoveDeleted.title', { count: confirm.links.length }),
+        message: t('publish.links.confirmRemoveDeleted.message', {
+          count: confirm.links.length,
+          destination: destinationName,
+        }),
+        confirm: t('publish.links.removeDeleted'),
+      };
+    }
+    const name = confirm?.link.album_name ?? '';
+    if (confirm?.kind === 'relink') {
+      return {
+        title: t('publish.links.confirmRelink.title', { name, context: DESTINATION_ID }),
+        message: confirm.link.remote_name
+          ? t('publish.links.confirmRelink.message', {
+              remote: confirm.link.remote_name,
+              destination: destinationName,
+              context: DESTINATION_ID,
+            })
+          : t('publish.links.confirmRelink.messageUnnamed', { destination: destinationName, context: DESTINATION_ID }),
+        confirm: t('publish.links.confirmRelink.confirm', { context: DESTINATION_ID }),
+      };
+    }
+    return {
+      title: t('publish.links.confirmUnlink.title', { name }),
+      message: t('publish.links.confirmUnlink.message', { destination: destinationName }),
+      confirm: t('publish.links.menu.unlink'),
+    };
+  };
+  const confirmation = confirmText();
 
   return (
     <div className="flex flex-col h-full">
@@ -300,36 +235,33 @@ export default function PublishPanel() {
         </button>
       </div>
 
-      {session.phase !== 'idle' ? (
-        <PublishProgress api={api} destinationName={destinationName} />
-      ) : (
-        <>
-          <div className="grow overflow-y-auto p-3 space-y-8">{renderBody()}</div>
-          {isConnected && (
-            <div className="p-3 border-t border-surface shrink-0">
-              <motion.div
-                whileTap={canPublish ? { scale: 0.98 } : undefined}
-                transition={{ type: 'spring', stiffness: 400, damping: 17 }}
-                className="w-full"
-              >
-                <Button
-                  className="rounded-md h-11 w-full flex items-center text-md font-bold! justify-center"
-                  disabled={!canPublish}
-                  onClick={() => target && api.publish(target, 'Republish')}
-                  size="lg"
-                >
-                  <UploadCloud size={18} className="mr-2" />
-                  {preview && toPublish === 0 && preview.unreadable === 0
-                    ? t('publish.actions.upToDate')
-                    : t('publish.actions.publish', { count: preview ? toPublish : (album?.images.length ?? 0) })}
-                </Button>
-              </motion.div>
-            </div>
-          )}
-        </>
-      )}
+      {renderBody()}
 
       <PublishManagerModal />
+
+      <ConfirmModal
+        confirmText={confirmation.confirm}
+        isOpen={confirm !== null}
+        message={confirmation.message}
+        onClose={() => setConfirm(null)}
+        onConfirm={() => {
+          if (!confirm) return;
+          if (confirm.kind === 'relink') {
+            setFlow({ albumId: confirm.link.album_id, isRelink: true });
+            return;
+          }
+          const albumIds = confirm.kind === 'unlink' ? [confirm.link.album_id] : confirm.links.map((l) => l.album_id);
+          api.unlink(albumIds).catch((error) => console.error('Publish unlink:', error));
+        }}
+        title={confirmation.title}
+      />
+
+      <SettingsChangeQuestion
+        count={question?.count ?? null}
+        onCancel={() => setQuestion(null)}
+        onKeepExisting={() => answer('KeepExisting')}
+        onRepublish={() => answer('Republish')}
+      />
     </div>
   );
 }

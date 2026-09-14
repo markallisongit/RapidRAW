@@ -122,8 +122,9 @@ impl SmugMugApi {
         parse_album(&self.get_signed(&url).await?)
     }
 
-    /// Creates an album under `parent_node`. Not idempotent on its own — see
-    /// [`ensure_album`](Self::ensure_album).
+    /// Creates an album under `parent_node`. Never reuses one of the same name:
+    /// [`find_child_album`](Self::find_child_album) is asked first, so the
+    /// user can link to it instead.
     ///
     /// Sends `Privacy` explicitly, which is what SmugMug's own Lightroom plugin
     /// does: `SmNode.create` sets `PUBLIC` when nothing else was chosen. Here
@@ -154,24 +155,6 @@ impl SmugMugApi {
         Err(PublishError::Rejected(format!(
             "could not find a free SmugMug URL name for the album \"{name}\"              after {URL_NAME_ATTEMPTS} attempts"
         )))
-    }
-
-    /// Find-or-create, which is what makes republishing an album safe to
-    /// repeat: the second call returns the first call's album.
-    ///
-    /// `privacy` reaches only a newly created album: one that already exists
-    /// keeps whatever privacy it has.
-    pub async fn ensure_album(
-        &self,
-        parent_node: &str,
-        name: &str,
-        privacy: ContainerPrivacy,
-    ) -> Result<RemoteContainerId, PublishError> {
-        let node = match self.find_child_album(parent_node, name).await? {
-            Some(existing) => existing,
-            None => self.create_album(parent_node, name, privacy).await?,
-        };
-        album_of(&node)
     }
 
     /// Everything the album already holds, across every page.
@@ -260,19 +243,6 @@ impl SmugMugApi {
 enum Created {
     Node(String),
     UrlNameTaken,
-}
-
-/// An album node with no album URI cannot be published to, and saying so here
-/// beats handing the node URI to an upload that will reject it.
-pub(super) fn album_of(node: &ChildNode) -> Result<RemoteContainerId, PublishError> {
-    node.album_uri()
-        .map(|uri| RemoteContainerId(uri.to_string()))
-        .ok_or_else(|| {
-            PublishError::Rejected(format!(
-                "the SmugMug album \"{}\" carries no album URI",
-                node.name
-            ))
-        })
 }
 
 /// SmugMug's name for each privacy level. Spelled out rather than borrowed
@@ -416,136 +386,8 @@ mod tests {
             .await;
     }
 
-    #[tokio::test]
-    async fn ensure_album_reuses_an_existing_album() {
-        let server = MockServer::start().await;
-        mount_children(
-            &server,
-            children_page(vec![child("Iceland 2026", "Album")], None),
-        )
-        .await;
-        forbid_creation(&server).await;
-
-        let api = api(&server);
-        let first = api
-            .ensure_album(ROOT, "Iceland 2026", ContainerPrivacy::Public)
-            .await
-            .unwrap();
-        let second = api
-            .ensure_album(ROOT, "Iceland 2026", ContainerPrivacy::Public)
-            .await
-            .unwrap();
-
-        assert_eq!(first, second);
-        assert_eq!(first, RemoteContainerId(album_uri("Iceland 2026")));
-    }
-
-    #[tokio::test]
-    async fn ensure_album_creates_one_when_none_matches() {
-        let server = MockServer::start().await;
-        mount_children(&server, children_page(vec![], None)).await;
-        Mock::given(method("POST"))
-            .and(path(format!("{ROOT}!children")))
-            .and(body_partial_json(
-                json!({ "Type": "Album", "Name": "Iceland 2026" }),
-            ))
-            .respond_with(
-                ResponseTemplate::new(201)
-                    .set_body_raw(created_node("Iceland 2026"), "application/json"),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let album = api(&server)
-            .ensure_album(ROOT, "Iceland 2026", ContainerPrivacy::Public)
-            .await
-            .unwrap();
-
-        assert_eq!(album, RemoteContainerId(album_uri("Iceland 2026")));
-    }
-
-    #[tokio::test]
-    async fn album_names_are_matched_exactly_not_by_prefix() {
-        let server = MockServer::start().await;
-        mount_children(
-            &server,
-            children_page(vec![child("Iceland 2026 Draft", "Album")], None),
-        )
-        .await;
-        Mock::given(method("POST"))
-            .respond_with(
-                ResponseTemplate::new(201)
-                    .set_body_raw(created_node("Iceland 2026"), "application/json"),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let album = api(&server)
-            .ensure_album(ROOT, "Iceland 2026", ContainerPrivacy::Public)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            album,
-            RemoteContainerId(album_uri("Iceland 2026")),
-            "a longer name that merely starts with the wanted one is a different album"
-        );
-    }
-
-    #[tokio::test]
-    async fn album_names_are_matched_case_sensitively() {
-        let server = MockServer::start().await;
-        mount_children(
-            &server,
-            children_page(vec![child("ICELAND 2026", "Album")], None),
-        )
-        .await;
-        Mock::given(method("POST"))
-            .respond_with(
-                ResponseTemplate::new(201)
-                    .set_body_raw(created_node("Iceland 2026"), "application/json"),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let album = api(&server)
-            .ensure_album(ROOT, "Iceland 2026", ContainerPrivacy::Public)
-            .await
-            .unwrap();
-
-        assert_eq!(album, RemoteContainerId(album_uri("Iceland 2026")));
-    }
-
-    #[tokio::test]
-    async fn a_folder_of_the_same_name_is_not_mistaken_for_an_album() {
-        let server = MockServer::start().await;
-        mount_children(
-            &server,
-            children_page(vec![child("Iceland 2026", "Folder")], None),
-        )
-        .await;
-        Mock::given(method("POST"))
-            .respond_with(
-                ResponseTemplate::new(201)
-                    .set_body_raw(created_node("Iceland 2026"), "application/json"),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let album = api(&server)
-            .ensure_album(ROOT, "Iceland 2026", ContainerPrivacy::Public)
-            .await
-            .unwrap();
-
-        assert_eq!(album, RemoteContainerId(album_uri("Iceland 2026")));
-    }
-
-    /// Idempotency lives or dies on this: an account whose albums span more
-    /// than one page would otherwise gain a duplicate on every publish.
+    /// An account whose albums span more than one page would otherwise be
+    /// offered a duplicate of an album it already has.
     #[tokio::test]
     async fn an_album_on_a_later_page_is_still_found() {
         let server = MockServer::start().await;
@@ -568,14 +410,14 @@ mod tests {
             )))
             .mount(&server)
             .await;
-        forbid_creation(&server).await;
 
         let album = api(&server)
-            .ensure_album(ROOT, "Iceland 2026", ContainerPrivacy::Public)
+            .find_child_album(ROOT, "Iceland 2026")
             .await
-            .unwrap();
+            .unwrap()
+            .expect("the album on the second page");
 
-        assert_eq!(album, RemoteContainerId(album_uri("Iceland 2026")));
+        assert_eq!(album.album_uri(), Some(album_uri("Iceland 2026").as_str()));
     }
 
     #[tokio::test]
@@ -772,7 +614,6 @@ mod tests {
     #[tokio::test]
     async fn a_taken_url_name_is_retried_with_a_distinct_one() {
         let server = MockServer::start().await;
-        mount_children(&server, children_page(vec![], None)).await;
         Mock::given(method("POST"))
             .and(body_partial_json(json!({ "UrlName": "Iceland-2026" })))
             .respond_with(ResponseTemplate::new(409).set_body_string("UrlName already taken"))
@@ -790,11 +631,11 @@ mod tests {
             .await;
 
         let album = api(&server)
-            .ensure_album(ROOT, "Iceland 2026", ContainerPrivacy::Public)
+            .create_album(ROOT, "Iceland 2026", ContainerPrivacy::Public)
             .await
             .unwrap();
 
-        assert_eq!(album, RemoteContainerId(album_uri("Iceland 2026")));
+        assert_eq!(album.album_uri(), Some(album_uri("Iceland 2026").as_str()));
     }
 
     #[tokio::test]
@@ -805,7 +646,6 @@ mod tests {
             (ContainerPrivacy::Private, "Private"),
         ] {
             let server = MockServer::start().await;
-            mount_children(&server, children_page(vec![], None)).await;
             Mock::given(method("POST"))
                 .and(path(format!("{ROOT}!children")))
                 .and(body_partial_json(
@@ -820,37 +660,9 @@ mod tests {
                 .await;
 
             api(&server)
-                .ensure_album(ROOT, "Iceland 2026", privacy)
+                .create_album(ROOT, "Iceland 2026", privacy)
                 .await
                 .unwrap_or_else(|e| panic!("{expected}: {e}"));
-        }
-    }
-
-    /// Privacy is the user's choice for albums RapidRAW creates. One that
-    /// already exists may have been set deliberately on SmugMug.
-    #[tokio::test]
-    async fn finding_an_existing_album_sends_no_privacy() {
-        let server = MockServer::start().await;
-        mount_children(
-            &server,
-            children_page(vec![child("Iceland 2026", "Album")], None),
-        )
-        .await;
-        forbid_creation(&server).await;
-
-        api(&server)
-            .ensure_album(ROOT, "Iceland 2026", ContainerPrivacy::Private)
-            .await
-            .unwrap();
-
-        for request in server.received_requests().await.unwrap() {
-            assert_eq!(request.method.as_str(), "GET", "{}", request.url);
-            assert!(
-                !request.url.as_str().contains("Privacy")
-                    && !String::from_utf8_lossy(&request.body).contains("Privacy"),
-                "{}",
-                request.url
-            );
         }
     }
 

@@ -73,10 +73,10 @@ pub fn resolve(preset_id: &str, presets: &[ExportPreset]) -> Result<PublishOutpu
     from_preset(preset)
 }
 
-/// The same `ExportSettings` and output format the frontend's
-/// `toExportSettings` and file format lookup build from a preset, so a
-/// preset and the Export panel set to that preset hash alike and nothing
-/// republishes when publishing moves from one to the other.
+/// The same `ExportSettings` and output format the Export panel's
+/// `handleExport` builds from a preset's values, so photos published with the
+/// Export panel set to a preset, before destinations had their own, hash
+/// alike with that preset and do not republish.
 ///
 /// A resize mode or watermark anchor the export pipeline would not accept is
 /// an error, as the Export panel's own export of that preset would be.
@@ -131,21 +131,17 @@ pub fn from_preset(preset: &ExportPreset) -> Result<PublishOutput, PresetError> 
     })
 }
 
-/// The output to publish with: the destination's preset when one is chosen.
-///
-/// Interim: removed by #21. Until the Publish Manager chooses a preset, the
-/// panel sends the Export panel's settings as `interim`, used only while no
-/// preset is configured.
+/// The output to publish with: the destination's preset. With none chosen
+/// there is nothing to publish with, and nothing falls back to the Export
+/// panel's settings.
 pub fn destination_output(
     preset_id: Option<&str>,
     presets: &[ExportPreset],
-    interim: Option<PublishOutput>,
 ) -> Result<PublishOutput, PresetError> {
-    match (preset_id, interim) {
-        (Some(preset_id), _) => resolve(preset_id, presets),
-        (None, Some(interim)) => Ok(interim),
-        (None, None) => Err(PresetError::PresetMissing { preset_id: None }),
-    }
+    resolve(
+        preset_id.ok_or(PresetError::PresetMissing { preset_id: None })?,
+        presets,
+    )
 }
 
 /// How many published photos switching the destination to `preset_id`
@@ -254,8 +250,8 @@ mod tests {
         preset(json)
     }
 
-    /// What `toExportSettings` in `PublishPanel.tsx` sends for a preset, as
-    /// the JSON the command receives.
+    /// What the Export panel's `handleExport` sends for a preset, as the JSON
+    /// the command receives.
     fn settings_json(output: &PublishOutput) -> Value {
         serde_json::to_value(&output.export_settings).unwrap()
     }
@@ -393,33 +389,23 @@ mod tests {
     }
 
     #[test]
-    fn a_configured_preset_wins_over_the_export_panel() {
+    fn a_destination_publishes_only_with_its_own_preset() {
         let presets = vec![with(json!({ "id": "a", "jpegQuality": 60 }))];
-        let export_panel = || PublishOutput {
-            export_settings: from_preset(&with(json!({ "jpegQuality": 99 })))
-                .unwrap()
-                .export_settings,
-            output_format: "png".into(),
-        };
 
-        let configured = destination_output(Some("a"), &presets, Some(export_panel())).unwrap();
+        let configured = destination_output(Some("a"), &presets).unwrap();
         assert_eq!(configured.export_settings.jpeg_quality, 60);
         assert_eq!(configured.output_format, "jpg");
 
-        let unconfigured = destination_output(None, &presets, Some(export_panel())).unwrap();
-        assert_eq!(unconfigured.export_settings.jpeg_quality, 99);
-        assert_eq!(unconfigured.output_format, "png");
-
         assert_eq!(
-            destination_output(None, &presets, None).unwrap_err(),
-            PresetError::PresetMissing { preset_id: None }
+            destination_output(None, &presets).unwrap_err(),
+            PresetError::PresetMissing { preset_id: None },
+            "with no preset chosen, nothing falls back to the Export panel"
         );
         assert_eq!(
-            destination_output(Some("deleted"), &presets, Some(export_panel())).unwrap_err(),
+            destination_output(Some("deleted"), &presets).unwrap_err(),
             PresetError::PresetMissing {
                 preset_id: Some("deleted".into())
-            },
-            "a deleted preset never falls back to the Export panel"
+            }
         );
     }
 

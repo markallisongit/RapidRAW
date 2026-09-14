@@ -5,8 +5,6 @@ import { open } from '@tauri-apps/plugin-shell';
 import { create } from 'zustand';
 import { useShallow } from 'zustand/react/shallow';
 
-import { ExportSettings } from '../../../ui/ExportImportProperties';
-
 // Mirrors the serde shapes in src-tauri/src/publish/{types,session,settings,links,preset,state,commands}.rs.
 
 export type AuthStatus =
@@ -122,11 +120,12 @@ export interface PublishSessionState {
   error: string | null;
 }
 
-export interface PublishTarget {
-  albumId: string;
-  /** Interim, removed by #21: the Export panel's settings, used only while the destination has no preset. */
-  exportSettings: ExportSettings;
-  outputFormat: string;
+/** One link's last preview. A preview being checked again keeps the counts it had. */
+export interface LinkPreview {
+  isChecking: boolean;
+  preview: PublishPreview | null;
+  /** A `PresetError` or a message; shown through `displayError`. */
+  error: unknown;
 }
 
 const IDLE_SESSION: PublishSessionState = {
@@ -173,6 +172,12 @@ interface DestinationEntry {
   challenge: AuthChallenge | null;
   /** As last saved, so the panel follows what the manager saves. */
   settings: DestinationSettings | null;
+  links: LinkInfo[] | null;
+  linksError: unknown;
+  /** By local album id. */
+  previews: Record<string, LinkPreview>;
+  /** The link the panel summarises, kept while its tab is not showing. */
+  selectedAlbumId: string | null;
 }
 
 const EMPTY_DESTINATION: DestinationEntry = {
@@ -181,6 +186,10 @@ const EMPTY_DESTINATION: DestinationEntry = {
   authError: null,
   challenge: null,
   settings: null,
+  links: null,
+  linksError: null,
+  previews: {},
+  selectedAlbumId: null,
 };
 
 export type ManagerSection = 'account' | 'apiKey' | 'output' | 'newAlbums';
@@ -221,6 +230,21 @@ const updateDestination = (destinationId: string, patch: Partial<DestinationEntr
     },
   }));
 
+const updatePreview = (destinationId: string, albumId: string, patch: Partial<LinkPreview>) =>
+  usePublishStore.setState((state) => {
+    const entry = state.destinations[destinationId] ?? EMPTY_DESTINATION;
+    const current = entry.previews[albumId] ?? { isChecking: false, preview: null, error: null };
+    return {
+      destinations: {
+        ...state.destinations,
+        [destinationId]: { ...entry, previews: { ...entry.previews, [albumId]: { ...current, ...patch } } },
+      },
+    };
+  });
+
+/** Counts each destination's preview runs, so a newer run stops an older one. */
+const previewRuns: Record<string, number> = {};
+
 const updateSession = (update: (current: PublishSessionState) => PublishSessionState) =>
   usePublishStore.setState((state) => ({ session: update(state.session) }));
 
@@ -255,9 +279,8 @@ const listenForSessionEvents = () => {
  * The publish commands and session events for one destination.
  */
 export function usePublishState(destinationId: string, isActive: boolean) {
-  const { destination, authStatus, authError, challenge, settings } = usePublishStore(
-    useShallow((state) => state.destinations[destinationId] ?? EMPTY_DESTINATION),
-  );
+  const { destination, authStatus, authError, challenge, settings, links, linksError, previews, selectedAlbumId } =
+    usePublishStore(useShallow((state) => state.destinations[destinationId] ?? EMPTY_DESTINATION));
   const session = usePublishStore((state) => state.session);
 
   useEffect(listenForSessionEvents, []);
@@ -356,31 +379,84 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     [destinationId],
   );
 
-  const listLinks = useCallback(() => invoke<LinkInfo[]>('publish_list_links', { destinationId }), [destinationId]);
+  const refreshLinks = useCallback(async () => {
+    try {
+      const next = await invoke<LinkInfo[]>('publish_list_links', { destinationId });
+      updateDestination(destinationId, { links: next, linksError: null });
+      return next;
+    } catch (error) {
+      updateDestination(destinationId, { linksError: error });
+      return null;
+    }
+  }, [destinationId]);
 
   /** Rejects with a `LinkError`. Linking to a different remote album drops the old one's photo records. */
   const linkAlbum = useCallback(
-    (albumId: string, target: LinkTarget) => invoke<LinkInfo>('publish_link_album', { destinationId, albumId, target }),
-    [destinationId],
+    async (albumId: string, target: LinkTarget) => {
+      const info = await invoke<LinkInfo>('publish_link_album', { destinationId, albumId, target });
+      // Selected once listed, so the panel never sees a selection it has no link for.
+      await refreshLinks();
+      updateDestination(destinationId, { selectedAlbumId: albumId });
+      return info;
+    },
+    [destinationId, refreshLinks],
   );
 
   /** Nothing on the destination is touched. */
   const unlink = useCallback(
-    (albumId: string) => invoke('publish_unlink', { destinationId, albumId }),
+    async (albumIds: string[]) => {
+      try {
+        for (const albumId of albumIds) await invoke('publish_unlink', { destinationId, albumId });
+      } finally {
+        await refreshLinks();
+      }
+    },
+    [destinationId, refreshLinks],
+  );
+
+  const selectAlbum = useCallback(
+    (albumId: string | null) => updateDestination(destinationId, { selectedAlbumId: albumId }),
     [destinationId],
   );
 
+  /** Rejects with a `PresetError`. Reads the photos and the state file; never renders or uploads. */
   const preview = useCallback(
-    (target: PublishTarget) => invoke<PublishPreview>('publish_preview', { destinationId, ...target }),
+    async (albumId: string) => {
+      updatePreview(destinationId, albumId, { isChecking: true });
+      try {
+        const counts = await invoke<PublishPreview>('publish_preview', { destinationId, albumId });
+        updatePreview(destinationId, albumId, { isChecking: false, preview: counts, error: null });
+        return counts;
+      } catch (error) {
+        updatePreview(destinationId, albumId, { isChecking: false, error });
+        throw error;
+      }
+    },
     [destinationId],
+  );
+
+  /**
+   * One album at a time, since each preview reads every photo's sidecar. A
+   * later call stops this one between albums.
+   */
+  const refreshPreviews = useCallback(
+    async (albumIds: string[]) => {
+      const run = (previewRuns[destinationId] ?? 0) + 1;
+      previewRuns[destinationId] = run;
+      for (const albumId of albumIds) {
+        if (previewRuns[destinationId] !== run) return;
+        await preview(albumId).catch(() => {});
+      }
+    },
+    [destinationId, preview],
   );
 
   /** `onSettingsChange` is required so settings-only changes never upload without the user having chosen to. */
   const publish = useCallback(
-    async (target: PublishTarget, onSettingsChange: SettingsChangePolicy) => {
+    async (albumId: string, onSettingsChange: SettingsChangePolicy) => {
       updateSession(() => ({ ...IDLE_SESSION, phase: 'starting' }));
       try {
-        await invoke('publish_album', { destinationId, ...target, onSettingsChange });
+        await invoke('publish_album', { destinationId, albumId, onSettingsChange });
         updateSession((current) => (current.phase === 'starting' ? { ...current, phase: 'running' } : current));
       } catch (error) {
         updateSession(() => ({ ...IDLE_SESSION, phase: 'error', error: errorMessage(error) }));
@@ -413,6 +489,10 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     authError,
     challenge,
     settings,
+    links,
+    linksError,
+    previews,
+    selectedAlbumId,
     session,
     refreshAuth,
     setCredentials,
@@ -423,10 +503,12 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     saveSettings,
     disconnect,
     listRemote,
-    listLinks,
+    refreshLinks,
     linkAlbum,
     unlink,
+    selectAlbum,
     preview,
+    refreshPreviews,
     publish,
     settingsImpact,
     cancel,

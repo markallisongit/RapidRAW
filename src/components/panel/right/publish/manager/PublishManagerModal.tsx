@@ -82,12 +82,14 @@ function DestinationRow({
 
 function ImpactQuestion({
   impact,
+  destinationId,
   destinationName,
   onRepublish,
   onKeepExisting,
   onCancel,
 }: {
   impact: SettingsImpact;
+  destinationId: string;
   destinationName: string;
   onRepublish: () => void;
   onKeepExisting: () => void;
@@ -109,7 +111,7 @@ function ImpactQuestion({
           {t('publish.manager.impact.message', {
             count: impact.photos,
             destination: destinationName,
-            albums: t('publish.manager.impact.albums', { count: impact.albums }),
+            albums: t('publish.manager.impact.albums', { count: impact.albums, context: destinationId }),
           })}
         </Text>
         <div className="flex flex-wrap justify-end gap-3">
@@ -366,6 +368,7 @@ function ManagerDialog({ request, show }: { request: ManagerRequest; show: boole
         {impact && (
           <ImpactQuestion
             impact={impact}
+            destinationId={selectedId}
             destinationName={destinationName}
             onCancel={() => setImpact(null)}
             onKeepExisting={() => commit(true)}

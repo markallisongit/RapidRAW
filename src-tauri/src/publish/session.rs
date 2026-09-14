@@ -367,17 +367,14 @@ impl<'a> PublishSession<'a> {
                 )));
             }
             Some(link) => RemoteContainerId(link.remote_uri.clone()),
-            // Phase 1's fallback, until the panel links every album first:
-            // find or create a remote album by name, and link it.
+            // Never found or created by name: the user chooses where an album
+            // goes, and sees the privacy of one RapidRAW creates, when linking.
             None => {
-                let container = self
-                    .destination
-                    .ensure_container(&request.album, self.ctx)
-                    .await?;
-                run.state
-                    .record_link(&request.album.album_id, &container, None);
-                run.save()?;
-                container
+                return Err(PublishError::Rejected(format!(
+                    "\"{}\" is not linked to an album on {}. Link it first",
+                    request.album.name,
+                    self.destination.display_name()
+                )));
             }
         };
 
@@ -1262,15 +1259,6 @@ mod tests {
             unimplemented!()
         }
 
-        async fn ensure_container(
-            &self,
-            local: &LocalContainer,
-            _ctx: &PublishContext,
-        ) -> Result<RemoteContainerId, PublishError> {
-            self.log.lock().unwrap().push("ensure_container".into());
-            Ok(RemoteContainerId(album_uri(&local.album_id)))
-        }
-
         async fn publish_image(
             &self,
             item: &PublishItem<'_>,
@@ -1427,6 +1415,16 @@ mod tests {
             .await
         }
 
+        /// Links `album_id` to its stub remote album, as the panel does
+        /// before anything can be published, unless it is linked already.
+        fn link(&self, album_id: &str) {
+            let mut state = self.state();
+            if state.link(album_id).is_none() {
+                state.record_link(album_id, &RemoteContainerId(album_uri(album_id)), None);
+                state.save_in(&self.ctx.state_dir).unwrap();
+            }
+        }
+
         async fn run_with(
             &self,
             destination: &StubDestination,
@@ -1434,6 +1432,7 @@ mod tests {
             request: PublishRequest,
             on_settings_change: SettingsChangePolicy,
         ) -> SessionSummary {
+            self.link(&request.album.album_id);
             let recorder = Arc::clone(&self.events);
             let events: EventSink = Arc::new(move |event| recorder.lock().unwrap().push(event));
             PublishSession::new(destination, pipeline, &self.ctx, self.spool_base(), events)
@@ -1850,14 +1849,6 @@ mod tests {
 
         assert_eq!(summary.uploaded, 2);
         assert!(
-            !destination
-                .log
-                .lock()
-                .unwrap()
-                .contains(&"ensure_container".to_string()),
-            "an explicit link is never replaced by a same-named album"
-        );
-        assert!(
             destination
                 .containers
                 .lock()
@@ -1870,18 +1861,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unlinked_album_is_still_found_or_created_by_name() {
+    async fn an_unlinked_album_is_refused_before_anything_is_touched() {
         let harness = Harness::new();
         let pipeline = StubPipeline::new(&harness.spool_base());
         let destination = StubDestination::new(&harness.spool_base());
 
-        harness.run(&destination, &pipeline, paths(1..=1)).await;
+        let recorder = Arc::clone(&harness.events);
+        let events: EventSink = Arc::new(move |event| recorder.lock().unwrap().push(event));
+        let result = PublishSession::new(
+            &destination,
+            &pipeline,
+            &harness.ctx,
+            harness.spool_base(),
+            events,
+        )
+        .run(
+            request(ALBUM, paths(1..=2)),
+            SettingsChangePolicy::Republish,
+        )
+        .await;
 
-        assert_eq!(destination.log.lock().unwrap()[0], "ensure_container");
-        assert_eq!(
-            harness.state().link(ALBUM).unwrap().remote_uri,
-            album_uri(ALBUM)
+        let error = result.expect_err("publishing requires a link");
+        assert!(matches!(error, PublishError::Rejected(_)), "{error}");
+        assert_eq!(harness.terminal_event(), "publish-error");
+        assert!(
+            destination.log.lock().unwrap().is_empty(),
+            "no album is found or created by name, and nothing uploads"
         );
+        assert!(harness.state().link(ALBUM).is_none());
     }
 
     #[tokio::test]

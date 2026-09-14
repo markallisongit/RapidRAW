@@ -117,8 +117,13 @@ export default function PublishProgress({ api, destinationName }: PublishProgres
               return (
                 <li key={`${index}-${item.file}`} className="flex items-center gap-2 min-w-0">
                   <Icon size={14} className={`shrink-0 ${className}`} />
-                  <Text variant={TextVariants.small} color={TextColors.primary} className="truncate flex-1">
-                    {item.file}
+                  <Text
+                    variant={TextVariants.small}
+                    color={TextColors.primary}
+                    className="truncate flex-1"
+                    data-tooltip={item.file}
+                  >
+                    {fileName(item.file)}
                   </Text>
                   <Text variant={TextVariants.small} className="shrink-0">
                     {t(`publish.progress.states.${item.state}`)}

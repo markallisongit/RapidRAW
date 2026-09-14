@@ -73,13 +73,6 @@ pub trait PublishDestination: Send + Sync {
         ctx: &PublishContext,
     ) -> Result<RemoteNode, PublishError>;
 
-    /// Idempotent.
-    async fn ensure_container(
-        &self,
-        local: &LocalContainer,
-        ctx: &PublishContext,
-    ) -> Result<RemoteContainerId, PublishError>;
-
     async fn publish_image(
         &self,
         item: &PublishItem<'_>,

@@ -21,8 +21,8 @@ use crate::publish::smugmug::upload::SmugMugUploader;
 use crate::publish::state::PublishState;
 use crate::publish::{
     AuthChallenge, AuthStatus, ConsumerCredentials, ContainerPrivacy, DestinationCapabilities,
-    LocalContainer, PublishContext, PublishDestination, PublishError, PublishItem,
-    RemoteContainerId, RemoteImageId, RemoteNode, RemoteNodeId, RemoteNodeKind,
+    PublishContext, PublishDestination, PublishError, PublishItem, RemoteContainerId,
+    RemoteImageId, RemoteNode, RemoteNodeId, RemoteNodeKind,
 };
 
 /// Also the name of the state file, so it must not change once shipped.
@@ -147,18 +147,6 @@ fn poisoned() -> PublishError {
     PublishError::Io("the SmugMug destination lock was poisoned".into())
 }
 
-/// Phase 1 does not mirror the group tree, so an album's groups are folded
-/// into its SmugMug name: "Travel" › "Iceland" publishes as "Travel - Iceland".
-fn flattened_name(local: &LocalContainer) -> String {
-    local
-        .parent_path
-        .iter()
-        .chain(std::iter::once(&local.name))
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join(" - ")
-}
-
 /// A folder or an album as the Publish Manager lists it. `None` for a page,
 /// which holds no photos, and for an album without an album URI, which could
 /// not be linked or uploaded into.
@@ -207,8 +195,7 @@ impl PublishDestination for SmugMugDestination {
         DestinationCapabilities {
             supports_replace: true,
             supports_reconcile: true,
-            // Albums sit in folders on SmugMug. Publishing still flattens the
-            // local groups into the album name: see `flattened_name`.
+            // Albums sit in folders on SmugMug.
             supports_nested_containers: true,
             // SmugMug's per-file ceiling varies by plan and is not published
             // as one number, so the upload reports the server's own rejection
@@ -347,22 +334,6 @@ impl PublishDestination for SmugMugDestination {
             web_url: album.web_uri,
             has_children: false,
         })
-    }
-
-    /// Albums go directly under the account's root node until the panel
-    /// offers a choice of folder. A created album takes
-    /// [`PublishContext::new_container_privacy`]; a found one keeps its own.
-    async fn ensure_container(
-        &self,
-        local: &LocalContainer,
-        ctx: &PublishContext,
-    ) -> Result<RemoteContainerId, PublishError> {
-        let connection = self.connection(ctx)?;
-        let root = connection.api.auth_user().await?.node_uri;
-        connection
-            .api
-            .ensure_album(&root, &flattened_name(local), ctx.new_container_privacy)
-            .await
     }
 
     async fn publish_image(
@@ -595,20 +566,6 @@ mod tests {
                 .capabilities()
                 .supports_nested_containers,
             "without folders, albums inside one could never be browsed to"
-        );
-    }
-
-    #[test]
-    fn groups_are_folded_into_the_album_name() {
-        let local = |parent_path: &[&str]| LocalContainer {
-            album_id: "a".into(),
-            name: "Iceland".into(),
-            parent_path: parent_path.iter().map(|s| s.to_string()).collect(),
-        };
-        assert_eq!(flattened_name(&local(&[])), "Iceland");
-        assert_eq!(
-            flattened_name(&local(&["Travel", "2026"])),
-            "Travel - 2026 - Iceland"
         );
     }
 }

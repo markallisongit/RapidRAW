@@ -95,7 +95,7 @@ pub enum ContainerPrivacy {
 pub struct LocalContainer {
     pub album_id: String,
     pub name: String,
-    /// Ancestors, outermost first. Flattened into the name in phase 1.
+    /// Ancestors, outermost first.
     pub parent_path: Vec<String>,
 }
 
@@ -143,8 +143,8 @@ pub struct PublishContext {
     pub consumer: Option<ConsumerCredentials>,
     /// Set when the user cancels; checked between retries and uploads.
     pub cancel: Arc<AtomicBool>,
-    /// The privacy of a container [`ensure_container`](crate::publish::PublishDestination::ensure_container)
-    /// has to create, from the destination's settings.
+    /// The privacy of a container [`create_container`](crate::publish::PublishDestination::create_container)
+    /// creates, from the destination's settings.
     ///
     /// A field here rather than an argument, because it changes the trait
     /// less: no destination method gains a parameter, and a later create path

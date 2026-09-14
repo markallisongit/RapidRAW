@@ -109,9 +109,16 @@ pub trait PublishDestination: Send + Sync {
     async fn begin_auth(&self, ctx: &PublishContext) -> Result<AuthChallenge, PublishError>;
     async fn complete_auth(&self, verifier: &str, ctx: &PublishContext) -> Result<(), PublishError>;
 
-    /// Idempotent.
-    async fn ensure_container(&self, local: &LocalContainer, ctx: &PublishContext)
-        -> Result<RemoteContainerId, PublishError>;
+    /// The remote album tree, a level at a time, for linking to an album that exists.
+    async fn list_containers(&self, parent: Option<&RemoteNodeId>, ctx: &PublishContext)
+        -> Result<Vec<RemoteNode>, PublishError>;
+    /// Linking to a new album: find reports a same-named one, so create never reuses it.
+    async fn find_container(&self, name: &str, ctx: &PublishContext)
+        -> Result<Option<RemoteNode>, PublishError>;
+    async fn create_container(&self, name: &str, ctx: &PublishContext)
+        -> Result<RemoteNode, PublishError>;
+    async fn container(&self, id: &RemoteContainerId, ctx: &PublishContext)
+        -> Result<RemoteNode, PublishError>;
 
     async fn publish_image(&self, item: &PublishItem<'_>, ctx: &PublishContext)
         -> Result<RemoteImageId, PublishError>;
@@ -227,8 +234,10 @@ src-tauri/src/publish/
                        upload.rs (raw-body POST, retry, reconcile) · model.rs
 
 src/components/panel/right/publish/
-  PublishPanel.tsx · PublishProgress.tsx · output.ts (preset summary, format checks)
-  usePublishState.ts · publish.i18n.ts
+  PublishPanel.tsx     tab shell: link flow, confirmations, the settings-change question
+  DestinationSection.tsx · LinkedAlbumRow.tsx (status, row actions)
+  LinkAlbumFlow.tsx · RemoteAlbumBrowser.tsx · PublishSummary.tsx · PublishProgress.tsx
+  output.ts (preset summary, format checks) · usePublishState.ts · publish.i18n.ts
   manager/             PublishManagerModal.tsx (portal, destination list, Save/Cancel)
                        SmugMugAccountSection.tsx · OutputSection.tsx · NewAlbumsSection.tsx
 ```
@@ -288,11 +297,23 @@ backend reports a session only through events and cannot be asked about one afte
 module-level zustand store with listeners registered once for the app's lifetime. This is the
 same reason `useTetheringStore` exists.
 
-States: not configured (key/secret entry + link to the developer page) → not authorised (connect,
-browser, verifier paste) → connected (account, album picker, new/update/skip/unreadable preview) →
-publishing (progress, per-image status including failed and ambiguous, cancel). Export settings are
-reused from the existing store with an explicit "publishing with your current export settings"
-line. The spool is never surfaced.
+The panel is built around **linked albums**, Lightroom's published collections. Set-up lives in
+the Publish Manager; the panel prompts for it when the destination is not connected or has no
+output preset, and publishing is disabled until both are in place. Each link shows a status from
+`publish_preview`, checked one album at a time while the tab is visible and again after a publish
+or an album change: up to date, N changed, N new, N affected by settings, not found on the
+destination, not published yet. Right-click or the row's menu publishes, opens the remote album,
+links to a different one or unlinks, each change confirmed. A link whose RapidRAW album was
+deleted can never be published again (album ids are never reused), so it is not listed: one line
+under the list counts such links and removes them, deleting nothing remotely.
+
+"Publish an album…" links first and uploads nothing: choose a RapidRAW album, then create a new
+remote album (its privacy stated before it is created, and an existing same-named album offered
+instead) or browse to one that exists. Publishing always requires a link and the destination's
+preset; nothing is found or created by name, and nothing falls back to the Export panel's
+settings. A publish whose album has settings-only changes asks first — republish them too, or
+only upload edited and new photos. Progress, per-image status including failed and ambiguous,
+and cancel follow. The spool is never surfaced.
 
 ## Integration surface
 
