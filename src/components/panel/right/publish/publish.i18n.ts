@@ -312,6 +312,28 @@ export const publishResources = {
       ambiguous: 'Unconfirmed',
     },
   },
+  albumMenu: {
+    publishTo: 'Publish to',
+    publishNow: '{{destination}} — Publish now',
+    publishNowCount_one: '{{destination}} — Publish now ({{count}} changed)',
+    publishNowCount_other: '{{destination}} — Publish now ({{count}} changed)',
+    linkAndPublish: '{{destination}} — Link and publish…',
+  },
+  deletedNotice: {
+    title: 'Left on {{destination}}',
+    one: '“{{album}}” was linked to the {{destination}} album “{{remote}}”, which has not been deleted.',
+    one_smugmug: '“{{album}}” was linked to the {{destination}} gallery “{{remote}}”, which has not been deleted.',
+    oneUnnamed: '“{{album}}” was linked to a {{destination}} album, which has not been deleted.',
+    oneUnnamed_smugmug: '“{{album}}” was linked to a {{destination}} gallery, which has not been deleted.',
+    many_other: '{{count}} deleted albums were linked to {{destination}} albums, which have not been deleted:',
+    many_smugmug_other:
+      '{{count}} deleted albums were linked to {{destination}} galleries, which have not been deleted:',
+    line: '“{{album}}” → “{{remote}}”',
+    lineUnnamed: '“{{album}}” → an album',
+    lineUnnamed_smugmug: '“{{album}}” → a gallery',
+    open: 'Open on {{destination}}',
+    openShort: 'Open',
+  },
   errors: {
     localFile: 'The photo could not be prepared on this computer.',
     presetMissing: 'Choose an output preset for this destination.',

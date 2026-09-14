@@ -59,6 +59,7 @@ import TaggingSubMenu from '../context/TaggingSubMenu';
 import { useEditorActions } from './useEditorActions';
 import { useLibraryActions } from './useLibraryActions';
 import { globalImageCache } from '../utils/ImageLRUCache';
+import { albumPublishOptions, notifyDeletedLinks } from '../components/panel/right/publish/albumContextMenu';
 
 export interface UseAppContextMenusProps {
   handleImageSelect: (path: string) => void;
@@ -1243,6 +1244,7 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
                       ...(moveOptions.length > 0 ? [{ type: OPTION_SEPARATOR }, ...moveOptions] : []),
                     ],
               },
+              ...albumPublishOptions(item),
               { type: OPTION_SEPARATOR },
               {
                 label:
@@ -1272,6 +1274,7 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
                       };
                       del(newTree);
                       invoke(Invokes.SaveAlbums, { tree: newTree })
+                        .then(() => notifyDeletedLinks(item))
                         .then(() => invoke(Invokes.GetAlbums))
                         .then((sorted: any) => setLibrary({ albumTree: sorted }))
                         .catch((err) => toast.error(t('contextMenus.toasts.failedDelete', { err })));

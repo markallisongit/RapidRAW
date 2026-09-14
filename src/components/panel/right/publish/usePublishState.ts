@@ -262,6 +262,32 @@ const previewRuns: Record<string, number> = {};
 const updateSession = (update: (current: PublishSessionState) => PublishSessionState) =>
   usePublishStore.setState((state) => ({ session: update(state.session) }));
 
+/** Needs no connection, so the panel need never have been shown. */
+export const loadLinks = async (destinationId: string): Promise<LinkInfo[] | null> => {
+  try {
+    const next = await invoke<LinkInfo[]>('publish_list_links', { destinationId });
+    updateDestination(destinationId, { links: next, linksError: null });
+    return next;
+  } catch (error) {
+    updateDestination(destinationId, { linksError: error });
+    return null;
+  }
+};
+
+/** Every destination, with each one's links, for callers outside the panel. */
+export const loadCatalogue = async (): Promise<DestinationInfo[]> => {
+  const destinations = await invoke<DestinationInfo[]>('publish_get_destinations');
+  usePublishStore.setState({ catalogue: destinations });
+  await Promise.all(destinations.map((destination) => loadLinks(destination.id)));
+  return destinations;
+};
+
+/** What is already known, without waiting on anything: the context menu is built synchronously. */
+export const publishSnapshot = () => {
+  const { catalogue, destinations } = usePublishStore.getState();
+  return { catalogue, destinations };
+};
+
 let isListening = false;
 
 /** Registered once and never removed, for the same reason the store is global. */
@@ -405,16 +431,7 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     [destinationId],
   );
 
-  const refreshLinks = useCallback(async () => {
-    try {
-      const next = await invoke<LinkInfo[]>('publish_list_links', { destinationId });
-      updateDestination(destinationId, { links: next, linksError: null });
-      return next;
-    } catch (error) {
-      updateDestination(destinationId, { linksError: error });
-      return null;
-    }
-  }, [destinationId]);
+  const refreshLinks = useCallback(() => loadLinks(destinationId), [destinationId]);
 
   /** Reads remote state only; any changes are made to RapidRAW's local records. */
   const refreshRemote = useCallback(

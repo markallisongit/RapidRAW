@@ -328,12 +328,13 @@ and cancel follow. The spool is never surfaced.
 | `src/components/panel/PanelSwitcher.tsx` | `Send` icon and tooltip key in `PANEL_ICONS` / `PANEL_TITLES`                                                | 3     | Low                            |
 | `src/store/useUIStore.ts`                | `Panel.Publish` in `ALL_PANELS`, default regions and both default layouts                                    | 10    | Low                            |
 | `src/store/useUIStore.ts`                | Android gating: `isPublishSupported` in the `allowedPanels` filter                                           | 15    | Low                            |
+| `src/hooks/useAppContextMenus.ts`        | import; `Publish to ▸` options for albums; deleted-link notice after an album delete                         | 3     | Low                            |
 | `i18next.config.ts`                      | `extract.ignore` for the publish directory                                                                   | 3     | Low                            |
 | `src/@types/i18next.d.ts`                | `PublishTranslations` in the type augmentation                                                               | 5     | Low                            |
 | **`src-tauri/src/export_processing.rs`** | **none**                                                                                                     | **0** | **None**                       |
 | `src/i18n/**`                            | **none**                                                                                                     | 0     | None                           |
 
-**~80 lines across 9 existing files** (77+/4− after #15; `scripts/check-fork-surface.sh` prints the live figure;
+**~90 lines across 10 existing files** (90+/4− after #23; `scripts/check-fork-surface.sh` prints the live figure;
 `Cargo.lock` follows `Cargo.toml` and is not counted). Everything else is new, and new files never
 conflict.
 

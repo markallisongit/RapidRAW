@@ -17,13 +17,8 @@ import PublishManagerModal from './manager/PublishManagerModal';
 import { formatSupport } from './output';
 import PublishProgress from './PublishProgress';
 import PublishSummary, { SettingsChangeQuestion } from './PublishSummary';
-import {
-  LinkInfo,
-  SettingsChangePolicy,
-  displayError,
-  usePublishManager,
-  usePublishState,
-} from './usePublishState';
+import { takePublishRequest, usePublishRequests } from './publishRequests';
+import { LinkInfo, SettingsChangePolicy, displayError, usePublishManager, usePublishState } from './usePublishState';
 
 const DESTINATION_ID = 'smugmug';
 const NO_PRESETS: ExportPreset[] = [];
@@ -67,7 +62,7 @@ export default function PublishPanel() {
     refreshReport,
     refreshError,
   } = api;
-  const { refreshLinks, refreshPreviews, selectAlbum } = api;
+  const { authError, dismissSession, refreshLinks, refreshPreviews, selectAlbum } = api;
   const destinationName = destination?.display_name ?? 'SmugMug';
   const { openManager } = usePublishManager();
 
@@ -162,6 +157,53 @@ export default function PublishPanel() {
     }
   };
 
+  const startPublishRef = useRef(startPublish);
+  startPublishRef.current = startPublish;
+
+  // A request from elsewhere, such as an album's context menu in Sources. It waits for what a panel
+  // shown for the first time is still loading, then does what the panel's own buttons would: anything
+  // that needs answering first (connecting, a preset, a broken link, changed settings) stops it there.
+  const request = usePublishRequests((state) => state.request);
+  useEffect(() => {
+    if (!request || request.destinationId !== DESTINATION_ID) return;
+    if (authError) return void takePublishRequest(request);
+    // Waits for a publish the panel is already starting, so the two never run into each other.
+    if (authStatus === null || settings === null || links === null || isStarting) return;
+    // A finished session's report stays up until dismissed; asking for something new dismisses it.
+    if (session.phase === 'complete' || session.phase === 'cancelled' || session.phase === 'error') {
+      dismissSession();
+      return;
+    }
+    if (!takePublishRequest(request)) return;
+    if (!isIdle || !isConnected) {
+      setFlow(null);
+      return;
+    }
+
+    // Whichever the menu offered, what is true now decides: the menu can have been built from older links.
+    const link = links.find((l) => l.album_id === request.albumId && l.album_name !== null);
+    if (!link) {
+      setFlow({ albumId: request.albumId, isRelink: false });
+      return;
+    }
+    setFlow(null);
+    selectAlbum(link.album_id);
+    if (request.kind === 'publish' && !link.broken && canCheck) startPublishRef.current(link.album_id);
+  }, [
+    request,
+    authError,
+    authStatus,
+    settings,
+    links,
+    isStarting,
+    session.phase,
+    isIdle,
+    isConnected,
+    canCheck,
+    dismissSession,
+    selectAlbum,
+  ]);
+
   const answer = (policy: SettingsChangePolicy) => {
     if (!question) return;
     setQuestion(null);
@@ -174,6 +216,7 @@ export default function PublishPanel() {
     if (flow && links) {
       return (
         <LinkAlbumFlow
+          key={flow.albumId ?? ''}
           albumTree={albumTree}
           api={api}
           destinationName={destinationName}
