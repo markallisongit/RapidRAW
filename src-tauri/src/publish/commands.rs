@@ -14,7 +14,10 @@ use tauri::{AppHandle, State};
 
 use crate::AppState;
 use crate::file_management::AlbumItem;
-use crate::publish::links::{LinkError, LinkInfo, LinkTarget, link_album, list_links};
+use crate::publish::links::{
+    ExistingMatch, LinkError, LinkInfo, LinkTarget, link_album, linked_images, list_links,
+    match_existing,
+};
 use crate::publish::preset::{
     PresetError, PublishOutput, destination_output, keep_existing_uploads, settings_impact,
 };
@@ -236,6 +239,92 @@ pub async fn publish_link_album(
     .await?;
     publish_state.save_in(&ctx.state_dir)?;
     Ok(info)
+}
+
+/// How many of the album's photos its linked remote album already holds, by
+/// the file name publishing would give each with the destination's preset.
+/// Reads the destination and the photos; records nothing.
+#[tauri::command]
+pub async fn publish_match_existing(
+    destination_id: String,
+    album_id: String,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<ExistingMatch, PresetError> {
+    let destination = destination(&state, &destination_id)?;
+    let request = album(&app_handle, &album_id)?;
+    let output = output(&app_handle, &destination_id)?;
+    let ctx = context(&app_handle, &destination_id, idle_cancel())?;
+    let mut publish_state =
+        PublishState::load_in(&ctx.state_dir, &destination_id, &request.albums)?;
+    check_account(destination.as_ref(), &ctx, &mut publish_state).await?;
+    let remote = linked_images(destination.as_ref(), &ctx, &publish_state, &album_id).await?;
+    let pipeline = ExportPipeline::new(
+        app_handle,
+        output.export_settings,
+        output.output_format,
+        idle_cancel(),
+    );
+
+    // A fingerprint per photo, as for a preview.
+    tauri::async_runtime::spawn_blocking(move || {
+        match_existing(
+            &pipeline,
+            &publish_state,
+            &album_id,
+            &request.paths,
+            &remote,
+        )
+        .summary()
+        .clone()
+    })
+    .await
+    .map_err(|e| e.to_string().into())
+}
+
+/// Records the photos [`publish_match_existing`] counts as published into
+/// the remote images they matched, listing the remote album again rather
+/// than trusting an earlier answer. Returns how many were recorded. Nothing
+/// on the destination changes. Refused while publishing, like linking.
+#[tauri::command]
+pub async fn publish_adopt_existing(
+    destination_id: String,
+    album_id: String,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<usize, PresetError> {
+    let destination = destination(&state, &destination_id)?;
+    let request = album(&app_handle, &album_id)?;
+    let output = output(&app_handle, &destination_id)?;
+    let _session = state.publish_registry.begin_session()?;
+    let ctx = context(&app_handle, &destination_id, idle_cancel())?;
+    let mut publish_state =
+        PublishState::load_in(&ctx.state_dir, &destination_id, &request.albums)?;
+    check_account(destination.as_ref(), &ctx, &mut publish_state).await?;
+    let remote = linked_images(destination.as_ref(), &ctx, &publish_state, &album_id).await?;
+    let pipeline = ExportPipeline::new(
+        app_handle,
+        output.export_settings,
+        output.output_format,
+        idle_cancel(),
+    );
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let adoption = match_existing(
+            &pipeline,
+            &publish_state,
+            &album_id,
+            &request.paths,
+            &remote,
+        );
+        let recorded = adoption.record(&mut publish_state)?;
+        if recorded > 0 {
+            publish_state.save_in(&ctx.state_dir)?;
+        }
+        Ok(recorded)
+    })
+    .await
+    .map_err(|e| PresetError::from(e.to_string()))?
 }
 
 /// Forgets the link and its image records. Nothing on the destination is

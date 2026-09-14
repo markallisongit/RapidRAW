@@ -503,8 +503,7 @@ impl<'a> PublishSession<'a> {
         on_settings_change: SettingsChangePolicy,
         run: &mut Run<'_>,
     ) -> Vec<Work> {
-        let total = paths.len();
-        let mut work = Vec::new();
+        let mut uploads = Vec::new();
 
         for (index, path) in paths.iter().enumerate() {
             let fingerprints = match self.pipeline.fingerprints(path) {
@@ -529,7 +528,15 @@ impl<'a> PublishSession<'a> {
                 PublishAction::Update { replaces }
                 | PublishAction::SettingsChanged { replaces } => Some(replaces),
             };
-            match self.pipeline.file_name(path, index, total) {
+            uploads.push((index, fingerprints, replaces));
+        }
+
+        let indices: Vec<usize> = uploads.iter().map(|(index, ..)| *index).collect();
+        let names = upload_file_names(self.pipeline, paths, &indices);
+        let mut work = Vec::new();
+        for ((index, fingerprints, replaces), name) in uploads.into_iter().zip(names) {
+            let path = &paths[index];
+            match name {
                 Ok(file_name) => work.push(Work {
                     path: path.clone(),
                     fingerprints,
@@ -539,12 +546,6 @@ impl<'a> PublishSession<'a> {
                 }),
                 Err(error) => run.fail(path, &error),
             }
-        }
-
-        let mut names: Vec<String> = work.iter().map(|w| w.file_name.clone()).collect();
-        make_unique(&mut names);
-        for (item, name) in work.iter_mut().zip(names) {
-            item.file_name = name;
         }
         work
     }
@@ -1023,6 +1024,31 @@ fn sequenced_output(files: &[PathBuf], index: usize, count: usize) -> Option<Pat
         .cloned()
 }
 
+/// The names the photos at `uploads`, indices into `paths`, go by at the
+/// destination when a session uploads them: `{sequence}` counts every photo in
+/// the album, uploaded or not, and a name repeated among the uploads is made
+/// unique. One entry per upload, in order.
+///
+/// Shared with adopting photos already in a remote album, which must predict
+/// exactly the names a publish would send.
+pub fn upload_file_names(
+    pipeline: &dyn RenderPipeline,
+    paths: &[String],
+    uploads: &[usize],
+) -> Vec<Result<String, PublishError>> {
+    let mut names: Vec<Result<String, PublishError>> = uploads
+        .iter()
+        .map(|&index| pipeline.file_name(&paths[index], index, paths.len()))
+        .collect();
+    let mut named: Vec<String> = names.iter().flatten().cloned().collect();
+    make_unique(&mut named);
+    let mut unique = named.into_iter();
+    for name in names.iter_mut().flatten() {
+        *name = unique.next().expect("one unique name per name");
+    }
+    names
+}
+
 /// Suffixes repeated names `_1`, `_2`, … before the extension, as the export
 /// pipeline does on disk: a filename template without `{sequence}` gives every
 /// photo the same name, and reconciliation matches on names.
@@ -1054,8 +1080,8 @@ mod tests {
 
     use super::*;
     use crate::publish::{
-        AuthChallenge, ContainerPrivacy, ContainerSnapshot, DestinationCapabilities, RemoteNode,
-        RemoteNodeId, state::PublishState,
+        AuthChallenge, ContainerPrivacy, ContainerSnapshot, DestinationCapabilities, RemoteImage,
+        RemoteNode, RemoteNodeId, state::PublishState,
     };
 
     const DESTINATION: &str = "stub";
@@ -1341,6 +1367,14 @@ mod tests {
                 web_url: None,
                 images: Vec::new(),
             }))
+        }
+
+        async fn list_container_images(
+            &self,
+            _container: &RemoteContainerId,
+            _ctx: &PublishContext,
+        ) -> Result<Vec<RemoteImage>, PublishError> {
+            unimplemented!()
         }
 
         async fn publish_image(
@@ -2309,5 +2343,63 @@ mod tests {
         ];
         make_unique(&mut names);
         assert_eq!(names, ["photo.jpg", "photo_1.jpg", "photo_2.jpg"]);
+    }
+
+    /// Names every photo by its position, as `{sequence}` does, or all alike,
+    /// as a template without one does.
+    struct TemplatePipeline {
+        sequence: bool,
+    }
+
+    #[async_trait]
+    impl RenderPipeline for TemplatePipeline {
+        fn mime(&self) -> &'static str {
+            "image/jpeg"
+        }
+
+        fn fingerprints(&self, _virtual_path: &str) -> Result<Fingerprints, PublishError> {
+            unimplemented!()
+        }
+
+        fn file_name(
+            &self,
+            _virtual_path: &str,
+            index: usize,
+            total: usize,
+        ) -> Result<String, PublishError> {
+            Ok(if self.sequence {
+                format!("Trip-{}of{total}.jpg", index + 1)
+            } else {
+                "Trip.jpg".into()
+            })
+        }
+
+        async fn render(
+            &self,
+            _virtual_paths: &[String],
+            _out_dir: &Path,
+        ) -> Result<Vec<Option<PathBuf>>, PublishError> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn upload_names_count_every_photo_and_repeats_among_the_uploads_are_made_unique() {
+        let names = |pipeline: &TemplatePipeline| -> Vec<String> {
+            upload_file_names(pipeline, &paths(1..=4), &[1, 3])
+                .into_iter()
+                .map(Result::unwrap)
+                .collect()
+        };
+
+        assert_eq!(
+            names(&TemplatePipeline { sequence: true }),
+            ["Trip-2of4.jpg", "Trip-4of4.jpg"],
+            "a skipped photo still takes its place in the sequence"
+        );
+        assert_eq!(
+            names(&TemplatePipeline { sequence: false }),
+            ["Trip.jpg", "Trip_1.jpg"]
+        );
     }
 }

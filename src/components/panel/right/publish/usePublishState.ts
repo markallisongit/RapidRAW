@@ -72,6 +72,15 @@ export type LinkError =
 /** What the commands that need the destination's output preset reject with. */
 export type PresetError = { kind: 'PresetMissing'; preset_id: string | null } | { kind: 'Failed'; message: string };
 
+/** How many of an album's photos its linked remote album already holds, by publish file name. */
+export interface ExistingMatch {
+  matched: number;
+  /** Every photo in the remote album, matched or not. */
+  remote_photos: number;
+  /** What publishing names the album's first unpublished photo. */
+  example_file_name: string | null;
+}
+
 export interface PublishPreview {
   new: number;
   /** Edited since they were published. */
@@ -495,6 +504,26 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     [destinationId],
   );
 
+  /** Rejects with a `PresetError`. Lists the linked remote album and reads the photos; records nothing. */
+  const matchExisting = useCallback(
+    (albumId: string) => invoke<ExistingMatch>('publish_match_existing', { destinationId, albumId }),
+    [destinationId],
+  );
+
+  /**
+   * Rejects with a `PresetError`. Records the photos `matchExisting` counts as
+   * published, then reloads the links and counts the album again; nothing on
+   * the destination changes.
+   */
+  const adoptExisting = useCallback(
+    async (albumId: string) => {
+      const recorded = await invoke<number>('publish_adopt_existing', { destinationId, albumId });
+      await Promise.all([refreshLinks(), preview(albumId).catch(() => {})]);
+      return recorded;
+    },
+    [destinationId, preview, refreshLinks],
+  );
+
   /**
    * One album at a time, since each preview reads every photo's sidecar. A
    * later call stops this one between albums.
@@ -569,6 +598,8 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     refreshLinks,
     refreshRemote,
     linkAlbum,
+    matchExisting,
+    adoptExisting,
     unlink,
     selectAlbum,
     preview,

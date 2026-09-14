@@ -17,7 +17,7 @@ pub use registry::PublishRegistry;
 pub use types::{
     AuthChallenge, AuthStatus, ConsumerCredentials, ContainerPrivacy, ContainerSnapshot,
     DestinationCapabilities, LocalContainer, PublishContext, PublishError, PublishItem,
-    RemoteContainerId, RemoteImageId, RemoteNode, RemoteNodeId, RemoteNodeKind,
+    RemoteContainerId, RemoteImage, RemoteImageId, RemoteNode, RemoteNodeId, RemoteNodeKind,
 };
 
 /// A place photos can be published to.
@@ -80,6 +80,14 @@ pub trait PublishDestination: Send + Sync {
         container: &RemoteContainerId,
         ctx: &PublishContext,
     ) -> Result<Option<ContainerSnapshot>, PublishError>;
+
+    /// Every image in the container, every page. Read-only. Only asked of a
+    /// destination whose `capabilities().supports_reconcile` is set.
+    async fn list_container_images(
+        &self,
+        container: &RemoteContainerId,
+        ctx: &PublishContext,
+    ) -> Result<Vec<RemoteImage>, PublishError>;
 
     /// Stable identity used when comparing a previously returned image id
     /// with a fresh container listing. Most destinations have stable ids;

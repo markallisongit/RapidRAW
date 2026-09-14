@@ -22,7 +22,7 @@ use crate::publish::state::PublishState;
 use crate::publish::{
     AuthChallenge, AuthStatus, ConsumerCredentials, ContainerPrivacy, ContainerSnapshot,
     DestinationCapabilities, PublishContext, PublishDestination, PublishError, PublishItem,
-    RemoteContainerId, RemoteImageId, RemoteNode, RemoteNodeId, RemoteNodeKind,
+    RemoteContainerId, RemoteImage, RemoteImageId, RemoteNode, RemoteNodeId, RemoteNodeKind,
 };
 
 /// Also the name of the state file, so it must not change once shipped.
@@ -358,6 +358,25 @@ impl PublishDestination for SmugMugDestination {
         ctx: &PublishContext,
     ) -> Result<Option<ContainerSnapshot>, PublishError> {
         self.connection(ctx)?.api.inspect_container(container).await
+    }
+
+    async fn list_container_images(
+        &self,
+        container: &RemoteContainerId,
+        ctx: &PublishContext,
+    ) -> Result<Vec<RemoteImage>, PublishError> {
+        let images = self
+            .connection(ctx)?
+            .api
+            .list_album_images(container)
+            .await?;
+        Ok(images
+            .into_iter()
+            .map(|image| RemoteImage {
+                id: image.image_uri,
+                file_name: image.file_name,
+            })
+            .collect())
     }
 
     fn image_identity(&self, image: &RemoteImageId) -> String {

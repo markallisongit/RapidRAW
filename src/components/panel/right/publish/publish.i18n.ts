@@ -240,6 +240,29 @@ export const publishResources = {
     alreadyLinkedDeleted: 'That album is already linked to a RapidRAW album that has been deleted. Unlink it first.',
     alreadyLinkedDeleted_smugmug:
       'That gallery is already linked to a RapidRAW album that has been deleted. Unlink it first.',
+    checking: 'Checking the album for photos…',
+    checking_smugmug: 'Checking the gallery for photos…',
+    existing: {
+      title_one: '{{count}} photo is already in “{{name}}”',
+      title_other: '{{count}} photos are already in “{{name}}”',
+      message_one:
+        'It matches a photo in this RapidRAW album by file name. If it was edited since it was uploaded, it updates the next time it is edited.',
+      message_other:
+        'They match photos in this RapidRAW album by file name. Photos edited since they were uploaded update the next time they are edited.',
+      adopt_one: 'Treat it as published',
+      adopt_other: 'Treat them as published',
+      uploadAgain_one: 'Upload it again',
+      uploadAgain_other: 'Upload them again',
+      adopting: 'Recording…',
+      noMatch_one: 'The photo in “{{name}}” does not match by file name.',
+      noMatch_other: 'None of the {{count}} photos in “{{name}}” match by file name.',
+      naming: 'Publishing names them like <code>{{example}}</code>, from the “{{preset}}” preset.',
+      noPreset: 'Choose an output preset to check for photos already in this album.',
+      noPreset_smugmug: 'Choose an output preset to check for photos already in this gallery.',
+      choosePreset: 'Choose a preset',
+      failed: 'Linked, but checking “{{name}}” for photos failed: {{error}}',
+      done: 'Done',
+    },
   },
   browser: {
     loading: 'Loading albums…',

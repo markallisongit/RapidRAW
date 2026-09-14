@@ -141,8 +141,8 @@ mod tests {
     use crate::publish::registry::PublishRegistry;
     use crate::publish::types::{
         AuthChallenge, AuthStatus, ContainerPrivacy, ContainerSnapshot, DestinationCapabilities,
-        PublishContext, PublishError, PublishItem, RemoteContainerId, RemoteImageId, RemoteNode,
-        RemoteNodeId,
+        PublishContext, PublishError, PublishItem, RemoteContainerId, RemoteImage, RemoteImageId,
+        RemoteNode, RemoteNodeId,
     };
 
     struct StubDestination;
@@ -225,6 +225,14 @@ mod tests {
             _container: &RemoteContainerId,
             _ctx: &PublishContext,
         ) -> Result<Option<ContainerSnapshot>, PublishError> {
+            unimplemented!()
+        }
+
+        async fn list_container_images(
+            &self,
+            _container: &RemoteContainerId,
+            _ctx: &PublishContext,
+        ) -> Result<Vec<RemoteImage>, PublishError> {
             unimplemented!()
         }
 

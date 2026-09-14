@@ -225,7 +225,9 @@ export default function PublishPanel() {
           links={links}
           onCancel={() => setFlow(null)}
           onChangePrivacy={() => openManager(DESTINATION_ID, 'newAlbums')}
+          onChooseOutput={() => openManager(DESTINATION_ID, 'output')}
           onDone={() => setFlow(null)}
+          presetName={preset?.name ?? null}
           privacy={settings?.new_album_privacy ?? 'Public'}
         />
       );

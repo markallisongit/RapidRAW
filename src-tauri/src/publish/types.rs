@@ -24,6 +24,15 @@ pub struct RemoteContainerId(pub String);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoteImageId(pub String);
 
+/// One image a container holds, as listed for matching local photos to it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteImage {
+    pub id: RemoteImageId,
+    /// As the destination stores it, which for an upload is the name it was
+    /// sent with.
+    pub file_name: String,
+}
+
 /// What a linked container currently looks like at the destination.
 ///
 /// Images that exist remotely but are not recorded locally are intentionally

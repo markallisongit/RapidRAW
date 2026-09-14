@@ -2269,6 +2269,8 @@ pub fn run() {
             publish::commands::publish_list_links,
             publish::commands::publish_refresh,
             publish::commands::publish_link_album,
+            publish::commands::publish_match_existing,
+            publish::commands::publish_adopt_existing,
             publish::commands::publish_unlink,
             // --- end publish ---
         ])
