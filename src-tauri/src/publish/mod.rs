@@ -15,9 +15,10 @@ use async_trait::async_trait;
 
 pub use registry::PublishRegistry;
 pub use types::{
-    AuthChallenge, AuthStatus, ConsumerCredentials, ContainerPrivacy, ContainerSnapshot,
-    DestinationCapabilities, LocalContainer, PublishContext, PublishError, PublishItem,
-    RemoteContainerId, RemoteImage, RemoteImageId, RemoteNode, RemoteNodeId, RemoteNodeKind,
+    AuthChallenge, AuthStatus, CaptureTime, ConsumerCredentials, ContainerPrivacy,
+    ContainerSnapshot, DestinationCapabilities, LocalContainer, PublishContext, PublishError,
+    PublishItem, RemoteContainerId, RemoteImage, RemoteImageId, RemoteNode, RemoteNodeId,
+    RemoteNodeKind,
 };
 
 /// A place photos can be published to.
@@ -88,6 +89,17 @@ pub trait PublishDestination: Send + Sync {
         container: &RemoteContainerId,
         ctx: &PublishContext,
     ) -> Result<Vec<RemoteImage>, PublishError>;
+
+    /// The bytes of `image`'s [`thumbnail_url`](RemoteImage::thumbnail_url),
+    /// fetched however the destination requires. `Ok(None)` when there is no
+    /// thumbnail to fetch. Read-only.
+    async fn fetch_thumbnail(
+        &self,
+        _image: &RemoteImage,
+        _ctx: &PublishContext,
+    ) -> Result<Option<Vec<u8>>, PublishError> {
+        Ok(None)
+    }
 
     /// Stable identity used when comparing a previously returned image id
     /// with a fresh container listing. Most destinations have stable ids;

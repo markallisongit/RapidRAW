@@ -72,13 +72,38 @@ export type LinkError =
 /** What the commands that need the destination's output preset reject with. */
 export type PresetError = { kind: 'PresetMissing'; preset_id: string | null } | { kind: 'Failed'; message: string };
 
-/** How many of an album's photos its linked remote album already holds, by publish file name. */
+/** Why a photo was paired with a remote image. */
+export type MatchReason = 'PublishName' | 'OriginalFileName' | 'CaptureTime' | 'LooksTheSame';
+
+/** `Exact` is safe to adopt unseen; `Likely` starts ticked in the review, `Possible` unticked. */
+export type MatchConfidence = 'Possible' | 'Likely' | 'Exact';
+
+/** A photo paired with an image its linked remote album already holds. */
+export interface ExistingPair {
+  /** Virtual path. */
+  path: string;
+  remote_id: string;
+  remote_file_name: string;
+  remote_thumbnail_url: string | null;
+  reasons: MatchReason[];
+  confidence: MatchConfidence;
+}
+
+/** What an album's linked remote album already holds of its photos. */
 export interface ExistingMatch {
-  matched: number;
-  /** Every photo in the remote album, matched or not. */
+  pairs: ExistingPair[];
+  /** Every photo in the remote album, paired or not. */
   remote_photos: number;
-  /** What publishing names the album's first unpublished photo. */
+  /** What publishing names the album's first unpublished photo; null when every photo is recorded. */
   example_file_name: string | null;
+  /** A remote photo nothing was paired with. */
+  example_remote_name: string | null;
+}
+
+/** How far matching has got comparing thumbnails. */
+export interface MatchProgress {
+  checked: number;
+  total: number;
 }
 
 export interface PublishPreview {
@@ -504,24 +529,46 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     [destinationId],
   );
 
-  /** Rejects with a `PresetError`. Lists the linked remote album and reads the photos; records nothing. */
+  /**
+   * Rejects with a `PresetError`. Lists the linked remote album, reads the photos and compares thumbnails where
+   * names and capture times leave pairs unsettled; records nothing. `cancelMatch` stops it, and it then rejects.
+   */
   const matchExisting = useCallback(
-    (albumId: string) => invoke<ExistingMatch>('publish_match_existing', { destinationId, albumId }),
+    async (albumId: string, onProgress: (progress: MatchProgress) => void) => {
+      const unlisten = await listen<MatchProgress>('publish-match-progress', (event) => onProgress(event.payload));
+      try {
+        return await invoke<ExistingMatch>('publish_match_existing', { destinationId, albumId });
+      } finally {
+        unlisten();
+      }
+    },
     [destinationId],
   );
 
+  const cancelMatch = useCallback(() => invoke<boolean>('publish_cancel'), []);
+
   /**
-   * Rejects with a `PresetError`. Records the photos `matchExisting` counts as
-   * published, then reloads the links and counts the album again; nothing on
-   * the destination changes.
+   * Rejects with a `PresetError`. Records the chosen pairs that still hold as published, and returns how many; the
+   * rest changed since they were matched. Then reloads the links and counts the album again. Nothing on the
+   * destination changes.
    */
   const adoptExisting = useCallback(
-    async (albumId: string) => {
-      const recorded = await invoke<number>('publish_adopt_existing', { destinationId, albumId });
+    async (albumId: string, pairs: ExistingPair[]) => {
+      const chosen = pairs.map(({ path, remote_id }) => ({ path, remote_id }));
+      const recorded = await invoke<number>('publish_adopt_existing', { destinationId, albumId, pairs: chosen });
       await Promise.all([refreshLinks(), preview(albumId).catch(() => {})]);
       return recorded;
     },
     [destinationId, preview, refreshLinks],
+  );
+
+  /** A `data:` URL of the photo as edited. */
+  const localThumbnail = useCallback((path: string) => invoke<string>('publish_local_thumbnail', { path }), []);
+
+  /** A `data:` URL, or null when the destination has no thumbnail to give. */
+  const remoteThumbnail = useCallback(
+    (thumbnailUrl: string) => invoke<string | null>('publish_remote_thumbnail', { destinationId, thumbnailUrl }),
+    [destinationId],
   );
 
   /**
@@ -599,7 +646,10 @@ export function usePublishState(destinationId: string, isActive: boolean) {
     refreshRemote,
     linkAlbum,
     matchExisting,
+    cancelMatch,
     adoptExisting,
+    localThumbnail,
+    remoteThumbnail,
     unlink,
     selectAlbum,
     preview,

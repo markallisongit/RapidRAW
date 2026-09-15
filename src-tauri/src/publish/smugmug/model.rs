@@ -8,9 +8,11 @@
 //! Every response arrives wrapped in the same `{"Response": …, "Code": …}`
 //! envelope, and every list endpoint pages, so those two shapes are shared.
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
 
-use crate::publish::{PublishError, RemoteImageId};
+use crate::publish::{CaptureTime, PublishError, RemoteImageId};
 
 /// An OAuth 1.0a credentials pair: a temporary one before authorisation, a
 /// token one after. The secret half never leaves the process except to go
@@ -247,12 +249,73 @@ pub struct RemoteImageSummary {
     pub file_name: String,
     pub size_bytes: u64,
     pub image_uri: RemoteImageId,
+    /// From the `ImageMetadata` expansion, when the listing asked for it.
+    pub captured_at: Option<CaptureTime>,
+    pub camera_model: Option<String>,
+    /// SmugMug's `Th` size, a square crop.
+    pub thumbnail_url: Option<String>,
 }
 
 /// One page of `GET <album>!images`.
 pub struct AlbumImagesPage {
     pub images: Vec<RemoteImageSummary>,
     pub next_page: Option<String>,
+}
+
+/// Expansions arrive beside `Response`, keyed on the URI each image's `Uris`
+/// entry names.
+#[derive(Debug, Deserialize)]
+struct AlbumImagesEnvelope {
+    #[serde(rename = "Response")]
+    response: AlbumImagesResponse,
+    #[serde(rename = "Expansions", default)]
+    expansions: HashMap<String, Expansion>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Expansion {
+    #[serde(rename = "ImageMetadata")]
+    image_metadata: Option<RawImageMetadata>,
+}
+
+/// SmugMug's reading of the photo's embedded metadata.
+///
+/// `DateTimeCreated` is the camera's clock with no zone, as EXIF records it.
+/// The image's own `DateTimeOriginal` is not: SmugMug reads that clock as US
+/// Pacific time and converts it to UTC, so it never equals a local reading.
+#[derive(Debug, Deserialize)]
+struct RawImageMetadata {
+    #[serde(rename = "DateTimeCreated", default)]
+    date_time_created: String,
+    /// With the fraction of a second and an offset, when the camera wrote a
+    /// fraction: `2026-09-11T17:31:52.458+01:00`. Otherwise empty.
+    #[serde(rename = "MicroDateTimeCreated", default)]
+    micro_date_time_created: String,
+    #[serde(rename = "Model", default)]
+    model: String,
+}
+
+impl RawImageMetadata {
+    fn captured_at(&self) -> Option<CaptureTime> {
+        let micro = parse_local_time(&self.micro_date_time_created);
+        let at = parse_local_time(&self.date_time_created)
+            .or(micro)
+            .map(|(at, _)| at)?;
+        Some(CaptureTime::new(at, micro.and_then(|(_, millis)| millis)))
+    }
+}
+
+/// The wall-clock part of an ISO 8601 time, ignoring any offset, and the
+/// milliseconds when it has a fraction.
+fn parse_local_time(value: &str) -> Option<(chrono::NaiveDateTime, Option<u16>)> {
+    let value = value.trim();
+    let seconds = value.get(..19)?;
+    let at = chrono::NaiveDateTime::parse_from_str(seconds, "%Y-%m-%dT%H:%M:%S").ok()?;
+    let millis = value[19..].strip_prefix('.').and_then(|rest| {
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        CaptureTime::millis_from_fraction(&digits)
+    });
+    Some((at, millis))
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,6 +335,8 @@ struct RawAlbumImage {
     /// derivative and would not match.
     #[serde(rename = "ArchivedSize", default)]
     archived_size: u64,
+    #[serde(rename = "ThumbnailUrl", default)]
+    thumbnail_url: Option<String>,
     #[serde(rename = "Uris")]
     uris: AlbumImageUris,
 }
@@ -282,22 +347,59 @@ struct RawAlbumImage {
 struct AlbumImageUris {
     #[serde(rename = "Image")]
     image: UriRef,
+    #[serde(rename = "ImageMetadata", default)]
+    image_metadata: Option<UriRef>,
 }
 
+/// One page of an album's images, with each image's metadata where the
+/// request expanded it.
 pub fn parse_album_images(body: &str) -> Result<AlbumImagesPage, PublishError> {
-    let response = parse_envelope::<AlbumImagesResponse>("album images", body)?;
+    let AlbumImagesEnvelope {
+        response,
+        expansions,
+    } = serde_json::from_str(body)
+        .map_err(|e| PublishError::Rejected(format!("unexpected album images response: {e}")))?;
     Ok(AlbumImagesPage {
         images: response
             .album_image
             .into_iter()
-            .map(|image| RemoteImageSummary {
-                file_name: image.file_name,
-                size_bytes: image.archived_size,
-                image_uri: RemoteImageId(image.uris.image.uri),
+            .map(|image| {
+                let metadata = image
+                    .uris
+                    .image_metadata
+                    .as_ref()
+                    .and_then(|uri| expansions.get(&uri.uri))
+                    .and_then(|expansion| expansion.image_metadata.as_ref());
+                RemoteImageSummary {
+                    file_name: image.file_name,
+                    size_bytes: image.archived_size,
+                    image_uri: RemoteImageId(image.uris.image.uri),
+                    captured_at: metadata.and_then(RawImageMetadata::captured_at),
+                    camera_model: metadata
+                        .map(|metadata| metadata.model.trim().to_string())
+                        .filter(|model| !model.is_empty()),
+                    thumbnail_url: image.thumbnail_url.filter(|url| !url.is_empty()),
+                }
             })
             .collect(),
         next_page: response.pages.next_page,
     })
+}
+
+/// The uncropped `S` size (within 300 px) of the square `Th` thumbnail an
+/// album listing names, on SmugMug's photo host only. `None` for any other
+/// URL, which is never fetched.
+pub fn whole_picture_thumbnail(thumbnail_url: &str) -> Option<String> {
+    let rest = thumbnail_url.strip_prefix("https://")?;
+    let (host, path) = rest.split_once('/')?;
+    if host != "smugmug.com" && !host.ends_with(".smugmug.com") {
+        return None;
+    }
+    let (dir, file) = path.rsplit_once('/')?;
+    let dir = dir.strip_suffix("/Th")?;
+    let (stem, extension) = file.rsplit_once('.')?;
+    let stem = stem.strip_suffix("-Th")?;
+    Some(format!("https://{host}/{dir}/S/{stem}-S.{extension}"))
 }
 
 /// What the upload host answered, once HTTP itself has succeeded.
@@ -550,8 +652,107 @@ mod tests {
                 file_name: "DSC_0001.jpg".into(),
                 size_bytes: 4_194_304,
                 image_uri: RemoteImageId("/api/v2/image/XyZ123-0".into()),
+                captured_at: None,
+                camera_model: None,
+                thumbnail_url: None,
             }]
         );
+    }
+
+    #[test]
+    fn reads_capture_time_and_camera_from_the_metadata_expansion() {
+        let body = r#"{
+            "Response": {
+                "AlbumImage": [
+                    {
+                        "FileName": "A67023312026-09-11.jpg",
+                        "ArchivedSize": 4152509,
+                        "DateTimeOriginal": "2026-09-12T01:18:07+00:00",
+                        "ThumbnailUrl": "https://photos.smugmug.com/Paramotoring/i-RQHrBvT/0/MtW3/Th/A67023312026-09-11-Th.jpg",
+                        "Uris": {
+                            "ImageMetadata": { "Uri": "/api/v2/image/RQHrBvT-0!metadata?_filter=Model" },
+                            "Image": { "Uri": "/api/v2/image/RQHrBvT-0" }
+                        }
+                    },
+                    {
+                        "FileName": "PXL_20260911_163152458.jpg",
+                        "Uris": {
+                            "ImageMetadata": { "Uri": "/api/v2/image/Pxl-0!metadata" },
+                            "Image": { "Uri": "/api/v2/image/Pxl-0" }
+                        }
+                    },
+                    {
+                        "FileName": "scan.jpg",
+                        "ThumbnailUrl": "",
+                        "Uris": { "Image": { "Uri": "/api/v2/image/Scan-0" } }
+                    }
+                ]
+            },
+            "Expansions": {
+                "/api/v2/image/RQHrBvT-0!metadata?_filter=Model": {
+                    "Locator": "ImageMetadata",
+                    "ImageMetadata": {
+                        "Model": "ILCE-6700",
+                        "DateTimeCreated": "2026-09-11T18:18:07",
+                        "MicroDateTimeCreated": ""
+                    }
+                },
+                "/api/v2/image/Pxl-0!metadata": {
+                    "ImageMetadata": {
+                        "Model": "Pixel 8a",
+                        "DateTimeCreated": "2026-09-11T17:31:52",
+                        "MicroDateTimeCreated": "2026-09-11T17:31:52.458+01:00"
+                    }
+                }
+            },
+            "Code": 200
+        }"#;
+        let images = parse_album_images(body).unwrap().images;
+        let time = |h, m, s| {
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 11)
+                .unwrap()
+                .and_hms_opt(h, m, s)
+                .unwrap()
+        };
+
+        assert_eq!(
+            images[0].captured_at,
+            Some(CaptureTime::new(time(18, 18, 7), None)),
+            "the camera's clock, not DateTimeOriginal"
+        );
+        assert_eq!(images[0].camera_model.as_deref(), Some("ILCE-6700"));
+        assert_eq!(
+            images[0].thumbnail_url.as_deref(),
+            Some(
+                "https://photos.smugmug.com/Paramotoring/i-RQHrBvT/0/MtW3/Th/A67023312026-09-11-Th.jpg"
+            )
+        );
+        assert_eq!(
+            images[1].captured_at,
+            Some(CaptureTime::new(time(17, 31, 52), Some(458)))
+        );
+        assert_eq!(images[2].captured_at, None);
+        assert_eq!(images[2].camera_model, None);
+        assert_eq!(images[2].thumbnail_url, None);
+    }
+
+    #[test]
+    fn the_whole_picture_thumbnail_is_the_s_size_on_smugmugs_host_only() {
+        assert_eq!(
+            whole_picture_thumbnail(
+                "https://photos.smugmug.com/Other/2026/i-RQHrBvT/0/MtW3WZ/Th/A67023312026-09-11-Th.jpg"
+            )
+            .as_deref(),
+            Some("https://photos.smugmug.com/Other/2026/i-RQHrBvT/0/MtW3WZ/S/A67023312026-09-11-S.jpg")
+        );
+        for refused in [
+            "http://photos.smugmug.com/i-R/0/K/Th/a-Th.jpg",
+            "https://photos.smugmug.com.example.org/i-R/0/K/Th/a-Th.jpg",
+            "https://example.org/i-R/0/K/Th/a-Th.jpg",
+            "https://photos.smugmug.com/i-R/0/K/M/a-M.jpg",
+        ] {
+            assert_eq!(whole_picture_thumbnail(refused), None, "{refused}");
+        }
     }
 
     #[test]

@@ -13,12 +13,29 @@ use crate::publish::oauth1::{self, Credentials};
 use crate::publish::smugmug::auth::{body_or_error, client, transport};
 use crate::publish::smugmug::model::{
     Album, AuthUser, ChildNode, RemoteImageSummary, parse_album, parse_album_images,
-    parse_auth_user, parse_created_node, parse_node_children,
+    parse_auth_user, parse_created_node, parse_node_children, whole_picture_thumbnail,
 };
 use crate::publish::{ContainerPrivacy, ContainerSnapshot, PublishError, RemoteContainerId};
 
 /// Overridden only in tests, where a local mock server stands in.
 pub const API_BASE: &str = "https://api.smugmug.com";
+
+/// The fields [`SmugMugApi::list_album_images_detailed`] reads.
+const IMAGE_DETAIL_FILTER: &str =
+    "_filter=FileName,ArchivedSize,ThumbnailUrl&_filteruri=Image,ImageMetadata";
+
+/// Inlines each image's metadata, trimmed to what matching compares.
+fn image_metadata_expansion() -> String {
+    let config = json!({
+        "expand": {
+            "ImageMetadata": { "filter": ["Model", "DateTimeCreated", "MicroDateTimeCreated"] }
+        }
+    });
+    format!(
+        "_expand=ImageMetadata&_config={}",
+        oauth1::percent_encode(&config.to_string())
+    )
+}
 
 /// SmugMug clamps this to whatever it allows; a larger page is an
 /// optimisation, and following `NextPage` is what makes paging correct.
@@ -206,6 +223,52 @@ impl SmugMugApi {
         }
 
         Ok(images)
+    }
+
+    /// [`list_album_images`](Self::list_album_images) with what matching
+    /// photos already in the album needs: each image's capture time and
+    /// camera model, inlined by the `ImageMetadata` expansion rather than a
+    /// request per image, and its thumbnail URL. Trimmed to those fields, a
+    /// page is a quarter the size of a plain listing.
+    pub async fn list_album_images_detailed(
+        &self,
+        album: &RemoteContainerId,
+    ) -> Result<Vec<RemoteImageSummary>, PublishError> {
+        let mut images = Vec::new();
+        let mut next = Some(format!(
+            "{}{}!images?count={PAGE_SIZE}&{IMAGE_DETAIL_FILTER}",
+            self.base_url, album.0
+        ));
+
+        while let Some(url) = next {
+            // `NextPage` keeps `_filter` and `_filteruri` but drops `_expand`
+            // and `_config`, so every page asks for the expansion again.
+            let url = format!("{url}&{}", image_metadata_expansion());
+            let page = parse_album_images(&self.get_signed(&url).await?)?;
+            images.extend(page.images);
+            next = page
+                .next_page
+                .map(|path| format!("{}{path}", self.base_url));
+        }
+
+        Ok(images)
+    }
+
+    /// A thumbnail's bytes. SmugMug serves them from its photo host by URL,
+    /// unsigned: the URL itself carries the image's key. Only
+    /// [`whole_picture_thumbnail`] URLs are fetched.
+    pub async fn thumbnail(&self, thumbnail_url: &str) -> Result<Option<Vec<u8>>, PublishError> {
+        let Some(url) = whole_picture_thumbnail(thumbnail_url) else {
+            return Ok(None);
+        };
+        let response = self.client.get(&url).send().await.map_err(transport)?;
+        if !response.status().is_success() {
+            return Err(PublishError::Network(format!(
+                "HTTP {} fetching a thumbnail",
+                response.status()
+            )));
+        }
+        Ok(Some(response.bytes().await.map_err(transport)?.to_vec()))
     }
 
     fn children_url(&self, parent_node: &str) -> String {
@@ -800,6 +863,64 @@ mod tests {
             images[0].image_uri,
             RemoteImageId("/api/v2/image/DSC0001jpg-0".into())
         );
+    }
+
+    #[tokio::test]
+    async fn the_detailed_listing_asks_for_metadata_on_every_page() {
+        let server = MockServer::start().await;
+        let album = RemoteContainerId("/api/v2/album/AbCdEf".into());
+        let images_path = "/api/v2/album/AbCdEf!images";
+        // As SmugMug writes it: the filters kept, the expansion dropped.
+        let next = format!(
+            "{images_path}?count=100&_filter=FileName,ArchivedSize,ThumbnailUrl&_filteruri=Image,ImageMetadata&start=2"
+        );
+        let with_metadata = |name: &str, model: &str, next_page: Option<&str>| {
+            let metadata_uri = format!("/api/v2/image/{}-0!metadata", key(name));
+            json!({
+                "Response": {
+                    "AlbumImage": [{
+                        "FileName": name,
+                        "Uris": {
+                            "Image": { "Uri": format!("/api/v2/image/{}-0", key(name)) },
+                            "ImageMetadata": { "Uri": metadata_uri.clone() },
+                        }
+                    }],
+                    "Pages": match next_page {
+                        Some(next) => json!({ "NextPage": next }),
+                        None => json!({}),
+                    },
+                },
+                "Expansions": {
+                    metadata_uri: { "ImageMetadata": { "Model": model, "DateTimeCreated": "2026-09-11T18:18:07" } }
+                },
+                "Code": 200
+            })
+            .to_string()
+        };
+        Mock::given(method("GET"))
+            .and(path(images_path))
+            .and(query_param_is_missing("start"))
+            .and(query_param("_expand", "ImageMetadata"))
+            .and(query_param("_filteruri", "Image,ImageMetadata"))
+            .respond_with(ok(with_metadata("A.jpg", "ILCE-6700", Some(&next))))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(images_path))
+            .and(query_param("start", "2"))
+            .and(query_param("_expand", "ImageMetadata"))
+            .respond_with(ok(with_metadata("B.jpg", "Pixel 8a", None)))
+            .mount(&server)
+            .await;
+
+        let images = api(&server)
+            .list_album_images_detailed(&album)
+            .await
+            .unwrap();
+
+        let models: Vec<Option<&str>> = images.iter().map(|i| i.camera_model.as_deref()).collect();
+        assert_eq!(models, [Some("ILCE-6700"), Some("Pixel 8a")]);
+        assert!(images.iter().all(|image| image.captured_at.is_some()));
     }
 
     fn images_page(file_names: &[&str], next_page: Option<&str>) -> String {

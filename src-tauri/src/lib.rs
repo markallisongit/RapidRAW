@@ -2271,6 +2271,8 @@ pub fn run() {
             publish::commands::publish_link_album,
             publish::commands::publish_match_existing,
             publish::commands::publish_adopt_existing,
+            publish::commands::publish_local_thumbnail,
+            publish::commands::publish_remote_thumbnail,
             publish::commands::publish_unlink,
             // --- end publish ---
         ])

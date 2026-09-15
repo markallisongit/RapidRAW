@@ -177,6 +177,8 @@ export const publishResources = {
       relink_smugmug: 'Link to a different gallery…',
       recreate: 'Create it again',
       recreate_smugmug: 'Create it again',
+      checkExisting: 'Check for photos already in this album…',
+      checkExisting_smugmug: 'Check for photos already in this gallery…',
       unlink: 'Unlink',
     },
     confirmUnlink: {
@@ -240,9 +242,15 @@ export const publishResources = {
     alreadyLinkedDeleted: 'That album is already linked to a RapidRAW album that has been deleted. Unlink it first.',
     alreadyLinkedDeleted_smugmug:
       'That gallery is already linked to a RapidRAW album that has been deleted. Unlink it first.',
+  },
+  existing: {
+    title: 'Photos already in “{{name}}”',
     checking: 'Checking the album for photos…',
     checking_smugmug: 'Checking the gallery for photos…',
-    existing: {
+    comparing_one: 'Comparing {{count}} photo…',
+    comparing_other: 'Comparing {{count}} photos…',
+    cancel: 'Cancel',
+    exact: {
       title_one: '{{count}} photo is already in “{{name}}”',
       title_other: '{{count}} photos are already in “{{name}}”',
       message_one:
@@ -253,16 +261,51 @@ export const publishResources = {
       adopt_other: 'Treat them as published',
       uploadAgain_one: 'Upload it again',
       uploadAgain_other: 'Upload them again',
-      adopting: 'Recording…',
-      noMatch_one: 'The photo in “{{name}}” does not match by file name.',
-      noMatch_other: 'None of the {{count}} photos in “{{name}}” match by file name.',
-      naming: 'Publishing names them like <code>{{example}}</code>, from the “{{preset}}” preset.',
-      noPreset: 'Choose an output preset to check for photos already in this album.',
-      noPreset_smugmug: 'Choose an output preset to check for photos already in this gallery.',
-      choosePreset: 'Choose a preset',
-      failed: 'Linked, but checking “{{name}}” for photos failed: {{error}}',
-      done: 'Done',
     },
+    review: {
+      title_one: '{{count}} photo looks like it is already in “{{name}}”',
+      title_other: '{{count}} photos look like they are already in “{{name}}”',
+      message:
+        'Their file names differ from what publishing would call them. Check the pairs; a photo you tick is updated in place the next time you edit it.',
+      open_one: 'Check the pair',
+      open_other: 'Check the pairs',
+      adopt_one: 'Treat {{count}} as published',
+      adopt_other: 'Treat {{count}} as published',
+      adoptNone: 'Tick the pairs to treat as published',
+      uploadAgain: 'Upload them all again',
+      close: 'Close',
+      inRapidRaw: 'In RapidRAW',
+      onDestination: 'On {{destination}}',
+      tick: 'Treat {{name}} as published',
+      noThumbnail: 'No preview',
+      reason: {
+        PublishName: 'Same file name',
+        OriginalFileName: 'Same original file name',
+        CaptureTime: 'Same capture time',
+        LooksTheSame: 'Looks the same',
+      },
+      possibleNote: 'Unticked pairs rest on a single clue.',
+    },
+    adopting: 'Recording…',
+    skipped_one:
+      'Recorded {{recorded}}. {{count}} pair was skipped: its photo or the remote photo changed since the check.',
+    skipped_other:
+      'Recorded {{recorded}}. {{count}} pairs were skipped: their photos or the remote photos changed since the check.',
+    noMatch_one: 'The photo in “{{name}}” does not match any in this album.',
+    noMatch_other: 'None of the {{count}} photos in “{{name}}” match any in this album.',
+    naming: 'Publishing names them like <code>{{example}}</code>, from the “{{preset}}” preset.',
+    namingBoth:
+      'Publishing names them like <code>{{example}}</code>; the album has names like <code>{{remote}}</code>.',
+    namingBoth_smugmug:
+      'Publishing names them like <code>{{example}}</code>; the gallery has names like <code>{{remote}}</code>.',
+    allRecorded: 'Every photo in this album is already recorded as published to “{{name}}”.',
+    empty: 'There are no photos in “{{name}}”.',
+    noPreset: 'Choose an output preset to check for photos already in this album.',
+    noPreset_smugmug: 'Choose an output preset to check for photos already in this gallery.',
+    choosePreset: 'Choose a preset',
+    failed: 'Checking “{{name}}” for photos failed: {{error}}',
+    failedLinked: 'Linked, but checking “{{name}}” for photos failed: {{error}}',
+    done: 'Done',
   },
   browser: {
     loading: 'Loading albums…',

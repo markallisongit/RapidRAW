@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useShallow } from 'zustand/react/shallow';
-import { RefreshCw, Settings } from 'lucide-react';
+import { ArrowLeft, RefreshCw, Settings } from 'lucide-react';
 
 import ConfirmModal from '../../../modals/ConfirmModal';
 import Text from '../../../ui/Text';
@@ -12,6 +12,7 @@ import { useLibraryStore } from '../../../../store/useLibraryStore';
 import { useSettingsStore } from '../../../../store/useSettingsStore';
 import { useUIStore } from '../../../../store/useUIStore';
 import DestinationSection from './DestinationSection';
+import ExistingCheck, { useExistingCheck } from './ExistingReview';
 import LinkAlbumFlow from './LinkAlbumFlow';
 import PublishManagerModal from './manager/PublishManagerModal';
 import { formatSupport } from './output';
@@ -81,6 +82,22 @@ export default function PublishPanel() {
   const [confirm, setConfirm] = useState<Confirm | null>(null);
   const [question, setQuestion] = useState<{ albumId: string; count: number } | null>(null);
   const [isStarting, setIsStarting] = useState(false);
+  /** The link being checked for photos its remote album already holds, from its row's menu. */
+  const [checkingLink, setCheckingLink] = useState<LinkInfo | null>(null);
+  const existing = useExistingCheck(api);
+
+  const checkExisting = (link: LinkInfo) => {
+    const name = link.remote_name ?? link.album_name ?? '';
+    setFlow(null);
+    selectAlbum(link.album_id);
+    setCheckingLink(link);
+    void existing.start(link.album_id, name, false);
+  };
+
+  const closeCheck = () => {
+    existing.cancel();
+    setCheckingLink(null);
+  };
 
   // Names, deletions and broken links can change with the album tree and after a publish.
   useEffect(() => {
@@ -213,6 +230,34 @@ export default function PublishPanel() {
   const renderBody = () => {
     if (!isIdle) return <PublishProgress api={api} destinationName={destinationName} />;
 
+    if (checkingLink && existing.check) {
+      return (
+        <div className="grow overflow-y-auto p-3 space-y-4">
+          <div className="flex items-center gap-2">
+            <button
+              aria-label={t('publish.link.back')}
+              className="p-1 rounded-md text-text-secondary hover:text-text-primary hover:bg-surface"
+              disabled={existing.isAdopting}
+              onClick={closeCheck}
+            >
+              <ArrowLeft size={16} />
+            </button>
+            <Text variant={TextVariants.heading} className="truncate">
+              {t('publish.existing.title', { name: existing.check.remoteName })}
+            </Text>
+          </div>
+          <ExistingCheck
+            afterLinking={false}
+            api={api}
+            controller={existing}
+            onChooseOutput={() => openManager(DESTINATION_ID, 'output')}
+            onDone={closeCheck}
+            presetName={preset?.name ?? null}
+          />
+        </div>
+      );
+    }
+
     if (flow && links) {
       return (
         <LinkAlbumFlow
@@ -240,6 +285,7 @@ export default function PublishPanel() {
             api={api}
             canCheck={canCheck}
             destinationName={destinationName}
+            onCheckExisting={checkExisting}
             onLinkAlbum={(albumId) => setFlow({ albumId, isRelink: false })}
             onOpenManager={(section) => openManager(DESTINATION_ID, section)}
             onPublish={startPublish}

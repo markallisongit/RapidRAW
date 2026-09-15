@@ -368,15 +368,29 @@ impl PublishDestination for SmugMugDestination {
         let images = self
             .connection(ctx)?
             .api
-            .list_album_images(container)
+            .list_album_images_detailed(container)
             .await?;
         Ok(images
             .into_iter()
             .map(|image| RemoteImage {
                 id: image.image_uri,
                 file_name: image.file_name,
+                captured_at: image.captured_at,
+                camera_model: image.camera_model,
+                thumbnail_url: image.thumbnail_url,
             })
             .collect())
+    }
+
+    async fn fetch_thumbnail(
+        &self,
+        image: &RemoteImage,
+        ctx: &PublishContext,
+    ) -> Result<Option<Vec<u8>>, PublishError> {
+        let Some(url) = &image.thumbnail_url else {
+            return Ok(None);
+        };
+        self.connection(ctx)?.api.thumbnail(url).await
     }
 
     fn image_identity(&self, image: &RemoteImageId) -> String {

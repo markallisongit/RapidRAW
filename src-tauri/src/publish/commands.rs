@@ -6,17 +6,20 @@
 //! module that owns it, because this layer cannot be exercised without a
 //! running app.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use futures::stream::{self, StreamExt};
+use rayon::prelude::*;
 use serde::Serialize;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::AppState;
 use crate::file_management::AlbumItem;
 use crate::publish::links::{
-    ExistingMatch, LinkError, LinkInfo, LinkTarget, link_album, linked_images, list_links,
-    match_existing,
+    Candidates, ChosenPair, ExistingMatch, LinkError, LinkInfo, LinkTarget, Looks, PhotoFacts,
+    ToLookAt, VisualHash, candidates, link_album, linked_images, list_links,
 };
 use crate::publish::preset::{
     PresetError, PublishOutput, destination_output, keep_existing_uploads, settings_impact,
@@ -30,8 +33,9 @@ use crate::publish::state::{
     AlbumMembership, PublishState, RefreshReport, SettingsImpact, state_dir,
 };
 use crate::publish::{
-    AuthChallenge, AuthStatus, DestinationCapabilities, PublishContext, PublishDestination,
-    PublishError, RemoteNode, RemoteNodeId, credential_store, spool,
+    AuthChallenge, AuthStatus, CaptureTime, DestinationCapabilities, PublishContext,
+    PublishDestination, PublishError, RemoteImage, RemoteImageId, RemoteNode, RemoteNodeId,
+    credential_store, spool,
 };
 
 #[derive(Serialize)]
@@ -241,9 +245,13 @@ pub async fn publish_link_album(
     Ok(info)
 }
 
-/// How many of the album's photos its linked remote album already holds, by
-/// the file name publishing would give each with the destination's preset.
-/// Reads the destination and the photos; records nothing.
+/// What the album's linked remote album already holds of its photos: paired
+/// by the name publishing would give them, and failing that by the source
+/// file's name, the capture time and how they look. Reads the destination
+/// and the photos; records nothing.
+///
+/// Holds the session slot while it runs, so `publish_cancel` stops it; while
+/// comparing looks it reports `publish-match-progress`.
 #[tauri::command]
 pub async fn publish_match_existing(
     destination_id: String,
@@ -254,42 +262,51 @@ pub async fn publish_match_existing(
     let destination = destination(&state, &destination_id)?;
     let request = album(&app_handle, &album_id)?;
     let output = output(&app_handle, &destination_id)?;
-    let ctx = context(&app_handle, &destination_id, idle_cancel())?;
+    let session = state.publish_registry.begin_session()?;
+    let ctx = context(&app_handle, &destination_id, session.cancel_flag())?;
     let mut publish_state =
         PublishState::load_in(&ctx.state_dir, &destination_id, &request.albums)?;
     check_account(destination.as_ref(), &ctx, &mut publish_state).await?;
     let remote = linked_images(destination.as_ref(), &ctx, &publish_state, &album_id).await?;
     let pipeline = ExportPipeline::new(
-        app_handle,
+        app_handle.clone(),
         output.export_settings,
         output.output_format,
         idle_cancel(),
     );
 
-    // A fingerprint per photo, as for a preview.
-    tauri::async_runtime::spawn_blocking(move || {
-        match_existing(
+    // A fingerprint per photo, as for a preview, and a sidecar read for its
+    // capture time.
+    let identity = Arc::clone(&destination);
+    let found = tauri::async_runtime::spawn_blocking(move || {
+        candidates(
             &pipeline,
+            &SourceFacts,
             &publish_state,
             &album_id,
             &request.paths,
-            &remote,
+            remote,
+            &|id| identity.image_identity(id),
         )
-        .summary()
-        .clone()
     })
     .await
-    .map_err(|e| e.to_string().into())
+    .map_err(|e| PresetError::from(e.to_string()))?;
+
+    let gpu = crate::gpu_processing::get_or_init_gpu_context(&state, &app_handle).ok();
+    let looks = read_looks(destination.as_ref(), &ctx, &found, &app_handle, gpu).await?;
+    Ok(found.pair(&looks))
 }
 
-/// Records the photos [`publish_match_existing`] counts as published into
-/// the remote images they matched, listing the remote album again rather
-/// than trusting an earlier answer. Returns how many were recorded. Nothing
-/// on the destination changes. Refused while publishing, like linking.
+/// Records the pairs the user chose from [`publish_match_existing`], each
+/// checked against a fresh listing of the remote album: a pair whose remote
+/// image has gone, or whose photo has been recorded since, is skipped.
+/// Returns how many were recorded. Nothing on the destination changes.
+/// Refused while publishing, like linking.
 #[tauri::command]
 pub async fn publish_adopt_existing(
     destination_id: String,
     album_id: String,
+    pairs: Vec<ChosenPair>,
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> Result<usize, PresetError> {
@@ -310,14 +327,17 @@ pub async fn publish_adopt_existing(
     );
 
     tauri::async_runtime::spawn_blocking(move || {
-        let adoption = match_existing(
+        let identity = |id: &RemoteImageId| destination.image_identity(id);
+        let found = candidates(
             &pipeline,
+            &NoCaptureTimes,
             &publish_state,
             &album_id,
             &request.paths,
-            &remote,
+            remote,
+            &identity,
         );
-        let recorded = adoption.record(&mut publish_state)?;
+        let recorded = found.adopt(&mut publish_state, &pairs, &identity)?;
         if recorded > 0 {
             publish_state.save_in(&ctx.state_dir)?;
         }
@@ -325,6 +345,55 @@ pub async fn publish_adopt_existing(
     })
     .await
     .map_err(|e| PresetError::from(e.to_string()))?
+}
+
+/// A local photo's thumbnail for reviewing pairs, as a `data:` URL: the
+/// edited picture, from RapidRAW's thumbnail cache, rendered when missing.
+#[tauri::command]
+pub async fn publish_local_thumbnail(
+    path: String,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<String, String> {
+    let gpu = crate::gpu_processing::get_or_init_gpu_context(&state, &app_handle).ok();
+    tauri::async_runtime::spawn_blocking(move || {
+        let image = crate::file_management::get_cached_or_generate_thumbnail_image(
+            &path,
+            &app_handle,
+            gpu.as_ref(),
+        )
+        .map_err(|e| e.to_string())?;
+        let small = image.thumbnail(REVIEW_THUMBNAIL_PX, REVIEW_THUMBNAIL_PX);
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        small
+            .to_rgb8()
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .map_err(|e| e.to_string())?;
+        Ok(jpeg_data_url(jpeg.get_ref()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// A remote image's thumbnail for reviewing pairs, as a `data:` URL, fetched
+/// through the destination. `None` when it has none to give.
+#[tauri::command]
+pub async fn publish_remote_thumbnail(
+    destination_id: String,
+    thumbnail_url: String,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<Option<String>, String> {
+    let destination = destination(&state, &destination_id)?;
+    let ctx = context(&app_handle, &destination_id, idle_cancel())?;
+    let image = RemoteImage {
+        thumbnail_url: Some(thumbnail_url),
+        ..RemoteImage::named(RemoteImageId(String::new()), "")
+    };
+    Ok(destination
+        .fetch_thumbnail(&image, &ctx)
+        .await?
+        .map(|bytes| jpeg_data_url(&bytes)))
 }
 
 /// Forgets the link and its image records. Nothing on the destination is
@@ -564,4 +633,164 @@ fn context(
 /// For calls outside a session, which nothing can cancel.
 fn idle_cancel() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
+}
+
+/// Big enough to judge a pair at a glance, small enough to send dozens.
+const REVIEW_THUMBNAIL_PX: u32 = 320;
+
+/// Remote thumbnails fetched at once while comparing looks.
+const THUMBNAIL_FETCHES: usize = 4;
+
+fn jpeg_data_url(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    format!(
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
+}
+
+/// Capture times from each photo's source file: the cached EXIF RapidRAW
+/// keeps beside it, read from the file itself the first time.
+struct SourceFacts;
+
+impl PhotoFacts for SourceFacts {
+    fn capture(&self, virtual_path: &str) -> (Option<CaptureTime>, Option<String>) {
+        let (source, _) = crate::file_management::parse_virtual_path(virtual_path);
+        let exif = crate::exif_processing::read_rrexif_sidecar(&source)
+            .or_else(|| {
+                let bytes = std::fs::read(&source).ok()?;
+                Some(crate::exif_processing::read_exif_data(
+                    &source.to_string_lossy(),
+                    &bytes,
+                ))
+            })
+            .unwrap_or_default();
+        // Read as file naming reads it, which takes the camera's clock as
+        // local time; turned back, that is the clock again.
+        let at = crate::exif_processing::try_get_exif_creation_date(&source)
+            .map(|utc| utc.with_timezone(&chrono::Local).naive_local());
+        let millis = exif
+            .get("SubSecTimeOriginal")
+            .and_then(|digits| CaptureTime::millis_from_fraction(digits));
+        let model = exif
+            .get("Model")
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty());
+        (at.map(|at| CaptureTime::new(at, millis)), model)
+    }
+}
+
+/// For adopting, which pairs nothing and so compares no capture times.
+struct NoCaptureTimes;
+
+impl PhotoFacts for NoCaptureTimes {
+    fn capture(&self, _virtual_path: &str) -> (Option<CaptureTime>, Option<String>) {
+        (None, None)
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct MatchProgress {
+    checked: usize,
+    total: usize,
+}
+
+/// Hashes what [`Candidates::to_look_at`] names: the local photos' edited
+/// thumbnails on the blocking pool, the remote thumbnails meanwhile. A photo
+/// whose picture cannot be read just has no looks to compare. Stops between
+/// photos when `ctx.cancel` is set.
+async fn read_looks(
+    destination: &dyn PublishDestination,
+    ctx: &PublishContext,
+    found: &Candidates,
+    app_handle: &AppHandle,
+    gpu: Option<crate::image_processing::GpuContext>,
+) -> Result<Looks, PublishError> {
+    let ToLookAt { local, remote } = found.to_look_at();
+    let total = local.len() + remote.len();
+    let mut looks = Looks::default();
+    if total == 0 {
+        return Ok(looks);
+    }
+    let checked = Arc::new(AtomicUsize::new(0));
+    let report = {
+        let checked = Arc::clone(&checked);
+        let app_handle = app_handle.clone();
+        move || {
+            let checked = checked.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = app_handle.emit("publish-match-progress", MatchProgress { checked, total });
+        }
+    };
+    let _ = app_handle.emit(
+        "publish-match-progress",
+        MatchProgress { checked: 0, total },
+    );
+
+    let local: Vec<(usize, String)> = local
+        .into_iter()
+        .map(|(index, path)| (index, path.to_string()))
+        .collect();
+    let hashing = {
+        let cancel = Arc::clone(&ctx.cancel);
+        let app_handle = app_handle.clone();
+        let report = report.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            local
+                .par_iter()
+                .filter_map(|(index, path)| {
+                    if cancel.load(Ordering::SeqCst) {
+                        return None;
+                    }
+                    let image = crate::file_management::get_cached_or_generate_thumbnail_image(
+                        path,
+                        &app_handle,
+                        gpu.as_ref(),
+                    );
+                    report();
+                    match image {
+                        Ok(image) => Some((*index, VisualHash::of(&image))),
+                        Err(error) => {
+                            log::warn!("No thumbnail of {path} to compare: {error}");
+                            None
+                        }
+                    }
+                })
+                .collect::<HashMap<usize, VisualHash>>()
+        })
+    };
+
+    // Built here rather than in a closure passed to the stream, whose
+    // borrows the command's future could not prove `Send`.
+    let fetching: Vec<_> = remote
+        .into_iter()
+        .map(|(index, image)| {
+            let fetch = destination.fetch_thumbnail(image, ctx);
+            async move { (index, fetch.await) }
+        })
+        .collect();
+    let mut fetches = stream::iter(fetching).buffer_unordered(THUMBNAIL_FETCHES);
+    while let Some((index, fetched)) = fetches.next().await {
+        if ctx.cancel.load(Ordering::SeqCst) {
+            break;
+        }
+        report();
+        let image = match fetched {
+            Ok(Some(bytes)) => image::load_from_memory(&bytes).map_err(|e| e.to_string()),
+            Ok(None) => continue,
+            Err(error) => Err(error.to_string()),
+        };
+        match image {
+            Ok(image) => {
+                looks.remote.insert(index, VisualHash::of(&image));
+            }
+            Err(error) => log::warn!("No remote thumbnail to compare: {error}"),
+        }
+    }
+    drop(fetches);
+
+    looks.local = hashing.await.map_err(|e| PublishError::Io(e.to_string()))?;
+    if ctx.cancel.load(Ordering::SeqCst) {
+        return Err(PublishError::Cancelled);
+    }
+    Ok(looks)
 }

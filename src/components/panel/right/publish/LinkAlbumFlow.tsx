@@ -8,17 +8,16 @@ import Input from '../../../ui/Input';
 import Text from '../../../ui/Text';
 import { AlbumItem } from '../../../ui/AppProperties';
 import { TextColors, TextVariants, TextWeights } from '../../../../types/typography';
+import ExistingCheck, { useExistingCheck } from './ExistingReview';
 import RemoteAlbumBrowser from './RemoteAlbumBrowser';
 import {
   ContainerPrivacy,
-  ExistingMatch,
   LinkError,
   LinkInfo,
   LinkTarget,
   PublishStateApi,
   RemoteNode,
   displayError,
-  isPresetMissing,
 } from './usePublishState';
 
 const SECONDARY_BUTTON = 'bg-surface text-text-primary shadow-none';
@@ -39,13 +38,6 @@ const findAlbumName = (items: AlbumItem[], albumId: string): string | null => {
 
 const hasAlbums = (items: AlbumItem[]): boolean =>
   items.some((item) => item.type === 'album' || hasAlbums(item.children));
-
-/** What linking to an existing remote album found in it, when there is something to say. */
-type Existing =
-  | { kind: 'matched'; match: ExistingMatch }
-  | { kind: 'noMatch'; match: ExistingMatch }
-  | { kind: 'noPreset' }
-  | { kind: 'failed'; error: unknown };
 
 function AlbumChoices({
   items,
@@ -138,12 +130,9 @@ export default function LinkAlbumFlow({
   const [name, setName] = useState(() => (initialAlbumId ? (findAlbumName(albumTree, initialAlbumId) ?? '') : ''));
   const [remote, setRemote] = useState<RemoteNode | null>(null);
   const [isLinking, setIsLinking] = useState(false);
-  const [isChecking, setIsChecking] = useState(false);
   const [error, setError] = useState<unknown>(null);
-  /** Set once linked: the link stands whatever is answered here. */
-  const [existing, setExisting] = useState<{ remoteName: string; found: Existing } | null>(null);
-  const [isAdopting, setIsAdopting] = useState(false);
-  const [adoptError, setAdoptError] = useState<unknown>(null);
+  /** Set once linked to an existing remote album: the link stands whatever is answered there. */
+  const existing = useExistingCheck(api);
 
   const linkedIds = useMemo(() => new Set(links.map((link) => link.album_id)), [links]);
   const albumName = albumId ? findAlbumName(albumTree, albumId) : null;
@@ -164,18 +153,6 @@ export default function LinkAlbumFlow({
     setError(null);
   };
 
-  /** `null` when there is nothing to ask or explain: an empty album, or a destination that cannot list one. */
-  const checkExisting = async (id: string): Promise<Existing | null> => {
-    setIsChecking(true);
-    try {
-      const match = await api.matchExisting(id);
-      if (match.matched > 0) return { kind: 'matched', match };
-      return match.remote_photos > 0 ? { kind: 'noMatch', match } : null;
-    } catch (e) {
-      return isPresetMissing(e) ? { kind: 'noPreset' } : { kind: 'failed', error: e };
-    }
-  };
-
   const link = async (target: LinkTarget) => {
     if (!albumId) return;
     setIsLinking(true);
@@ -188,28 +165,9 @@ export default function LinkAlbumFlow({
       setIsLinking(false);
       return;
     }
-    // A new album has nothing in it to adopt.
-    const found = target.kind === 'Existing' ? await checkExisting(albumId) : null;
-    if (found === null) {
-      onDone();
-      return;
-    }
-    setExisting({ remoteName: info.remote_name ?? '', found });
-    setIsChecking(false);
     setIsLinking(false);
-  };
-
-  const adopt = async () => {
-    if (!albumId) return;
-    setIsAdopting(true);
-    setAdoptError(null);
-    try {
-      await api.adoptExisting(albumId);
-      onDone();
-    } catch (e) {
-      setAdoptError(e);
-      setIsAdopting(false);
-    }
+    // A new album has nothing in it to adopt, and an empty one nothing to say.
+    if (target.kind !== 'Existing' || !(await existing.start(albumId, info.remote_name ?? '', true))) onDone();
   };
 
   const renderError = () => {
@@ -227,7 +185,7 @@ export default function LinkAlbumFlow({
               disabled={isLinking}
               onClick={() => link({ kind: 'Existing', remote_uri: container })}
             >
-              {isChecking ? t('publish.link.checking', { context }) : t('publish.link.linkInstead')}
+              {t('publish.link.linkInstead')}
             </Button>
           )}
         </div>
@@ -244,76 +202,6 @@ export default function LinkAlbumFlow({
       <Text variant={TextVariants.small} color={TextColors.error}>
         {message}
       </Text>
-    );
-  };
-
-  const renderExisting = ({ remoteName, found }: { remoteName: string; found: Existing }) => {
-    if (found.kind === 'matched') {
-      const count = found.match.matched;
-      return (
-        <div className="space-y-3">
-          <Text color={TextColors.primary} weight={TextWeights.medium}>
-            {t('publish.link.existing.title', { count, name: remoteName })}
-          </Text>
-          <Text variant={TextVariants.small}>{t('publish.link.existing.message', { count })}</Text>
-          {adoptError !== null && (
-            <Text variant={TextVariants.small} color={TextColors.error}>
-              {isPresetMissing(adoptError)
-                ? t('publish.link.existing.noPreset', { context })
-                : displayError(adoptError, t('publish.errors.localFile'))}
-            </Text>
-          )}
-          <Button className="w-full" disabled={isAdopting} onClick={adopt}>
-            {isAdopting && <Loader size={16} className="animate-spin" />}
-            {isAdopting ? t('publish.link.existing.adopting') : t('publish.link.existing.adopt', { count })}
-          </Button>
-          <Button className={clsx(SECONDARY_BUTTON, 'w-full')} disabled={isAdopting} onClick={onDone}>
-            {t('publish.link.existing.uploadAgain', { count })}
-          </Button>
-        </div>
-      );
-    }
-
-    return (
-      <div className="space-y-3">
-        {found.kind === 'noMatch' && (
-          <Text variant={TextVariants.small} color={TextColors.primary}>
-            {t('publish.link.existing.noMatch', { count: found.match.remote_photos, name: remoteName })}
-            {found.match.example_file_name !== null && presetName !== null && (
-              <>
-                {' '}
-                <Trans
-                  i18nKey="publish.link.existing.naming"
-                  values={{ example: found.match.example_file_name, preset: presetName }}
-                  components={{ code: <code className="font-mono" /> }}
-                />
-              </>
-            )}
-          </Text>
-        )}
-        {found.kind === 'noPreset' && (
-          <div className="space-y-1">
-            <Text variant={TextVariants.small} color={TextColors.primary}>
-              {t('publish.link.existing.noPreset', { context })}
-            </Text>
-            <button className="flex items-center gap-1 text-sm text-accent hover:underline" onClick={onChooseOutput}>
-              {t('publish.link.existing.choosePreset')}
-              <ArrowUpRight size={14} />
-            </button>
-          </div>
-        )}
-        {found.kind === 'failed' && (
-          <Text variant={TextVariants.small} color={TextColors.error}>
-            {t('publish.link.existing.failed', {
-              name: remoteName,
-              error: displayError(found.error, t('publish.errors.localFile')),
-            })}
-          </Text>
-        )}
-        <Button className="w-full" onClick={onDone}>
-          {t('publish.link.existing.done')}
-        </Button>
-      </div>
     );
   };
 
@@ -408,13 +296,11 @@ export default function LinkAlbumFlow({
               onClick={() => remote?.container && link({ kind: 'Existing', remote_uri: remote.container })}
             >
               {isLinking && <Loader size={16} className="animate-spin" />}
-              {isChecking
-                ? t('publish.link.checking', { context })
-                : isLinking
-                  ? t('publish.link.linking')
-                  : remote
-                    ? t('publish.link.linkTo', { name: remote.name })
-                    : t('publish.link.chooseRemote', { context })}
+              {isLinking
+                ? t('publish.link.linking')
+                : remote
+                  ? t('publish.link.linkTo', { name: remote.name })
+                  : t('publish.link.chooseRemote', { context })}
             </Button>
           </div>
         )}
@@ -430,8 +316,12 @@ export default function LinkAlbumFlow({
         <button
           aria-label={t('publish.link.back')}
           className="p-1 rounded-md text-text-secondary hover:text-text-primary hover:bg-surface"
-          disabled={isAdopting}
-          onClick={existing ? onDone : back}
+          disabled={existing.isAdopting}
+          onClick={() => {
+            if (!existing.check) return back();
+            existing.cancel();
+            onDone();
+          }}
         >
           <ArrowLeft size={16} />
         </button>
@@ -440,8 +330,15 @@ export default function LinkAlbumFlow({
         </Text>
       </div>
 
-      {existing ? (
-        renderExisting(existing)
+      {existing.check ? (
+        <ExistingCheck
+          afterLinking
+          api={api}
+          controller={existing}
+          onChooseOutput={onChooseOutput}
+          onDone={onDone}
+          presetName={presetName}
+        />
       ) : albumId === null ? (
         <div className="space-y-2">
           <Text color={TextColors.primary} weight={TextWeights.medium}>
@@ -459,7 +356,7 @@ export default function LinkAlbumFlow({
         renderTarget()
       )}
 
-      {!existing && (
+      {!existing.check && (
         <Button className={clsx(SECONDARY_BUTTON, 'w-full')} onClick={onCancel}>
           {t('publish.link.cancel')}
         </Button>

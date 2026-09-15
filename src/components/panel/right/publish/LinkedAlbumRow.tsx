@@ -14,6 +14,7 @@ import {
   MoreHorizontal,
   Plus,
   RefreshCw,
+  SearchCheck,
   Settings2,
   Unlink,
   UploadCloud,
@@ -107,6 +108,7 @@ interface LinkedAlbumRowProps {
   destinationName: string;
   isSelected: boolean;
   onSelect: () => void;
+  onCheckExisting: () => void;
   onPublish: () => void;
   onRecreate: () => void;
   onRelink: () => void;
@@ -121,6 +123,7 @@ export default function LinkedAlbumRow({
   destinationName,
   isSelected,
   onSelect,
+  onCheckExisting,
   onPublish,
   onRecreate,
   onRelink,
@@ -155,6 +158,11 @@ export default function LinkedAlbumRow({
         label: t('publish.links.menu.open', { destination: destinationName }),
         disabled: link.web_url === null || link.broken,
         onClick: () => link.web_url && open(link.web_url),
+      },
+      {
+        icon: SearchCheck,
+        label: t('publish.links.menu.checkExisting', { context: destinationId }),
+        onClick: onCheckExisting,
       },
       { type: OPTION_SEPARATOR },
       { icon: Link2, label: t('publish.links.menu.relink', { context: destinationId }), onClick: onRelink },

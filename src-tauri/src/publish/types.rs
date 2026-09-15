@@ -25,12 +25,75 @@ pub struct RemoteContainerId(pub String);
 pub struct RemoteImageId(pub String);
 
 /// One image a container holds, as listed for matching local photos to it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Everything past the name is filled only where the destination's listing
+/// provides it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteImage {
     pub id: RemoteImageId,
     /// As the destination stores it, which for an upload is the name it was
     /// sent with.
     pub file_name: String,
+    /// When the photo was taken, by the camera's own clock.
+    pub captured_at: Option<CaptureTime>,
+    pub camera_model: Option<String>,
+    /// A small rendering of the whole picture, uncropped.
+    pub thumbnail_url: Option<String>,
+}
+
+impl RemoteImage {
+    /// An image known only by its id and name.
+    pub fn named(id: RemoteImageId, file_name: impl Into<String>) -> Self {
+        Self {
+            id,
+            file_name: file_name.into(),
+            captured_at: None,
+            camera_model: None,
+            thumbnail_url: None,
+        }
+    }
+}
+
+/// A capture time as EXIF records it: the camera's clock with no time zone,
+/// to the second, and the fraction of a second when the camera wrote one.
+///
+/// Deliberately zone-free. A service that converts the camera's clock to UTC
+/// has to guess the zone, and the guess would never match a local reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CaptureTime {
+    pub at: chrono::NaiveDateTime,
+    pub millis: Option<u16>,
+}
+
+impl CaptureTime {
+    /// `at` to the second; the fraction goes in `millis` when there is one.
+    pub fn new(at: chrono::NaiveDateTime, millis: Option<u16>) -> Self {
+        use chrono::Timelike;
+        Self {
+            at: at.with_nanosecond(0).unwrap_or(at),
+            millis,
+        }
+    }
+
+    /// The same moment: the same second, and the same fraction when both
+    /// sides know it. A side without one cannot tell burst frames apart.
+    pub fn same_moment(&self, other: &Self) -> bool {
+        self.at == other.at
+            && match (self.millis, other.millis) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
+    }
+
+    /// Milliseconds from the digits of a fraction of a second, as EXIF's
+    /// `SubSecTimeOriginal` and ISO 8601 write them: `"45"` is 450 ms.
+    pub fn millis_from_fraction(digits: &str) -> Option<u16> {
+        let digits = digits.trim();
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let padded: String = digits.chars().chain("000".chars()).take(3).collect();
+        padded.parse().ok()
+    }
 }
 
 /// What a linked container currently looks like at the destination.
