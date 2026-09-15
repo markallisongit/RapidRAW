@@ -48,7 +48,7 @@ fn srgb_to_linear(value: f32) -> f32 {
 fn develop_internal(
     file_bytes: &[u8],
     fast_demosaic: bool,
-    highlight_compression: f32,
+    _highlight_compression: f32,
     linear_mode: String,
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
 ) -> Result<(DynamicImage, Orientation)> {
@@ -128,7 +128,8 @@ fn develop_internal(
     let denominator = (original_white_level - original_black_level).max(1.0);
     let rescale_factor = (u32::MAX as f32 - original_black_level) / denominator;
 
-    let safe_highlight_compression = highlight_compression.max(1.01);
+    // turn off highlights clipping setting for now - needs clean cleanup across other files.
+    let safe_highlight_compression = 1000.0;
 
     let clamp_limit = if fast_demosaic {
         1.0
@@ -158,6 +159,29 @@ fn develop_internal(
                     r = srgb_to_linear(r.clamp(0.0, 1.0));
                     g = srgb_to_linear(g.clamp(0.0, 1.0));
                     b = srgb_to_linear(b.clamp(0.0, 1.0));
+                }
+
+                let max_c_initial = r.max(g).max(b);
+
+                if max_c_initial > 1.0 {
+                    let min_c = r.min(g).min(b);
+
+                    let base_desat = ((min_c - 0.3) * 2.5).clamp(0.0, 1.0);
+
+                    let magenta_factor = (r.min(b) - g).max(0.0);
+                    let magenta_desat = ((magenta_factor - 0.15) * 2.5).clamp(0.0, 1.0);
+
+                    let target_desat = base_desat.max(magenta_desat);
+
+                    let intensity = ((max_c_initial - 1.0) * 2.0).clamp(0.0, 1.0);
+                    let mut desat = target_desat * intensity;
+
+                    if desat > 0.0 {
+                        desat = desat * desat * (3.0 - 2.0 * desat);
+                        r = r * (1.0 - desat) + max_c_initial * desat;
+                        g = g * (1.0 - desat) + max_c_initial * desat;
+                        b = b * (1.0 - desat) + max_c_initial * desat;
+                    }
                 }
 
                 let max_c = r.max(g).max(b);
