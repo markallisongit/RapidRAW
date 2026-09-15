@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::app_settings::ExportPreset;
-use crate::export_processing::{ExportSettings, ResizeOptions, WatermarkSettings};
+use crate::export_processing::{ExportSettings, ResizeOptions, TiffBitDepth, WatermarkSettings};
 use crate::publish::PublishError;
 use crate::publish::state::{PublishState, RelevantExportSettings, SettingsImpact, settings_hash};
 
@@ -108,6 +108,9 @@ pub fn from_preset(preset: &ExportPreset) -> Result<PublishOutput, PresetError> 
     Ok(PublishOutput {
         export_settings: ExportSettings {
             jpeg_quality: preset.jpeg_quality,
+            // The frontend stores it on a preset, but `ExportPreset` here has no
+            // such field, so this is the 16 the frontend falls back to.
+            tiff_bit_depth: TiffBitDepth::default(),
             resize,
             keep_metadata: preset.keep_metadata,
             // Not stored in a preset. Sets the local file's mtime, which
@@ -265,6 +268,7 @@ mod tests {
             settings_json(&output),
             json!({
                 "jpegQuality": 88,
+                "tiffBitDepth": 16,
                 "resize": { "mode": "longEdge", "value": 3000, "dontEnlarge": false },
                 "keepMetadata": true,
                 "preserveTimestamps": false,

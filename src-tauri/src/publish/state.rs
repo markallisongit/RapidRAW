@@ -1038,13 +1038,14 @@ pub(crate) fn destination_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::export_processing::{ResizeMode, WatermarkAnchor};
+    use crate::export_processing::{ResizeMode, TiffBitDepth, WatermarkAnchor};
 
     /// A baseline `ExportSettings` for the fingerprint tests to vary one field
     /// of at a time.
     fn export_settings() -> ExportSettings {
         ExportSettings {
             jpeg_quality: 90,
+            tiff_bit_depth: TiffBitDepth::default(),
             resize: Some(ResizeOptions {
                 mode: ResizeMode::LongEdge,
                 value: 2048,
