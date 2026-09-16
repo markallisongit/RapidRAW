@@ -224,6 +224,7 @@ export const publishResources = {
     linkExisting: 'Link to an existing album',
     linkExisting_smugmug: 'Link to an existing gallery',
     nameLabel: 'Album name',
+    nameLabel_smugmug: 'Gallery name',
     privacy: 'New albums are <strong>{{privacy}}</strong>.',
     privacy_smugmug: 'New galleries are <strong>{{privacy}}</strong>.',
     changePrivacy: 'Change in Publish Manager',

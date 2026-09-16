@@ -240,7 +240,7 @@ export default function LinkAlbumFlow({
             <div className="space-y-1">
               <label htmlFor="publish-new-album-name">
                 <Text as="span" variant={TextVariants.label} className="block">
-                  {t('publish.link.nameLabel')}
+                  {t('publish.link.nameLabel', { context })}
                 </Text>
               </label>
               <Input
