@@ -8,8 +8,13 @@
 //!    here, before any rendering: an unchanged album costs one `stat` per
 //!    photo and no GPU time.
 //! 3. Render into the spool through the unmodified export pipeline.
-//! 4. Upload, replacing the remote image when this is an update.
+//! 4. Journal the upload as pending, then send it, replacing the remote image
+//!    when this is an update.
 //! 5. On success, write the state entry and release the spooled file at once.
+//!
+//! An upload whose outcome is never learned (a lost response, a kill, a failed
+//! save) stays journaled. The next publish looks for it in the remote album
+//! before classifying, and records it rather than sending it twice.
 //!
 //! Rendering runs in chunks, with chunk *n + 1* rendering while chunk *n*
 //! uploads, so the GPU and the network overlap and the spool holds at most
@@ -31,7 +36,7 @@ use crate::export_processing::{ExportAdjustmentsMode, ExportSettings};
 use crate::file_management::AlbumItem;
 use crate::publish::spool::Spool;
 use crate::publish::state::{
-    AlbumMembership, Fingerprints, PublishAction, PublishState, RefreshReport,
+    AlbumMembership, Fingerprints, PendingUpload, PublishAction, PublishState, RefreshReport,
     RelevantExportSettings, fingerprints,
 };
 use crate::publish::{
@@ -219,8 +224,8 @@ pub struct SessionSummary {
     pub updated: usize,
     pub skipped: usize,
     pub failed: Vec<FailedItem>,
-    /// Neither confirmed nor refuted, even after reconciliation. Not recorded
-    /// in the state file, so the next publish tries them again.
+    /// Neither confirmed nor refuted, even after reconciliation. Journaled as
+    /// pending, so the next publish looks for them before uploading.
     pub ambiguous: Vec<String>,
     pub cancelled: bool,
 }
@@ -388,6 +393,7 @@ impl<'a> PublishSession<'a> {
             summary: SessionSummary::default(),
             completed: 0,
             total: request.paths.len(),
+            adopted: HashSet::new(),
         };
         // Before anything remote: another account's ids would name albums and
         // images it does not own.
@@ -401,15 +407,21 @@ impl<'a> PublishSession<'a> {
         // publish from replacing a deleted image or rendering for an album
         // that has disappeared. Save before the broken-link refusal below so
         // the panel shows what the session discovered.
+        // The same listing settles uploads a previous session never
+        // confirmed, so a photo that landed is recorded instead of sent twice.
         if capabilities.supports_reconcile {
-            refresh_destination(
+            let report = refresh_destination(
                 self.destination,
                 self.ctx,
                 &mut run.state,
                 Some(&request.album.album_id),
             )
             .await?;
+            run.adopted = report.adopted.into_iter().collect();
             run.save()?;
+        } else {
+            // Nothing could ever settle them.
+            run.state.discard_pending(&request.album.album_id);
         }
 
         let container = match run.state.link(&request.album.album_id) {
@@ -476,16 +488,11 @@ impl<'a> PublishSession<'a> {
             rendered = ready;
         }
 
-        if run.summary.cancelled {
-            // Possibly landed, possibly not; nothing is recorded, so the next
-            // publish finds out.
-            for item in &ambiguous {
-                run.unresolved(&item.work);
-            }
-        } else if !ambiguous.is_empty() {
+        // Even after a cancel: the network is usually fine then, so the
+        // album's row is right at once.
+        if !ambiguous.is_empty() {
             self.resolve(&spool, &container, ambiguous, &mut run, &capabilities)
                 .await?;
-            run.summary.cancelled = self.cancelled();
         }
 
         run.finish()
@@ -607,9 +614,11 @@ impl<'a> PublishSession<'a> {
         result
     }
 
-    /// Uploads with bounded concurrency, applying each outcome as it arrives.
-    /// Ambiguous items keep their spooled file: reconciliation needs its size,
-    /// and a re-queue needs its bytes.
+    /// Journals the items, then uploads them with bounded concurrency,
+    /// applying each outcome as it arrives. Ambiguous items keep their spooled
+    /// file: reconciliation needs its size.
+    ///
+    /// An `Err` when the journal cannot be saved, before anything is sent.
     async fn upload_all(
         &self,
         spool: &Spool,
@@ -618,6 +627,7 @@ impl<'a> PublishSession<'a> {
         run: &mut Run<'_>,
         ambiguous: &mut Vec<Rendered>,
     ) -> Result<(), PublishError> {
+        let items = run.journal(spool, items)?;
         let mime = self.pipeline.mime();
         let mut outcomes = stream::iter(items)
             .map(|rendered| async move {
@@ -642,8 +652,13 @@ impl<'a> PublishSession<'a> {
                     release(spool, &rendered.file);
                 }
                 Err(PublishError::Ambiguous { .. }) => ambiguous.push(rendered),
-                Err(PublishError::Cancelled) => release(spool, &rendered.file),
+                // Anything but an ambiguity means the upload did not land.
+                Err(PublishError::Cancelled) => {
+                    run.not_sent(&rendered.work);
+                    release(spool, &rendered.file);
+                }
                 Err(error) => {
+                    run.not_sent(&rendered.work);
                     run.fail(&rendered.work.path, &error);
                     release(spool, &rendered.file);
                 }
@@ -652,9 +667,10 @@ impl<'a> PublishSession<'a> {
         Ok(())
     }
 
-    /// Asks the destination what the ambiguous uploads left behind. What it
-    /// found is recorded; what it did not is uploaded once more; whatever is
-    /// still unresolved after that is reported rather than guessed at.
+    /// Asks the destination what the ambiguous uploads left behind, and
+    /// records what it found. The rest stay journaled and are reported as
+    /// unconfirmed, never sent again here: a listing can lag behind a fresh
+    /// upload, and the next publish settles them once it has caught up.
     async fn resolve(
         &self,
         spool: &Spool,
@@ -669,49 +685,26 @@ impl<'a> PublishSession<'a> {
                 .iter()
                 .map(|rendered| rendered.item(container, mime))
                 .collect();
-            match self
-                .destination
+            self.destination
                 .reconcile(container, &items, self.ctx)
                 .await
-            {
-                Ok(found) => Some(found),
-                Err(error) => {
+                .unwrap_or_else(|error| {
                     log::warn!("Reconciling the publish session failed: {error}");
-                    None
-                }
-            }
+                    Vec::new()
+                })
         } else {
-            None
+            Vec::new()
         };
 
-        // Without an answer, a re-upload is exactly the blind retry that
-        // risks a duplicate.
-        let Some(found) = found else {
-            for rendered in &ambiguous {
-                run.unresolved(&rendered.work);
-            }
-            return Ok(());
-        };
-
-        let mut requeue = Vec::new();
         for rendered in ambiguous {
             match found
                 .iter()
                 .find(|(name, _)| *name == rendered.work.file_name)
             {
-                Some((_, id)) => {
-                    run.succeed(&rendered.work, id)?;
-                    release(spool, &rendered.file);
-                }
-                None => requeue.push(rendered),
+                Some((_, id)) => run.succeed(&rendered.work, id)?,
+                None => run.unresolved(&rendered.work),
             }
-        }
-
-        let mut still_ambiguous = Vec::new();
-        self.upload_all(spool, container, requeue, run, &mut still_ambiguous)
-            .await?;
-        for rendered in &still_ambiguous {
-            run.unresolved(&rendered.work);
+            release(spool, &rendered.file);
         }
         Ok(())
     }
@@ -723,8 +716,8 @@ struct Work {
     fingerprints: Fingerprints,
     file_name: String,
     replaces: Option<RemoteImageId>,
-    /// One per photo for the whole session, re-queue included, so the
-    /// destination can deduplicate.
+    /// One per photo for the whole session, so the destination can
+    /// deduplicate retries.
     request_id: Uuid,
 }
 
@@ -761,6 +754,9 @@ struct Run<'s> {
     summary: SessionSummary,
     completed: usize,
     total: usize,
+    /// Photos the pre-publish refresh found already uploaded, which are
+    /// reported as uploaded rather than skipped.
+    adopted: HashSet<String>,
 }
 
 impl Run<'_> {
@@ -791,8 +787,7 @@ impl Run<'_> {
     fn skip(&mut self, path: &str, fingerprints: &Fingerprints) {
         self.state
             .confirm_unchanged(&self.album_id, path, fingerprints);
-        self.summary.skipped += 1;
-        self.report(path, ItemState::Skipped);
+        self.left_alone(path);
     }
 
     /// A settings-only change the user chose not to upload: recorded as
@@ -800,8 +795,62 @@ impl Run<'_> {
     fn keep(&mut self, path: &str, fingerprints: &Fingerprints) {
         self.state
             .mark_image_settings_current(&self.album_id, path, &fingerprints.settings_hash);
-        self.summary.skipped += 1;
-        self.report(path, ItemState::Skipped);
+        self.left_alone(path);
+    }
+
+    /// Nothing to send. A skip, unless an earlier session's unconfirmed
+    /// upload was just found: that photo did reach the album.
+    fn left_alone(&mut self, path: &str) {
+        if self.adopted.remove(path) {
+            self.summary.uploaded += 1;
+            self.report(path, ItemState::Uploaded);
+        } else {
+            self.summary.skipped += 1;
+            self.report(path, ItemState::Skipped);
+        }
+    }
+
+    /// Journals `items` as pending and saves, returning those that may be
+    /// sent. A file that cannot be measured could never be recognised
+    /// remotely, so it fails here instead.
+    fn journal(
+        &mut self,
+        spool: &Spool,
+        items: Vec<Rendered>,
+    ) -> Result<Vec<Rendered>, PublishError> {
+        let mut sendable = Vec::new();
+        let mut entries = Vec::new();
+        for rendered in items {
+            match std::fs::metadata(&rendered.file) {
+                Ok(metadata) => {
+                    let work = &rendered.work;
+                    entries.push(PendingUpload {
+                        path: work.path.clone(),
+                        file_name: work.file_name.clone(),
+                        size_bytes: metadata.len(),
+                        edit_hash: work.fingerprints.edit_hash.clone(),
+                        settings_hash: work.fingerprints.settings_hash.clone(),
+                    });
+                    sendable.push(rendered);
+                }
+                Err(e) => {
+                    let error = PublishError::Io(format!("{}: {e}", rendered.file.display()));
+                    self.fail(&rendered.work.path, &error);
+                    release(spool, &rendered.file);
+                }
+            }
+        }
+        if !entries.is_empty() {
+            self.state.journal_uploads(&self.album_id, entries)?;
+            self.save()?;
+        }
+        Ok(sendable)
+    }
+
+    /// An upload known not to have landed leaves the journal. Saved with the
+    /// next write.
+    fn not_sent(&mut self, work: &Work) {
+        self.state.forget_pending(&self.album_id, &work.path);
     }
 
     /// Saved on every success rather than at the end: a crash mid-session
@@ -1081,7 +1130,8 @@ mod tests {
     use super::*;
     use crate::publish::{
         AuthChallenge, ContainerPrivacy, ContainerSnapshot, DestinationCapabilities, RemoteImage,
-        RemoteNode, RemoteNodeId, state::PublishState,
+        RemoteNode, RemoteNodeId, SnapshotImage,
+        state::{PendingUpload, PublishState},
     };
 
     const DESTINATION: &str = "stub";
@@ -1223,6 +1273,14 @@ mod tests {
         account: Option<String>,
         supports_reconcile: bool,
         container_exists: bool,
+        /// What `inspect_container` lists.
+        listing: Vec<SnapshotImage>,
+        reconcile_fails: bool,
+        /// Makes the state directory unwritable during the upload with this
+        /// (1-based) number.
+        lock_state_on_upload: Option<usize>,
+        /// The photos journaled on disk as each upload was sent, by file name.
+        journaled_at_upload: Mutex<Vec<(String, Vec<String>)>>,
     }
 
     impl StubDestination {
@@ -1239,7 +1297,27 @@ mod tests {
                 peak: AtomicU64::new(0),
                 supports_reconcile: false,
                 container_exists: true,
+                listing: Vec::new(),
+                reconcile_fails: false,
+                lock_state_on_upload: None,
+                journaled_at_upload: Mutex::new(Vec::new()),
             }
+        }
+
+        /// A destination whose album already holds the images `names`, as
+        /// uploads of [`FILE_BYTES`] into [`ALBUM`].
+        fn listing(mut self, names: &[String]) -> Self {
+            self.supports_reconcile = true;
+            self.listing = names
+                .iter()
+                .map(|name| SnapshotImage {
+                    id: image_id(ALBUM, name),
+                    file_name: Some(name.clone()),
+                    size_bytes: Some(FILE_BYTES as u64),
+                    uploaded_at: Some("2026-09-16T15:43:26+00:00".into()),
+                })
+                .collect();
+            self
         }
 
         fn connected_as(mut self, account: Option<&str>) -> Self {
@@ -1365,7 +1443,7 @@ mod tests {
             Ok(Some(ContainerSnapshot {
                 name: "Album".into(),
                 web_url: None,
-                images: Vec::new(),
+                images: self.listing.clone(),
             }))
         }
 
@@ -1397,6 +1475,22 @@ mod tests {
                 uploads.push((item.file_name.clone(), item.replaces.clone()));
                 uploads.len()
             };
+            let on_disk =
+                PublishState::load_in(&ctx.state_dir, DESTINATION, &AlbumMembership::default())
+                    .unwrap();
+            let journaled = on_disk.link(ALBUM).map_or_else(Vec::new, |link| {
+                link.pending
+                    .iter()
+                    .map(|entry| entry.path.clone())
+                    .collect()
+            });
+            self.journaled_at_upload
+                .lock()
+                .unwrap()
+                .push((item.file_name.clone(), journaled));
+            if self.lock_state_on_upload == Some(count) {
+                set_writable(&ctx.state_dir, false);
+            }
             self.containers
                 .lock()
                 .unwrap()
@@ -1438,6 +1532,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("reconcile:{}", names.join(",")));
+            if self.reconcile_fails {
+                return Err(PublishError::Network("still offline".into()));
+            }
             Ok(expected
                 .iter()
                 .filter(|item| self.landed.contains(&item.file_name))
@@ -1508,6 +1605,67 @@ mod tests {
             state.save_in(&self.ctx.state_dir).unwrap();
         }
 
+        /// Journals `paths` as sent to [`ALBUM`] with the stub's current
+        /// fingerprints, as a publish killed mid-upload leaves them.
+        fn journaled(&self, pipeline: &StubPipeline, paths: &[String]) {
+            self.link(ALBUM);
+            let mut state = self.state();
+            let entries = paths
+                .iter()
+                .map(|path| {
+                    let fingerprints = pipeline.fingerprints_of(path);
+                    PendingUpload {
+                        path: path.clone(),
+                        file_name: pipeline.file_name(path, 0, 1).unwrap(),
+                        size_bytes: FILE_BYTES as u64,
+                        edit_hash: fingerprints.edit_hash,
+                        settings_hash: fingerprints.settings_hash,
+                    }
+                })
+                .collect();
+            state.journal_uploads(ALBUM, entries).unwrap();
+            state.save_in(&self.ctx.state_dir).unwrap();
+        }
+
+        fn pending(&self) -> Vec<String> {
+            self.state()
+                .link(ALBUM)
+                .unwrap()
+                .pending
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect()
+        }
+
+        /// A session that is expected to stop with an error.
+        async fn run_failing(
+            &self,
+            destination: &StubDestination,
+            pipeline: &StubPipeline,
+            paths: Vec<String>,
+        ) -> PublishError {
+            self.link(ALBUM);
+            let events: EventSink = Arc::new(|_| {});
+            PublishSession::new(destination, pipeline, &self.ctx, self.spool_base(), events)
+                .run(request(ALBUM, paths), SettingsChangePolicy::Republish)
+                .await
+                .expect_err("the session stops")
+        }
+
+        fn reported(&self, path: &str) -> Vec<ItemState> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|event| match event {
+                    SessionEvent::Progress(progress) if progress.current_file == path => {
+                        Some(progress.state)
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
         async fn run(
             &self,
             destination: &StubDestination,
@@ -1562,6 +1720,12 @@ mod tests {
         fn terminal_event(&self) -> &'static str {
             self.events.lock().unwrap().last().unwrap().name()
         }
+    }
+
+    fn set_writable(dir: &Path, writable: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if writable { 0o755 } else { 0o555 };
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
     fn paths(range: std::ops::RangeInclusive<usize>) -> Vec<String> {
@@ -2158,7 +2322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ambiguous_items_trigger_reconcile_at_session_end() {
+    async fn ambiguous_items_are_reconciled_at_session_end_and_never_sent_twice() {
         let harness = Harness::new();
         let pipeline = StubPipeline::new(&harness.spool_base());
         let mut destination = StubDestination::new(&harness.spool_base())
@@ -2186,24 +2350,25 @@ mod tests {
             log[reconcile_at]["reconcile:".len()..].split(',').collect();
         reconciled.sort();
         assert_eq!(reconciled, [file_name(2), file_name(4)]);
-        for n in 1..=5 {
-            let first_upload = log
-                .iter()
-                .position(|entry| *entry == format!("upload:{}", file_name(n)))
-                .unwrap();
-            assert!(
-                first_upload < reconcile_at,
-                "reconcile waits for every upload: {log:?}"
-            );
-        }
         assert_eq!(
-            log[reconcile_at + 1..],
-            [format!("upload:{}", file_name(4))],
-            "what did not land is uploaded again; what did is not"
+            reconcile_at,
+            log.len() - 1,
+            "reconcile waits for every upload, and nothing is sent after it: \
+             the listing may not show a fresh upload yet: {log:?}"
         );
+        assert_eq!(destination.uploaded_names().len(), 5);
         let state = harness.state();
-        assert!((1..=5).all(|n| state.image_for(ALBUM, &path(n)).is_some()));
-        assert!(summary.ambiguous.is_empty());
+        let recorded: Vec<bool> = (1..=5)
+            .map(|n| state.image_for(ALBUM, &path(n)).is_some())
+            .collect();
+        assert_eq!(recorded, [true, true, true, false, true]);
+        assert_eq!(summary.uploaded, 4);
+        assert_eq!(summary.ambiguous, [path(4)]);
+        assert_eq!(
+            harness.pending(),
+            [path(4)],
+            "the next publish checks for it before uploading"
+        );
     }
 
     #[tokio::test]
@@ -2213,10 +2378,7 @@ mod tests {
         let destination = StubDestination::new(&harness.spool_base())
             .with_reconcile()
             .script(&file_name(1), vec![Scripted::Fail])
-            .script(
-                &file_name(2),
-                vec![Scripted::Ambiguous, Scripted::Ambiguous],
-            );
+            .script(&file_name(2), vec![Scripted::Ambiguous]);
 
         let summary = harness.run(&destination, &pipeline, paths(1..=3)).await;
 
@@ -2230,9 +2392,222 @@ mod tests {
             "an ambiguity reconcile could not confirm is not recorded"
         );
         assert!(state.image_for(ALBUM, &path(3)).is_some());
+        assert_eq!(
+            harness.pending(),
+            [path(2)],
+            "a refusal did not land, so only the ambiguity stays journaled"
+        );
         assert_eq!(summary.ambiguous, [path(2)]);
         assert_eq!(summary.failed.len(), 1);
         assert_eq!(summary.uploaded, 1);
+    }
+
+    #[tokio::test]
+    async fn uploads_are_journaled_before_they_are_sent() {
+        let harness = Harness::new();
+        let pipeline = StubPipeline::new(&harness.spool_base());
+        let destination = StubDestination::new(&harness.spool_base());
+        let photos = paths(1..=(RENDER_CHUNK_SIZE + 2));
+
+        harness.run(&destination, &pipeline, photos.clone()).await;
+
+        let journaled = destination.journaled_at_upload.lock().unwrap().clone();
+        assert_eq!(journaled.len(), photos.len());
+        for (name, on_disk) in &journaled {
+            let photo = format!("/photos/{}.ARW", name.trim_end_matches(".jpg"));
+            assert!(
+                on_disk.contains(&photo),
+                "{name} was sent before it was journaled: {on_disk:?}"
+            );
+        }
+        let (_, last) = journaled.last().unwrap();
+        assert!(
+            !last.contains(&path(1)),
+            "a confirmed upload leaves the journal: {last:?}"
+        );
+        assert!(harness.pending().is_empty());
+    }
+
+    #[tokio::test]
+    async fn nothing_is_sent_when_the_journal_cannot_be_saved() {
+        let harness = Harness::new();
+        let pipeline = StubPipeline::new(&harness.spool_base());
+        let destination = StubDestination::new(&harness.spool_base());
+        harness.link(ALBUM);
+        set_writable(&harness.ctx.state_dir, false);
+
+        let error = harness
+            .run_failing(&destination, &pipeline, paths(1..=2))
+            .await;
+
+        set_writable(&harness.ctx.state_dir, true);
+        assert!(matches!(error, PublishError::Io(_)), "{error}");
+        assert!(destination.uploaded_names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_killed_upload_found_in_the_album_is_recorded_instead_of_sent_again() {
+        let harness = Harness::new();
+        let pipeline = StubPipeline::new(&harness.spool_base());
+        harness.journaled(&pipeline, &[path(1)]);
+        let destination = StubDestination::new(&harness.spool_base()).listing(&[file_name(1)]);
+
+        let summary = harness.run(&destination, &pipeline, paths(1..=2)).await;
+
+        assert_eq!(destination.uploaded_names(), [file_name(2)]);
+        assert_eq!(pipeline.renders.load(Ordering::SeqCst), 1);
+        let state = harness.state();
+        assert_eq!(
+            state.image_for(ALBUM, &path(1)).unwrap().remote_uri,
+            image_id(ALBUM, &file_name(1)).0
+        );
+        assert!(harness.pending().is_empty());
+        assert_eq!((summary.uploaded, summary.skipped), (2, 0));
+        assert_eq!(
+            harness.reported(&path(1)),
+            [ItemState::Uploaded],
+            "it did reach the album, as the preview said it would"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_killed_upload_edited_since_replaces_the_adopted_image() {
+        let harness = Harness::new();
+        let mut pipeline = StubPipeline::new(&harness.spool_base());
+        harness.journaled(&pipeline, &[path(1)]);
+        pipeline.edited = [path(1)].into();
+        let destination = StubDestination::new(&harness.spool_base()).listing(&[file_name(1)]);
+
+        let summary = harness.run(&destination, &pipeline, paths(1..=1)).await;
+
+        assert_eq!(
+            destination.uploads.lock().unwrap().clone(),
+            [(file_name(1), Some(image_id(ALBUM, &file_name(1))))]
+        );
+        assert_eq!(summary.updated, 1);
+    }
+
+    #[tokio::test]
+    async fn a_killed_upload_that_never_landed_is_uploaded_once_as_new() {
+        let harness = Harness::new();
+        let pipeline = StubPipeline::new(&harness.spool_base());
+        harness.journaled(&pipeline, &[path(1)]);
+        let destination = StubDestination::new(&harness.spool_base()).listing(&[]);
+
+        let summary = harness.run(&destination, &pipeline, paths(1..=1)).await;
+
+        assert_eq!(
+            destination.uploads.lock().unwrap().clone(),
+            [(file_name(1), None)]
+        );
+        assert_eq!(summary.uploaded, 1);
+        assert!(harness.pending().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_upload_reconcile_cannot_check_is_found_by_the_next_publish() {
+        let harness = Harness::new();
+        let pipeline = StubPipeline::new(&harness.spool_base());
+        let mut offline = StubDestination::new(&harness.spool_base())
+            .with_reconcile()
+            .script(&file_name(2), vec![Scripted::Ambiguous]);
+        offline.reconcile_fails = true;
+
+        let summary = harness.run(&offline, &pipeline, paths(1..=3)).await;
+
+        assert_eq!(summary.ambiguous, [path(2)]);
+        assert_eq!(harness.pending(), [path(2)]);
+
+        let online = StubDestination::new(&harness.spool_base()).listing(&[
+            file_name(1),
+            file_name(2),
+            file_name(3),
+        ]);
+        let summary = harness.run(&online, &pipeline, paths(1..=3)).await;
+
+        assert!(online.uploaded_names().is_empty(), "nothing is sent twice");
+        assert_eq!((summary.uploaded, summary.skipped), (1, 2));
+        assert!(harness.pending().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_with_an_unconfirmed_upload_still_asks_the_destination() {
+        let harness = Harness::new();
+        let pipeline = StubPipeline::new(&harness.spool_base());
+        let mut destination = StubDestination::new(&harness.spool_base())
+            .with_reconcile()
+            .script(&file_name(1), vec![Scripted::Ambiguous]);
+        destination.landed = [file_name(1)].into();
+        destination.cancel_on_upload = Some((1, Arc::clone(&harness.ctx.cancel)));
+
+        let summary = harness.run(&destination, &pipeline, paths(1..=5)).await;
+
+        assert!(summary.cancelled);
+        assert!(
+            destination
+                .log
+                .lock()
+                .unwrap()
+                .contains(&format!("reconcile:{}", file_name(1)))
+        );
+        assert!(harness.state().image_for(ALBUM, &path(1)).is_some());
+        assert!(summary.ambiguous.is_empty());
+        assert!(
+            harness.pending().is_empty(),
+            "uploads cancelled before they were sent are not journaled"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upload_whose_record_cannot_be_saved_is_found_by_the_next_publish() {
+        let harness = Harness::new();
+        let pipeline = StubPipeline::new(&harness.spool_base());
+        let mut failing = StubDestination::new(&harness.spool_base());
+        failing.lock_state_on_upload = Some(1);
+
+        let error = harness.run_failing(&failing, &pipeline, paths(1..=1)).await;
+
+        set_writable(&harness.ctx.state_dir, true);
+        assert!(matches!(error, PublishError::Io(_)), "{error}");
+        assert_eq!(harness.pending(), [path(1)]);
+
+        let next = StubDestination::new(&harness.spool_base()).listing(&[file_name(1)]);
+        let summary = harness.run(&next, &pipeline, paths(1..=1)).await;
+
+        assert!(next.uploaded_names().is_empty());
+        assert_eq!(summary.uploaded, 1);
+    }
+
+    #[tokio::test]
+    async fn a_destination_that_cannot_list_forgets_the_journal() {
+        let harness = Harness::new();
+        let pipeline = StubPipeline::new(&harness.spool_base());
+        harness.journaled(&pipeline, &[path(1)]);
+        let destination = StubDestination::new(&harness.spool_base());
+
+        harness.run(&destination, &pipeline, paths(2..=2)).await;
+
+        assert!(
+            harness.pending().is_empty(),
+            "nothing could ever settle it: the journal holds one session's uploads"
+        );
+    }
+
+    #[tokio::test]
+    async fn refreshing_records_unconfirmed_uploads_found_in_the_album() {
+        let harness = Harness::new();
+        let pipeline = StubPipeline::new(&harness.spool_base());
+        harness.journaled(&pipeline, &[path(1), path(2)]);
+        let destination = StubDestination::new(&harness.spool_base()).listing(&[file_name(1)]);
+        let mut state = harness.state();
+
+        let report = refresh_destination(&destination, &harness.ctx, &mut state, None)
+            .await
+            .unwrap();
+
+        assert_eq!(report.uploads_found, 1);
+        assert!(state.image_for(ALBUM, &path(1)).is_some());
+        assert!(state.link(ALBUM).unwrap().pending.is_empty());
     }
 
     #[tokio::test]
@@ -2264,6 +2639,10 @@ mod tests {
                 .filter(|n| state.image_for(ALBUM, &path(*n)).is_some())
                 .count(),
             3
+        );
+        assert!(
+            harness.pending().is_empty(),
+            "an upload cancelled before it was sent did not land"
         );
         assert_eq!(harness.terminal_event(), "publish-cancelled");
     }

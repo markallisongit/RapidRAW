@@ -18,7 +18,7 @@ pub use types::{
     AuthChallenge, AuthStatus, CaptureTime, ConsumerCredentials, ContainerPrivacy,
     ContainerSnapshot, DestinationCapabilities, LocalContainer, PublishContext, PublishError,
     PublishItem, RemoteContainerId, RemoteImage, RemoteImageId, RemoteNode, RemoteNodeId,
-    RemoteNodeKind,
+    RemoteNodeKind, SnapshotImage,
 };
 
 /// A place photos can be published to.

@@ -139,6 +139,10 @@ export const publishResources = {
     restored_other: '{{count}} restored',
     imagesMissing_one: '{{count}} photo missing',
     imagesMissing_other: '{{count}} photos missing',
+    uploadsFound_one: '{{count}} unconfirmed upload found',
+    uploadsFound_other: '{{count}} unconfirmed uploads found',
+    uploadsFound_smugmug_one: '{{count}} unconfirmed upload found on SmugMug',
+    uploadsFound_smugmug_other: '{{count}} unconfirmed uploads found on SmugMug',
     uploadNext_one: "it'll upload next time",
     uploadNext_other: "they'll upload next time",
     failed: 'Could not refresh: {{error}}',
@@ -369,8 +373,10 @@ export const publishResources = {
     summary: '{{uploaded}} new, {{updated}} updated, {{skipped}} unchanged',
     failedCount_one: '{{count}} failed',
     failedCount_other: '{{count}} failed',
-    ambiguous_one: 'SmugMug did not confirm {{count}} photo. It will be tried again next time you publish.',
-    ambiguous_other: 'SmugMug did not confirm {{count}} photos. They will be tried again next time you publish.',
+    ambiguous_one:
+      'SmugMug did not confirm {{count}} photo. Publishing again checks the gallery first and uploads it only if it is missing.',
+    ambiguous_other:
+      'SmugMug did not confirm {{count}} photos. Publishing again checks the gallery first and uploads only what is missing.',
     states: {
       skipped: 'Unchanged',
       uploaded: 'Uploaded',

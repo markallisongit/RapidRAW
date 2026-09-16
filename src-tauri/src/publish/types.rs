@@ -98,14 +98,39 @@ impl CaptureTime {
 
 /// What a linked container currently looks like at the destination.
 ///
-/// Images that exist remotely but are not recorded locally are intentionally
-/// just identifiers: refresh uses them only to retain matching records and
-/// never imports or changes them.
+/// Refresh uses the images to retain matching records, and to find uploads
+/// whose outcome was never recorded. It never changes them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContainerSnapshot {
     pub name: String,
     pub web_url: Option<String>,
-    pub images: Vec<RemoteImageId>,
+    pub images: Vec<SnapshotImage>,
+}
+
+/// One image in a [`ContainerSnapshot`]. Everything past the id is filled
+/// only where the destination's listing provides it; without a name and size
+/// an unrecorded upload can never be recognised.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotImage {
+    pub id: RemoteImageId,
+    /// As the destination stores it, which for an upload is the name it was
+    /// sent with.
+    pub file_name: Option<String>,
+    /// The size of the bytes that were uploaded.
+    pub size_bytes: Option<u64>,
+    /// RFC 3339.
+    pub uploaded_at: Option<String>,
+}
+
+impl SnapshotImage {
+    pub fn id_only(id: RemoteImageId) -> Self {
+        Self {
+            id,
+            file_name: None,
+            size_bytes: None,
+            uploaded_at: None,
+        }
+    }
 }
 
 /// Opaque destination-side identifier for anything in the container tree,

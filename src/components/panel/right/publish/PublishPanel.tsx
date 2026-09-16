@@ -148,6 +148,9 @@ export default function PublishPanel() {
     if (refreshReport.images_missing > 0) {
       parts.push(t('publish.refresh.imagesMissing', { count: refreshReport.images_missing }));
     }
+    if (refreshReport.uploads_found > 0) {
+      parts.push(t('publish.refresh.uploadsFound', { count: refreshReport.uploads_found, context: DESTINATION_ID }));
+    }
     return `${parts.join(' · ')}${
       refreshReport.images_missing > 0
         ? ` — ${t('publish.refresh.uploadNext', { count: refreshReport.images_missing })}`

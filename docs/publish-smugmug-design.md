@@ -92,9 +92,20 @@ from `cancel_export` (`:1455`).
 
 **Ambiguous failures.** A timeout may or may not have committed; blind retry risks a duplicate,
 giving up risks a missing photo. Retry with the same request id; if exhausted, mark _ambiguous_,
-not failed; at session end call `reconcile()` to list the album and match by filename and size;
-record what's found, re-queue what isn't. Per-image failures never abort the batch, and the state
-file records only confirmed successes.
+not failed; at session end (after a cancel too) call `reconcile()` to list the album and match by
+filename and size, and record what's found. What isn't found is reported as unconfirmed and never
+re-sent in the same session: a listing can lag behind a fresh upload. Per-image failures never
+abort the batch, and the state file records only confirmed successes.
+
+**Upload journal.** Every upload is journaled as `pending` in the state file, and saved, before it
+is sent (once per chunk; a failed save stops the session first). A confirmed upload's record
+replaces its entry; one known not to have landed (cancelled before sending, refused) drops it; an
+ambiguous one keeps it. Whatever is left (a lost response, a kill, a failed save) is settled the
+next time the album is listed, by the pre-publish refresh or ↻: an unclaimed image with the same
+file name and size is recorded with the fingerprints the upload was rendered with (the oldest, if
+several match), and the rest are forgotten. Rendering is deterministic, so name and size identify
+an upload RapidRAW made. A settled photo is reported as uploaded, and an edit made since still
+replaces it. A destination that cannot list discards its journal.
 
 ### The trait
 
@@ -180,6 +191,15 @@ interrupted publish resumes.
           "last_published": "…",
         },
       },
+      "pending": [                         // omitted when empty
+        {
+          "path": "<virtual_path>",
+          "file_name": "DSC_0001.jpg",     // exactly as sent
+          "size_bytes": 1322434,           // the rendered file
+          "edit_hash": "b3:…",             // what it was rendered with
+          "settings_hash": "b3:…",
+        },
+      ],
     },
   },
 }
@@ -192,6 +212,12 @@ connecting never loads — or migrates — the image records.
 **Image records live under their link.** A photo in two RapidRAW albums is two uploads, one into
 each remote album, each replaced or skipped on its own. Relinking an album to a *different*
 remote album drops its records, which describe images in the old album.
+
+**Pending uploads live under their link too**, so unlinking, or relinking elsewhere, drops them,
+and a link whose album has gone clears them. `pending` is omitted when empty, so adding it needed
+no version bump: a clean publish writes the same file as before. It lives here rather than in the
+image sidecar, which would drop an unknown field on the next edit and would carry account-specific
+ids into files that get synced and shared.
 
 **Key on the full virtual path**, not the source path — virtual copies use a `vc=` suffix
 (`export_processing.rs:937-942`, named `_VCnn` at `:1034-1038`) and are distinct publishable photos.

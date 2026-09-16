@@ -26,7 +26,7 @@ use tauri::{AppHandle, Manager};
 use crate::export_processing::{ExportSettings, ResizeOptions, WatermarkSettings};
 use crate::file_management::AlbumItem;
 use crate::publish::{
-    ContainerSnapshot, PublishError, RemoteContainerId, RemoteImageId, RemoteNode,
+    ContainerSnapshot, PublishError, RemoteContainerId, RemoteImageId, RemoteNode, SnapshotImage,
 };
 
 /// Subdirectory of `app_data_dir` holding one file per destination.
@@ -60,6 +60,27 @@ pub struct LinkRecord {
     /// suffix. Keying on the source would collapse every copy of an image onto
     /// one remote image, each republish overwriting the last.
     pub images: BTreeMap<String, ImageRecord>,
+    /// Uploads sent through this link whose outcome is not yet known: a lost
+    /// response, a kill, a failed save. Written before the upload is sent,
+    /// and settled against the remote album by [`PublishState::apply_snapshot`],
+    /// so an upload that landed unrecorded is adopted instead of sent twice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending: Vec<PendingUpload>,
+}
+
+/// An upload that may have landed. Enough to recognise it in a listing, and
+/// to record it as what was rendered, not as the photo is now.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PendingUpload {
+    /// The virtual path, as [`LinkRecord::images`] keys it.
+    pub path: String,
+    /// Exactly as sent to the destination.
+    pub file_name: String,
+    /// The rendered file's size.
+    pub size_bytes: u64,
+    /// The [`Fingerprints`] it was rendered with.
+    pub edit_hash: String,
+    pub settings_hash: String,
 }
 
 /// Where one publishable photo ended up, and what it looked like at the time.
@@ -135,6 +156,11 @@ pub struct RefreshReport {
     pub broken: usize,
     pub restored: usize,
     pub images_missing: usize,
+    /// Unconfirmed uploads found in the remote album and recorded.
+    pub uploads_found: usize,
+    /// Their photos' virtual paths, for a session to report as uploaded.
+    #[serde(skip)]
+    pub adopted: Vec<String>,
 }
 
 impl RefreshReport {
@@ -144,6 +170,8 @@ impl RefreshReport {
         self.broken += other.broken;
         self.restored += other.restored;
         self.images_missing += other.images_missing;
+        self.uploads_found += other.uploads_found;
+        self.adopted.extend(other.adopted);
     }
 }
 
@@ -359,6 +387,7 @@ impl PublishState {
                         last_published: None,
                         broken: false,
                         images: BTreeMap::new(),
+                        pending: Vec::new(),
                     },
                 );
             }
@@ -400,10 +429,14 @@ impl PublishState {
         self.links.remove(album_id).is_some()
     }
 
-    /// Applies one destination snapshot without ever inventing local records.
-    /// A missing container keeps its image records in case the link is
-    /// restored; missing images in a live container are forgotten so the next
-    /// publish adds those photos again rather than replacing deleted ids.
+    /// Applies one destination snapshot. A missing container keeps its image
+    /// records in case the link is restored; missing images in a live
+    /// container are forgotten so the next publish adds those photos again
+    /// rather than replacing deleted ids.
+    ///
+    /// Also settles every [pending upload](LinkRecord::pending): one the
+    /// listing holds is recorded, the rest are forgotten. These are the only
+    /// records a refresh creates, and only for uploads RapidRAW sent.
     pub fn apply_snapshot<F>(
         &mut self,
         album_id: &str,
@@ -423,6 +456,8 @@ impl PublishState {
         };
 
         let Some(snapshot) = snapshot else {
+            // Whatever those uploads left behind went with the album.
+            link.pending.clear();
             if !link.broken {
                 link.broken = true;
                 report.broken = 1;
@@ -447,7 +482,7 @@ impl PublishState {
         let remote_images: HashMap<String, &RemoteImageId> = snapshot
             .images
             .iter()
-            .map(|image| (image_identity(image), image))
+            .map(|image| (image_identity(&image.id), &image.id))
             .collect();
         let before = link.images.len();
         link.images.retain(|_, image| {
@@ -461,7 +496,43 @@ impl PublishState {
             true
         });
         report.images_missing = before - link.images.len();
+        report.adopted = settle_pending(link, snapshot, &image_identity);
+        report.uploads_found = report.adopted.len();
         Ok(report)
+    }
+
+    /// Journals uploads about to be sent into `album_id`'s linked album,
+    /// replacing any entry for the same photo. An error when the album is not
+    /// linked, as for [`Self::record_image`].
+    pub fn journal_uploads(
+        &mut self,
+        album_id: &str,
+        uploads: Vec<PendingUpload>,
+    ) -> Result<(), PublishError> {
+        let link = self.links.get_mut(album_id).ok_or_else(|| {
+            PublishError::Io(format!(
+                "journaling uploads: album {album_id} is not linked"
+            ))
+        })?;
+        link.pending
+            .retain(|entry| !uploads.iter().any(|upload| upload.path == entry.path));
+        link.pending.extend(uploads);
+        Ok(())
+    }
+
+    /// Drops every journal entry of `album_id`'s link, for a destination that
+    /// cannot list what landed.
+    pub fn discard_pending(&mut self, album_id: &str) {
+        if let Some(link) = self.links.get_mut(album_id) {
+            link.pending.clear();
+        }
+    }
+
+    /// Drops the journal entry of an upload known not to have landed.
+    pub fn forget_pending(&mut self, album_id: &str, virtual_path: &str) {
+        if let Some(link) = self.links.get_mut(album_id) {
+            link.pending.retain(|entry| entry.path != virtual_path);
+        }
     }
 
     /// Stamps the link's `last_published`. A no-op for an unlinked album.
@@ -498,6 +569,7 @@ impl PublishState {
                 last_published: now_rfc3339(),
             },
         );
+        link.pending.retain(|entry| entry.path != virtual_path);
         Ok(())
     }
 
@@ -663,6 +735,7 @@ impl PublishState {
                     last_published: Some(container.last_published),
                     broken: false,
                     images: BTreeMap::new(),
+                    pending: Vec::new(),
                 };
                 (album_id, link)
             })
@@ -712,6 +785,72 @@ impl PublishState {
             links,
         }
     }
+}
+
+/// Records each of `link`'s pending uploads that `snapshot` holds, under the
+/// fingerprints it was rendered with, and empties the journal. Returns how
+/// the virtual paths of those recorded.
+///
+/// An upload is recognised by its file name and size, which a deterministic
+/// render repeats exactly. An image another photo's record already claims is
+/// never taken. Where several match, the oldest is: the others are duplicates
+/// a previous interrupted publish left behind.
+fn settle_pending<F>(
+    link: &mut LinkRecord,
+    snapshot: &ContainerSnapshot,
+    image_identity: &F,
+) -> Vec<String>
+where
+    F: Fn(&RemoteImageId) -> String,
+{
+    let mut claimed: HashMap<String, String> = link
+        .images
+        .iter()
+        .map(|(path, record)| {
+            let id = RemoteImageId(record.remote_uri.clone());
+            (image_identity(&id), path.clone())
+        })
+        .collect();
+
+    // Stable, so listing order decides between equal or unknown times.
+    let mut oldest_first: Vec<&SnapshotImage> = snapshot.images.iter().collect();
+    oldest_first.sort_by_key(|image| {
+        let uploaded = image
+            .uploaded_at
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok());
+        (uploaded.is_none(), uploaded)
+    });
+
+    let mut found = Vec::new();
+    for entry in std::mem::take(&mut link.pending) {
+        let adopted = oldest_first.iter().find_map(|image| {
+            let identity = image_identity(&image.id);
+            let matches = image.file_name.as_deref() == Some(entry.file_name.as_str())
+                && image.size_bytes == Some(entry.size_bytes)
+                && claimed
+                    .get(&identity)
+                    .is_none_or(|owner| *owner == entry.path);
+            matches.then_some((identity, &image.id))
+        });
+        let Some((identity, id)) = adopted else {
+            continue;
+        };
+        claimed.insert(identity, entry.path.clone());
+        found.push(entry.path.clone());
+        link.images.insert(
+            entry.path,
+            ImageRecord {
+                remote_uri: id.0.clone(),
+                web_url: None,
+                edit_hash: Some(entry.edit_hash),
+                settings_hash: Some(entry.settings_hash),
+                legacy_fingerprint: None,
+                last_published: now_rfc3339(),
+            },
+        );
+    }
+    found
 }
 
 /// Phase 1's file format, kept only so [`PublishState::migrate`] can read it.
@@ -1361,7 +1500,7 @@ mod tests {
                 Some(&ContainerSnapshot {
                     name: "A".into(),
                     web_url: Some("https://example.test/a".into()),
-                    images: vec![RemoteImageId("/img/1".into())],
+                    images: vec![SnapshotImage::id_only(RemoteImageId("/img/1".into()))],
                 }),
                 exact_image_identity,
             )
@@ -1392,8 +1531,8 @@ mod tests {
                     web_url: Some("https://example.test/new-name".into()),
                     // `/img/3` was added outside RapidRAW and stays ignored.
                     images: vec![
-                        RemoteImageId("/img/1".into()),
-                        RemoteImageId("/img/3".into()),
+                        SnapshotImage::id_only(RemoteImageId("/img/1".into())),
+                        SnapshotImage::id_only(RemoteImageId("/img/3".into())),
                     ],
                 }),
                 exact_image_identity,
@@ -1436,7 +1575,9 @@ mod tests {
                 Some(&ContainerSnapshot {
                     name: "A".into(),
                     web_url: None,
-                    images: vec![RemoteImageId("/api/v2/image/Key-0".into())],
+                    images: vec![SnapshotImage::id_only(RemoteImageId(
+                        "/api/v2/image/Key-0".into(),
+                    ))],
                 }),
                 without_revision,
             )
@@ -2035,6 +2176,349 @@ mod tests {
             PublishState::account_in(dir.path(), "smugmug").is_err(),
             "nor may its account be trusted"
         );
+    }
+
+    fn pending(path: &str, file_name: &str, size: u64, fp: &Fingerprints) -> PendingUpload {
+        PendingUpload {
+            path: path.into(),
+            file_name: file_name.into(),
+            size_bytes: size,
+            edit_hash: fp.edit_hash.clone(),
+            settings_hash: fp.settings_hash.clone(),
+        }
+    }
+
+    fn listed(uri: &str, file_name: &str, size: u64, uploaded_at: &str) -> SnapshotImage {
+        SnapshotImage {
+            id: RemoteImageId(uri.into()),
+            file_name: Some(file_name.into()),
+            size_bytes: Some(size),
+            uploaded_at: Some(uploaded_at.into()),
+        }
+    }
+
+    fn snapshot(images: Vec<SnapshotImage>) -> ContainerSnapshot {
+        ContainerSnapshot {
+            name: "A".into(),
+            web_url: None,
+            images,
+        }
+    }
+
+    fn pending_paths(state: &PublishState, album_id: &str) -> Vec<String> {
+        state
+            .link(album_id)
+            .unwrap()
+            .pending
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_v2_file_without_pending_uploads_saves_back_without_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("smugmug.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 2,
+                "destination": "smugmug",
+                "account": "markallison",
+                "links": { "a": {
+                    "remote_uri": "/api/v2/album/a",
+                    "remote_name": "A",
+                    "web_url": null,
+                    "linked_at": "2026-09-01T10:00:00+00:00",
+                    "last_published": null,
+                    "broken": false,
+                    "images": {}
+                }}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let before = read_json(&path);
+
+        let state = PublishState::load_from(&path, "smugmug", &AlbumMembership::default()).unwrap();
+        assert!(state.link("a").unwrap().pending.is_empty());
+        state.save_to(&path).unwrap();
+
+        assert_eq!(read_json(&path), before);
+    }
+
+    #[test]
+    fn pending_uploads_round_trip_and_a_record_settles_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("smugmug.json");
+        let mut state = published("a", &[]);
+        state
+            .journal_uploads(
+                "a",
+                vec![
+                    pending("/p/1.raf", "1.jpg", 100, &prints("e1", "s1")),
+                    pending("/p/2.raf", "2.jpg", 200, &prints("e2", "s1")),
+                ],
+            )
+            .unwrap();
+        state.save_to(&path).unwrap();
+
+        let written = read_json(&path);
+        assert_eq!(
+            written["links"]["a"]["pending"][1],
+            serde_json::json!({
+                "path": "/p/2.raf",
+                "file_name": "2.jpg",
+                "size_bytes": 200,
+                "edit_hash": "e2",
+                "settings_hash": "s1"
+            })
+        );
+        let mut loaded =
+            PublishState::load_from(&path, "smugmug", &AlbumMembership::default()).unwrap();
+        assert_eq!(loaded, state);
+
+        record(&mut loaded, "a", "/p/1.raf", "/img/1", &prints("e1", "s1"));
+        loaded.forget_pending("a", "/p/2.raf");
+        assert!(pending_paths(&loaded, "a").is_empty());
+        loaded.save_to(&path).unwrap();
+        assert!(
+            read_json(&path)["links"]["a"].get("pending").is_none(),
+            "an empty journal is not written"
+        );
+    }
+
+    #[test]
+    fn journaling_needs_a_link() {
+        let mut state = PublishState::empty("smugmug");
+        assert!(
+            state
+                .journal_uploads(
+                    "a",
+                    vec![pending("/p/1.raf", "1.jpg", 1, &prints("e", "s"))]
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unlinking_or_a_deleted_album_drops_pending_uploads() {
+        let mut state = published("a", &[]);
+        state.record_link("b", &album_uri("b"), None);
+        for album in ["a", "b"] {
+            state
+                .journal_uploads(
+                    album,
+                    vec![pending("/p/1.raf", "1.jpg", 100, &prints("e1", "s1"))],
+                )
+                .unwrap();
+        }
+
+        state.unlink_album("a");
+        state.record_link("a", &album_uri("a"), None);
+        assert!(pending_paths(&state, "a").is_empty());
+
+        state
+            .apply_snapshot("b", None, exact_image_identity)
+            .unwrap();
+        assert!(
+            pending_paths(&state, "b").is_empty(),
+            "the orphans went with the album"
+        );
+    }
+
+    #[test]
+    fn a_pending_upload_found_remotely_is_recorded_with_its_journaled_fingerprints() {
+        let mut state = published("a", &[]);
+        state
+            .journal_uploads(
+                "a",
+                vec![pending("/p/1.raf", "1.jpg", 100, &prints("e-then", "s1"))],
+            )
+            .unwrap();
+
+        let report = state
+            .apply_snapshot(
+                "a",
+                Some(&snapshot(vec![listed(
+                    "/img/1",
+                    "1.jpg",
+                    100,
+                    "2026-09-16T15:43:26Z",
+                )])),
+                exact_image_identity,
+            )
+            .unwrap();
+
+        assert_eq!(report.uploads_found, 1);
+        assert!(pending_paths(&state, "a").is_empty());
+        let adopted = state.image_for("a", "/p/1.raf").unwrap();
+        assert_eq!(adopted.remote_uri, "/img/1");
+        assert_eq!(
+            state.classify("a", "/p/1.raf", &prints("e-now", "s1")),
+            update("/img/1"),
+            "an edit made since the upload still replaces it"
+        );
+        assert_eq!(
+            state.classify("a", "/p/1.raf", &prints("e-then", "s1")),
+            PublishAction::Skip
+        );
+    }
+
+    #[test]
+    fn a_pending_upload_not_found_remotely_is_forgotten() {
+        let mut state = published("a", &[]);
+        state
+            .journal_uploads(
+                "a",
+                vec![pending("/p/1.raf", "1.jpg", 100, &prints("e1", "s1"))],
+            )
+            .unwrap();
+
+        let report = state
+            .apply_snapshot(
+                "a",
+                Some(&snapshot(vec![
+                    listed("/img/9", "9.jpg", 100, "2026-09-16T15:43:26Z"),
+                    listed("/img/1", "1.jpg", 101, "2026-09-16T15:43:26Z"),
+                ])),
+                exact_image_identity,
+            )
+            .unwrap();
+
+        assert_eq!(report.uploads_found, 0);
+        assert!(pending_paths(&state, "a").is_empty());
+        assert_eq!(
+            state.classify("a", "/p/1.raf", &prints("e1", "s1")),
+            PublishAction::New,
+            "a different size is a different file"
+        );
+    }
+
+    #[test]
+    fn an_image_another_record_claims_is_never_adopted() {
+        let mut state = published("a", &[("/p/other.raf", "/img/1", prints("e0", "s1"))]);
+        state
+            .journal_uploads(
+                "a",
+                vec![pending("/p/1.raf", "1.jpg", 100, &prints("e1", "s1"))],
+            )
+            .unwrap();
+
+        state
+            .apply_snapshot(
+                "a",
+                Some(&snapshot(vec![listed(
+                    "/img/1",
+                    "1.jpg",
+                    100,
+                    "2026-09-16T15:43:26Z",
+                )])),
+                exact_image_identity,
+            )
+            .unwrap();
+
+        assert!(state.image_for("a", "/p/1.raf").is_none());
+        assert_eq!(
+            state.image_for("a", "/p/other.raf").unwrap().remote_uri,
+            "/img/1"
+        );
+    }
+
+    #[test]
+    fn a_replacement_that_landed_is_found_under_the_photos_own_record() {
+        let mut state = published("a", &[("/p/1.raf", "/img/1-0", prints("e-old", "s1"))]);
+        state
+            .journal_uploads(
+                "a",
+                vec![pending("/p/1.raf", "1.jpg", 100, &prints("e-new", "s1"))],
+            )
+            .unwrap();
+
+        state
+            .apply_snapshot(
+                "a",
+                Some(&snapshot(vec![listed(
+                    "/img/1-1",
+                    "1.jpg",
+                    100,
+                    "2026-09-16T15:43:26Z",
+                )])),
+                |image: &RemoteImageId| image.0.rsplit_once('-').unwrap().0.to_string(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            state.classify("a", "/p/1.raf", &prints("e-new", "s1")),
+            PublishAction::Skip
+        );
+        assert_eq!(
+            state.image_for("a", "/p/1.raf").unwrap().remote_uri,
+            "/img/1-1"
+        );
+    }
+
+    #[test]
+    fn of_two_matching_images_the_oldest_is_adopted_and_each_only_once() {
+        let mut state = published("a", &[]);
+        state
+            .journal_uploads(
+                "a",
+                vec![
+                    pending("/p/1.raf", "1.jpg", 100, &prints("e1", "s1")),
+                    // The same name and size: a template without `{sequence}`.
+                    pending("/p/1b.raf", "1.jpg", 100, &prints("e1b", "s1")),
+                    pending("/p/1c.raf", "1.jpg", 100, &prints("e1c", "s1")),
+                ],
+            )
+            .unwrap();
+
+        let report = state
+            .apply_snapshot(
+                "a",
+                Some(&snapshot(vec![
+                    listed("/img/newer", "1.jpg", 100, "2026-09-16T15:44:55Z"),
+                    listed("/img/older", "1.jpg", 100, "2026-09-16T15:43:26Z"),
+                ])),
+                exact_image_identity,
+            )
+            .unwrap();
+
+        assert_eq!(report.uploads_found, 2);
+        assert_eq!(
+            state.image_for("a", "/p/1.raf").unwrap().remote_uri,
+            "/img/older"
+        );
+        assert_eq!(
+            state.image_for("a", "/p/1b.raf").unwrap().remote_uri,
+            "/img/newer"
+        );
+        assert!(state.image_for("a", "/p/1c.raf").is_none());
+        assert!(pending_paths(&state, "a").is_empty());
+    }
+
+    #[test]
+    fn a_listing_without_names_or_sizes_adopts_nothing() {
+        let mut state = published("a", &[]);
+        state
+            .journal_uploads(
+                "a",
+                vec![pending("/p/1.raf", "1.jpg", 100, &prints("e1", "s1"))],
+            )
+            .unwrap();
+
+        state
+            .apply_snapshot(
+                "a",
+                Some(&snapshot(vec![SnapshotImage::id_only(RemoteImageId(
+                    "/img/1".into(),
+                ))])),
+                exact_image_identity,
+            )
+            .unwrap();
+
+        assert!(state.image_for("a", "/p/1.raf").is_none());
+        assert!(pending_paths(&state, "a").is_empty());
     }
 
     #[test]

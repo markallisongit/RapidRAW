@@ -249,6 +249,8 @@ pub struct RemoteImageSummary {
     pub file_name: String,
     pub size_bytes: u64,
     pub image_uri: RemoteImageId,
+    /// RFC 3339, when the listing includes it.
+    pub uploaded_at: Option<String>,
     /// From the `ImageMetadata` expansion, when the listing asked for it.
     pub captured_at: Option<CaptureTime>,
     pub camera_model: Option<String>,
@@ -351,6 +353,9 @@ struct RawAlbumImage {
     /// derivative and would not match.
     #[serde(rename = "ArchivedSize", default)]
     archived_size: u64,
+    /// Absent where a listing filters it out.
+    #[serde(rename = "DateTimeUploaded", default)]
+    date_time_uploaded: Option<String>,
     #[serde(rename = "Uris")]
     uris: AlbumImageUris,
 }
@@ -393,6 +398,7 @@ pub fn parse_album_images(body: &str) -> Result<AlbumImagesPage, PublishError> {
                     file_name: image.file_name,
                     size_bytes: image.archived_size,
                     image_uri: RemoteImageId(image.uris.image.uri),
+                    uploaded_at: image.date_time_uploaded,
                     captured_at: metadata.and_then(RawImageMetadata::captured_at),
                     camera_model: metadata
                         .map(|metadata| metadata.model.trim().to_string())
@@ -667,6 +673,7 @@ mod tests {
                 file_name: "DSC_0001.jpg".into(),
                 size_bytes: 4_194_304,
                 image_uri: RemoteImageId("/api/v2/image/XyZ123-0".into()),
+                uploaded_at: None,
                 captured_at: None,
                 camera_model: None,
                 thumbnail_url: None,

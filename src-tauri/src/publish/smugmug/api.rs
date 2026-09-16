@@ -15,7 +15,9 @@ use crate::publish::smugmug::model::{
     Album, AuthUser, ChildNode, RemoteImageSummary, parse_album, parse_album_images,
     parse_auth_user, parse_created_node, parse_node_children, photo_host_url,
 };
-use crate::publish::{ContainerPrivacy, ContainerSnapshot, PublishError, RemoteContainerId};
+use crate::publish::{
+    ContainerPrivacy, ContainerSnapshot, PublishError, RemoteContainerId, SnapshotImage,
+};
 
 /// Overridden only in tests, where a local mock server stands in.
 pub const API_BASE: &str = "https://api.smugmug.com";
@@ -143,7 +145,8 @@ impl SmugMugApi {
         parse_album(&self.get_signed(&url).await?)
     }
 
-    /// The album and the ids of every image it currently contains. A missing
+    /// The album and every image it currently contains, with the name, size
+    /// and upload time an unconfirmed upload is recognised by. A missing
     /// album is not an API failure for refresh; importantly, its image endpoint
     /// is not queried after the 404.
     pub async fn inspect_container(
@@ -159,7 +162,13 @@ impl SmugMugApi {
             .list_album_images(container)
             .await?
             .into_iter()
-            .map(|image| image.image_uri)
+            .map(|image| SnapshotImage {
+                id: image.image_uri,
+                file_name: Some(image.file_name),
+                // Zero is what a listing without the field parses to.
+                size_bytes: Some(image.size_bytes).filter(|size| *size > 0),
+                uploaded_at: image.uploaded_at,
+            })
             .collect();
         Ok(Some(ContainerSnapshot {
             name: album.name,
@@ -741,7 +750,13 @@ mod tests {
         );
         assert_eq!(
             snapshot.images,
-            [RemoteImageId("/api/v2/image/DSC0001jpg-0".into())]
+            [SnapshotImage {
+                id: RemoteImageId("/api/v2/image/DSC0001jpg-0".into()),
+                file_name: Some("DSC_0001.jpg".into()),
+                size_bytes: Some(4_194_304),
+                uploaded_at: Some("2026-09-16T15:43:26+00:00".into()),
+            }],
+            "enough to recognise an upload whose response was lost"
         );
     }
 
@@ -944,6 +959,7 @@ mod tests {
                 json!({
                     "FileName": name,
                     "ArchivedSize": 4_194_304,
+                    "DateTimeUploaded": "2026-09-16T15:43:26+00:00",
                     "Uri": format!("/api/v2/album/AbCdEf/image/{}-0", key(name)),
                     "Uris": { "Image": { "Uri": format!("/api/v2/image/{}-0", key(name)) } }
                 })

@@ -131,6 +131,7 @@ export interface RefreshReport {
   broken: number;
   restored: number;
   images_missing: number;
+  uploads_found: number;
 }
 
 export type ItemState = 'skipped' | 'uploaded' | 'updated' | 'failed' | 'ambiguous';
