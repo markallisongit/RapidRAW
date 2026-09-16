@@ -252,7 +252,8 @@ pub struct RemoteImageSummary {
     /// From the `ImageMetadata` expansion, when the listing asked for it.
     pub captured_at: Option<CaptureTime>,
     pub camera_model: Option<String>,
-    /// SmugMug's `Th` size, a square crop.
+    /// The `S` size: the whole picture, uncropped, from the
+    /// `ImageSizeDetails` expansion.
     pub thumbnail_url: Option<String>,
 }
 
@@ -276,6 +277,21 @@ struct AlbumImagesEnvelope {
 struct Expansion {
     #[serde(rename = "ImageMetadata")]
     image_metadata: Option<RawImageMetadata>,
+    #[serde(rename = "ImageSizeDetails")]
+    image_size_details: Option<RawImageSizeDetails>,
+}
+
+/// The sizes SmugMug renders of an image, trimmed to the one matching reads.
+#[derive(Debug, Deserialize)]
+struct RawImageSizeDetails {
+    #[serde(rename = "ImageSizeSmall")]
+    image_size_small: Option<RawImageSize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawImageSize {
+    #[serde(rename = "Url", default)]
+    url: String,
 }
 
 /// SmugMug's reading of the photo's embedded metadata.
@@ -335,8 +351,6 @@ struct RawAlbumImage {
     /// derivative and would not match.
     #[serde(rename = "ArchivedSize", default)]
     archived_size: u64,
-    #[serde(rename = "ThumbnailUrl", default)]
-    thumbnail_url: Option<String>,
     #[serde(rename = "Uris")]
     uris: AlbumImageUris,
 }
@@ -349,6 +363,8 @@ struct AlbumImageUris {
     image: UriRef,
     #[serde(rename = "ImageMetadata", default)]
     image_metadata: Option<UriRef>,
+    #[serde(rename = "ImageSizeDetails", default)]
+    image_size_details: Option<UriRef>,
 }
 
 /// One page of an album's images, with each image's metadata where the
@@ -364,12 +380,15 @@ pub fn parse_album_images(body: &str) -> Result<AlbumImagesPage, PublishError> {
             .album_image
             .into_iter()
             .map(|image| {
-                let metadata = image
-                    .uris
-                    .image_metadata
-                    .as_ref()
-                    .and_then(|uri| expansions.get(&uri.uri))
+                let expansion =
+                    |uri: &Option<UriRef>| uri.as_ref().and_then(|uri| expansions.get(&uri.uri));
+                let metadata = expansion(&image.uris.image_metadata)
                     .and_then(|expansion| expansion.image_metadata.as_ref());
+                let thumbnail_url = expansion(&image.uris.image_size_details)
+                    .and_then(|expansion| expansion.image_size_details.as_ref())
+                    .and_then(|sizes| sizes.image_size_small.as_ref())
+                    .map(|size| size.url.clone())
+                    .filter(|url| !url.is_empty());
                 RemoteImageSummary {
                     file_name: image.file_name,
                     size_bytes: image.archived_size,
@@ -378,7 +397,7 @@ pub fn parse_album_images(body: &str) -> Result<AlbumImagesPage, PublishError> {
                     camera_model: metadata
                         .map(|metadata| metadata.model.trim().to_string())
                         .filter(|model| !model.is_empty()),
-                    thumbnail_url: image.thumbnail_url.filter(|url| !url.is_empty()),
+                    thumbnail_url,
                 }
             })
             .collect(),
@@ -386,20 +405,16 @@ pub fn parse_album_images(body: &str) -> Result<AlbumImagesPage, PublishError> {
     })
 }
 
-/// The uncropped `S` size (within 300 px) of the square `Th` thumbnail an
-/// album listing names, on SmugMug's photo host only. `None` for any other
-/// URL, which is never fetched.
-pub fn whole_picture_thumbnail(thumbnail_url: &str) -> Option<String> {
-    let rest = thumbnail_url.strip_prefix("https://")?;
-    let (host, path) = rest.split_once('/')?;
-    if host != "smugmug.com" && !host.ends_with(".smugmug.com") {
-        return None;
-    }
-    let (dir, file) = path.rsplit_once('/')?;
-    let dir = dir.strip_suffix("/Th")?;
-    let (stem, extension) = file.rsplit_once('.')?;
-    let stem = stem.strip_suffix("-Th")?;
-    Some(format!("https://{host}/{dir}/S/{stem}-S.{extension}"))
+/// `url` when SmugMug's photo host serves it, and `None` for any other URL,
+/// which is never fetched.
+///
+/// A rendered size is served unsigned, because its URL carries an access
+/// token of its own. That token is issued for one size: no other size's URL
+/// can be derived from it, so a listing's URL is fetched exactly as given.
+pub fn photo_host_url(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("https://")?;
+    let (host, _) = rest.split_once('/')?;
+    (host == "smugmug.com" || host.ends_with(".smugmug.com")).then_some(url)
 }
 
 /// What the upload host answered, once HTTP itself has succeeded.
@@ -668,9 +683,9 @@ mod tests {
                         "FileName": "A67023312026-09-11.jpg",
                         "ArchivedSize": 4152509,
                         "DateTimeOriginal": "2026-09-12T01:18:07+00:00",
-                        "ThumbnailUrl": "https://photos.smugmug.com/Paramotoring/i-RQHrBvT/0/MtW3/Th/A67023312026-09-11-Th.jpg",
                         "Uris": {
                             "ImageMetadata": { "Uri": "/api/v2/image/RQHrBvT-0!metadata?_filter=Model" },
+                            "ImageSizeDetails": { "Uri": "/api/v2/image/RQHrBvT-0!sizedetails" },
                             "Image": { "Uri": "/api/v2/image/RQHrBvT-0" }
                         }
                     },
@@ -683,8 +698,10 @@ mod tests {
                     },
                     {
                         "FileName": "scan.jpg",
-                        "ThumbnailUrl": "",
-                        "Uris": { "Image": { "Uri": "/api/v2/image/Scan-0" } }
+                        "Uris": {
+                            "ImageSizeDetails": { "Uri": "/api/v2/image/Scan-0!sizedetails" },
+                            "Image": { "Uri": "/api/v2/image/Scan-0" }
+                        }
                     }
                 ]
             },
@@ -703,6 +720,20 @@ mod tests {
                         "DateTimeCreated": "2026-09-11T17:31:52",
                         "MicroDateTimeCreated": "2026-09-11T17:31:52.458+01:00"
                     }
+                },
+                "/api/v2/image/RQHrBvT-0!sizedetails": {
+                    "Locator": "ImageSizeDetails",
+                    "ImageSizeDetails": {
+                        "ImageUrlTemplate": "https://photos.smugmug.com/photos/i-RQHrBvT/0/#size#/i-RQHrBvT-#size#.jpg",
+                        "ImageSizeSmall": {
+                            "Url": "https://photos.smugmug.com/photos/i-RQHrBvT/0/MPcdXf4tdgrpc3pR2SV7B4Fhsr8mnL9djskBBPsgv/S/i-RQHrBvT-S.jpg",
+                            "Width": 400,
+                            "Height": 300
+                        }
+                    }
+                },
+                "/api/v2/image/Scan-0!sizedetails": {
+                    "ImageSizeDetails": { "ImageSizeSmall": { "Url": "" } }
                 }
             },
             "Code": 200
@@ -724,8 +755,9 @@ mod tests {
         assert_eq!(
             images[0].thumbnail_url.as_deref(),
             Some(
-                "https://photos.smugmug.com/Paramotoring/i-RQHrBvT/0/MtW3/Th/A67023312026-09-11-Th.jpg"
-            )
+                "https://photos.smugmug.com/photos/i-RQHrBvT/0/MPcdXf4tdgrpc3pR2SV7B4Fhsr8mnL9djskBBPsgv/S/i-RQHrBvT-S.jpg"
+            ),
+            "the S size the expansion named, which no other size's URL implies"
         );
         assert_eq!(
             images[1].captured_at,
@@ -733,25 +765,25 @@ mod tests {
         );
         assert_eq!(images[2].captured_at, None);
         assert_eq!(images[2].camera_model, None);
-        assert_eq!(images[2].thumbnail_url, None);
+        assert_eq!(images[1].thumbnail_url, None, "no size expansion to read");
+        assert_eq!(images[2].thumbnail_url, None, "an empty URL is no URL");
     }
 
     #[test]
-    fn the_whole_picture_thumbnail_is_the_s_size_on_smugmugs_host_only() {
+    fn only_a_url_on_smugmugs_photo_host_is_fetched_and_it_is_fetched_as_given() {
+        let url = "https://photos.smugmug.com/photos/i-R/0/MtW3WZ/S/i-R-S.jpg";
+        assert_eq!(photo_host_url(url), Some(url));
         assert_eq!(
-            whole_picture_thumbnail(
-                "https://photos.smugmug.com/Other/2026/i-RQHrBvT/0/MtW3WZ/Th/A67023312026-09-11-Th.jpg"
-            )
-            .as_deref(),
-            Some("https://photos.smugmug.com/Other/2026/i-RQHrBvT/0/MtW3WZ/S/A67023312026-09-11-S.jpg")
+            photo_host_url("https://smugmug.com/photos/i-R/0/MtW3WZ/S/i-R-S.jpg"),
+            Some("https://smugmug.com/photos/i-R/0/MtW3WZ/S/i-R-S.jpg")
         );
         for refused in [
-            "http://photos.smugmug.com/i-R/0/K/Th/a-Th.jpg",
-            "https://photos.smugmug.com.example.org/i-R/0/K/Th/a-Th.jpg",
-            "https://example.org/i-R/0/K/Th/a-Th.jpg",
-            "https://photos.smugmug.com/i-R/0/K/M/a-M.jpg",
+            "http://photos.smugmug.com/i-R/0/K/S/a-S.jpg",
+            "https://photos.smugmug.com.example.org/i-R/0/K/S/a-S.jpg",
+            "https://example.org/i-R/0/K/S/a-S.jpg",
+            "https://photos.smugmug.com",
         ] {
-            assert_eq!(whole_picture_thumbnail(refused), None, "{refused}");
+            assert_eq!(photo_host_url(refused), None, "{refused}");
         }
     }
 

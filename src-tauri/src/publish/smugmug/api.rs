@@ -13,7 +13,7 @@ use crate::publish::oauth1::{self, Credentials};
 use crate::publish::smugmug::auth::{body_or_error, client, transport};
 use crate::publish::smugmug::model::{
     Album, AuthUser, ChildNode, RemoteImageSummary, parse_album, parse_album_images,
-    parse_auth_user, parse_created_node, parse_node_children, whole_picture_thumbnail,
+    parse_auth_user, parse_created_node, parse_node_children, photo_host_url,
 };
 use crate::publish::{ContainerPrivacy, ContainerSnapshot, PublishError, RemoteContainerId};
 
@@ -22,17 +22,21 @@ pub const API_BASE: &str = "https://api.smugmug.com";
 
 /// The fields [`SmugMugApi::list_album_images_detailed`] reads.
 const IMAGE_DETAIL_FILTER: &str =
-    "_filter=FileName,ArchivedSize,ThumbnailUrl&_filteruri=Image,ImageMetadata";
+    "_filter=FileName,ArchivedSize&_filteruri=Image,ImageMetadata,ImageSizeDetails";
 
-/// Inlines each image's metadata, trimmed to what matching compares.
-fn image_metadata_expansion() -> String {
+/// Inlines each image's metadata and the `S` size of its rendering, both
+/// trimmed to what matching compares. The size has to be asked for: its URL
+/// carries an access token issued for that one size, so it cannot be derived
+/// from the `ThumbnailUrl` the listing would otherwise give.
+fn image_detail_expansions() -> String {
     let config = json!({
         "expand": {
-            "ImageMetadata": { "filter": ["Model", "DateTimeCreated", "MicroDateTimeCreated"] }
+            "ImageMetadata": { "filter": ["Model", "DateTimeCreated", "MicroDateTimeCreated"] },
+            "ImageSizeDetails": { "filter": ["ImageSizeSmall"] }
         }
     });
     format!(
-        "_expand=ImageMetadata&_config={}",
+        "_expand=ImageMetadata,ImageSizeDetails&_config={}",
         oauth1::percent_encode(&config.to_string())
     )
 }
@@ -226,10 +230,10 @@ impl SmugMugApi {
     }
 
     /// [`list_album_images`](Self::list_album_images) with what matching
-    /// photos already in the album needs: each image's capture time and
-    /// camera model, inlined by the `ImageMetadata` expansion rather than a
-    /// request per image, and its thumbnail URL. Trimmed to those fields, a
-    /// page is a quarter the size of a plain listing.
+    /// photos already in the album needs: each image's capture time, camera
+    /// model and the URL of a small rendering of it, inlined by expansions
+    /// rather than two requests per image. Trimmed to those fields, a page
+    /// stays smaller than a plain listing.
     pub async fn list_album_images_detailed(
         &self,
         album: &RemoteContainerId,
@@ -242,8 +246,8 @@ impl SmugMugApi {
 
         while let Some(url) = next {
             // `NextPage` keeps `_filter` and `_filteruri` but drops `_expand`
-            // and `_config`, so every page asks for the expansion again.
-            let url = format!("{url}&{}", image_metadata_expansion());
+            // and `_config`, so every page asks for the expansions again.
+            let url = format!("{url}&{}", image_detail_expansions());
             let page = parse_album_images(&self.get_signed(&url).await?)?;
             images.extend(page.images);
             next = page
@@ -254,14 +258,13 @@ impl SmugMugApi {
         Ok(images)
     }
 
-    /// A thumbnail's bytes. SmugMug serves them from its photo host by URL,
-    /// unsigned: the URL itself carries the image's key. Only
-    /// [`whole_picture_thumbnail`] URLs are fetched.
+    /// A thumbnail's bytes, from the URL the listing gave, unchanged: it is
+    /// signed for that one size. Only [`photo_host_url`] URLs are fetched.
     pub async fn thumbnail(&self, thumbnail_url: &str) -> Result<Option<Vec<u8>>, PublishError> {
-        let Some(url) = whole_picture_thumbnail(thumbnail_url) else {
+        let Some(url) = photo_host_url(thumbnail_url) else {
             return Ok(None);
         };
-        let response = self.client.get(&url).send().await.map_err(transport)?;
+        let response = self.client.get(url).send().await.map_err(transport)?;
         if !response.status().is_success() {
             return Err(PublishError::Network(format!(
                 "HTTP {} fetching a thumbnail",
@@ -866,16 +869,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_detailed_listing_asks_for_metadata_on_every_page() {
+    async fn the_detailed_listing_asks_for_metadata_and_a_size_on_every_page() {
         let server = MockServer::start().await;
         let album = RemoteContainerId("/api/v2/album/AbCdEf".into());
         let images_path = "/api/v2/album/AbCdEf!images";
         // As SmugMug writes it: the filters kept, the expansion dropped.
         let next = format!(
-            "{images_path}?count=100&_filter=FileName,ArchivedSize,ThumbnailUrl&_filteruri=Image,ImageMetadata&start=2"
+            "{images_path}?count=100&_filter=FileName,ArchivedSize&_filteruri=Image,ImageMetadata,ImageSizeDetails&start=2"
         );
         let with_metadata = |name: &str, model: &str, next_page: Option<&str>| {
             let metadata_uri = format!("/api/v2/image/{}-0!metadata", key(name));
+            let sizes_uri = format!("/api/v2/image/{}-0!sizedetails", key(name));
+            let small = format!(
+                "https://photos.smugmug.com/photos/i-{}/0/MtW3WZ/S/i-{0}-S.jpg",
+                key(name)
+            );
             json!({
                 "Response": {
                     "AlbumImage": [{
@@ -883,6 +891,7 @@ mod tests {
                         "Uris": {
                             "Image": { "Uri": format!("/api/v2/image/{}-0", key(name)) },
                             "ImageMetadata": { "Uri": metadata_uri.clone() },
+                            "ImageSizeDetails": { "Uri": sizes_uri.clone() },
                         }
                     }],
                     "Pages": match next_page {
@@ -891,7 +900,8 @@ mod tests {
                     },
                 },
                 "Expansions": {
-                    metadata_uri: { "ImageMetadata": { "Model": model, "DateTimeCreated": "2026-09-11T18:18:07" } }
+                    metadata_uri: { "ImageMetadata": { "Model": model, "DateTimeCreated": "2026-09-11T18:18:07" } },
+                    sizes_uri: { "ImageSizeDetails": { "ImageSizeSmall": { "Url": small } } },
                 },
                 "Code": 200
             })
@@ -900,15 +910,18 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(images_path))
             .and(query_param_is_missing("start"))
-            .and(query_param("_expand", "ImageMetadata"))
-            .and(query_param("_filteruri", "Image,ImageMetadata"))
+            .and(query_param("_expand", "ImageMetadata,ImageSizeDetails"))
+            .and(query_param(
+                "_filteruri",
+                "Image,ImageMetadata,ImageSizeDetails",
+            ))
             .respond_with(ok(with_metadata("A.jpg", "ILCE-6700", Some(&next))))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path(images_path))
             .and(query_param("start", "2"))
-            .and(query_param("_expand", "ImageMetadata"))
+            .and(query_param("_expand", "ImageMetadata,ImageSizeDetails"))
             .respond_with(ok(with_metadata("B.jpg", "Pixel 8a", None)))
             .mount(&server)
             .await;
@@ -921,6 +934,7 @@ mod tests {
         let models: Vec<Option<&str>> = images.iter().map(|i| i.camera_model.as_deref()).collect();
         assert_eq!(models, [Some("ILCE-6700"), Some("Pixel 8a")]);
         assert!(images.iter().all(|image| image.captured_at.is_some()));
+        assert!(images.iter().all(|image| image.thumbnail_url.is_some()));
     }
 
     fn images_page(file_names: &[&str], next_page: Option<&str>) -> String {
