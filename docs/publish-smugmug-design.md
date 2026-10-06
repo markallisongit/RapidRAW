@@ -1,11 +1,11 @@
 # RapidRAW → SmugMug publishing
 
-**Design document** · 2026-09-12, updated 2026-09-13 · Mark Allison (with Claude)
+**Design document** · 2026-09-12, updated 2026-10-06 · Mark Allison (with Claude)
 Target: [CyberTimon/RapidRAW](https://github.com/CyberTimon/RapidRAW) · Fork: [markallisongit/RapidRAW](https://github.com/markallisongit/RapidRAW) · Branch: `feat/publish-destinations-smugmug`
 
-**Implementation:** phase 1 tracked in [#13](https://github.com/markallisongit/RapidRAW/issues/13) (issues [#1](https://github.com/markallisongit/RapidRAW/issues/1)–[#12](https://github.com/markallisongit/RapidRAW/issues/12)); the Publish Manager batch in [#14](https://github.com/markallisongit/RapidRAW/issues/14) (issues [#15](https://github.com/markallisongit/RapidRAW/issues/15)–[#24](https://github.com/markallisongit/RapidRAW/issues/24)). Each issue carries its own task detail; this document is the rationale only.
+**Implementation:** phase 1 tracked in [#13](https://github.com/markallisongit/RapidRAW/issues/13) (issues [#1](https://github.com/markallisongit/RapidRAW/issues/1)–[#12](https://github.com/markallisongit/RapidRAW/issues/12)); the Publish Manager batch in [#14](https://github.com/markallisongit/RapidRAW/issues/14) (issues [#15](https://github.com/markallisongit/RapidRAW/issues/15)–[#29](https://github.com/markallisongit/RapidRAW/issues/29) and [#34](https://github.com/markallisongit/RapidRAW/issues/34)). Each issue carries its own task detail; this document is the rationale only.
 
-**Status:** phase 1 complete: all twelve issues closed, and tested end-to-end against a live SmugMug account on 2026-09-13. The #14 batch is in progress; [#15](https://github.com/markallisongit/RapidRAW/issues/15) (Publish as a panel tab) is done. This document describes what is implemented, and #24 brings it fully up to date at the end of the batch.
+**Status:** phase 1 complete, tested end-to-end against a live SmugMug account on 2026-09-13. The Publish Manager batch is built; its full manual walk passed on Linux on 2026-10-06 ([#28](https://github.com/markallisongit/RapidRAW/issues/28)), and the Windows walk ([#29](https://github.com/markallisongit/RapidRAW/issues/29)) is what remains. This document describes the code as it is.
 
 ## Summary
 
@@ -16,15 +16,16 @@ S3, Immich) are cheap. Images spool to a managed temp dir, upload, and are delet
 **In scope:** one-action publish; republish replaces rather than duplicates; unchanged photos
 skipped; full reuse of the export pipeline; resumable; guaranteed cleanup; no secrets in the binary.
 
-**Out (phase 1):** delete sync, comment/rating pull, rename sync, `Group` tree mirroring, video,
-other destinations.
+**Out:** delete sync, comment/rating pull, pushing renames to the destination, `Group` tree
+mirroring, video, downloading destination-only photos, several accounts per destination, other
+destinations.
 
 ## Decisions
 
 | #   | Question      | Decision                                                                                           |
 | --- | ------------- | -------------------------------------------------------------------------------------------------- |
 | 1   | Sync model    | Publish, phased. Remote-ID map + skip-unchanged in phase 1                                         |
-| 2   | Mapping       | One RapidRAW `Album` → one SmugMug album under the account root. `Group` path folded into the name |
+| 2   | Mapping       | One RapidRAW `Album` → one SmugMug album. Phase 1 found or created it by name; superseded by 13    |
 | 3   | Credentials   | User supplies their own API key/secret. Nothing embedded                                           |
 | 4   | Token storage | OS keyring (`keyring` 4.2). Explicit error where unavailable, no plaintext fallback                |
 | 5   | OAuth         | Hand-rolled `oauth1` module over `hmac`/`sha1` (~150 lines)                                        |
@@ -32,6 +33,20 @@ other destinations.
 | 7   | Byte path     | Spool to managed temp dir, upload from disk, delete on success                                     |
 | 8   | Pipeline      | Call existing `export_images_impl` unmodified with a temp output folder                            |
 | 9   | Idempotency   | Stable `X-Smug-UploadRequestId` per image + post-timeout reconciliation                            |
+
+The Publish Manager batch (#14, decided 2026-09-13) added:
+
+| #   | Question                 | Decision                                                                                                                                                  |
+| --- | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 10  | Where publishing lives   | A native dockable panel tab, `Panel.Publish`, beside Metadata and Export — not a button by the bottom bar. A few more upstream lines, built as upstream would |
+| 11  | Where set-up lives       | A **Publish Manager** modal opened from the panel. Not a Settings category (`SettingsPanel.tsx` is large and busy upstream), not in-panel pages (350 px is too narrow for two panes) |
+| 12  | Output settings          | Each destination uses one existing **export preset**, never the Export panel's current values. Changing it asks: republish affected photos, or keep the uploads |
+| 13  | Album mapping            | **Explicit links**, like Lightroom's published collections: link to a remote album that exists (including one made outside RapidRAW), or create one. Nothing is found or created by name at publish time |
+| 14  | Sync                     | Linking plus a read-only **refresh** from the destination. No download of destination-only photos, no comment/rating pull, no delete sync               |
+| 15  | New-album privacy        | A destination setting, default **Public**, matching SmugMug's own Lightroom plugin (`SmNode.create` sets `Privacy = PUBLIC` when none is chosen; plugin 3.5.19.1 bytecode). Stated before an album is created, never applied to one that is linked |
+| 16  | Right-click publish      | "Publish to ▸" on albums in Sources                                                                                                                       |
+| 17  | Deleting a linked album  | Nothing is deleted remotely. A persistent notice names the remote album left behind, in the destination's own terms, with its URL                        |
+| 18  | Several accounts         | Not built. One configuration per destination type                                                                                                         |
 
 Rationale for the contentious ones. **User keys (3):** an embedded consumer secret in an
 open-source desktop binary is trivially extractable and puts CyberTimon on the hook for every
@@ -68,8 +83,8 @@ bandwidth, and runs uploads on a pool separate from rendering.
 
 ## Architecture
 
-**Pipeline.** `export_images_impl` (`export_processing.rs:862`) is already `pub(crate)` and takes a
-completion channel; `run_headless_export` (`:1352`) is a working template for calling it outside
+**Pipeline.** `export_images_impl` (`export_processing.rs`) is already `pub(crate)` and takes a
+completion channel; `run_headless_export` is a working template for calling it outside
 the command layer. A publish session does the same with a temp output folder.
 
 **Chunking.** Process in chunks of 8 — render chunk _n+1_ while uploading chunk _n_, so the GPU and
@@ -78,17 +93,23 @@ the network overlap and the spool stays bounded at ~16 images (~320 MB at 45 MP)
 **Spool.** `app_cache_dir/publish-spool/<session_uuid>/` — cache, not data: regenerable, and the OS
 already treats it as disposable. Write a `session.json` marker with pid and start time; delete each
 file _immediately_ on upload success so the footprint tracks outstanding work; remove the directory
-via a `Drop` guard on every exit path, mirroring `ExportTaskGuard` (`:307-409`). `Drop` can't run
+via a `Drop` guard on every exit path, mirroring `ExportTaskGuard`. `Drop` can't run
 after SIGKILL, so also sweep at startup for sessions >24 h old or with a dead pid. Never surfaced
 to the user.
 
-**Concurrency.** The export loop sizes its pool from cores and free RAM (`:900-915`, clamped 1–4) —
+**Concurrency.** The export loop sizes its pool from cores and free RAM (clamped 1–4) —
 a GPU heuristic, wrong for network I/O. Publishing uses a separate semaphore, default 3.
 
 **Retry.** Exponential backoff with jitter on 5xx and 429, honouring `Retry-After`, max 4 attempts,
 same request id throughout. Timeouts are derived from measured throughput and file size — fixed
 values are wrong when sizes vary 20× and uplinks 100×. Cancellation reuses the `AtomicBool` pattern
-from `cancel_export` (`:1455`).
+from `cancel_export`, and an upload in flight is raced against it, so cancelling a stalled upload
+does not wait out its timeout; one abandoned that way reports as unconfirmed.
+
+**A dead connection stops the session.** Without that, every remaining photo would spend its full
+retry schedule (about 35 s each) failing. Once `OFFLINE_STREAK` uploads in a row (one per upload
+slot) fail on the transport or go unconfirmed, the session stops and reports the rest as not
+tried. Publishing again picks up where it left off.
 
 **Ambiguous failures.** A timeout may or may not have committed; blind retry risks a duplicate,
 giving up risks a missing photo. Retry with the same request id; if exhausted, mark _ambiguous_,
@@ -107,6 +128,27 @@ several match), and the rest are forgotten. Rendering is deterministic, so name 
 an upload RapidRAW made. A settled photo is reported as uploaded, and an edit made since still
 replaces it. A destination that cannot list discards its journal.
 
+**Refresh is read-only towards the destination.** `refresh_destination` (`session.rs`) asks
+`inspect_container` for each link's current name and images and applies the snapshot to the state
+(`PublishState::apply_snapshot`): a renamed remote album updates the link's `remote_name`; a
+missing one marks the link `broken` and keeps its image records in case it comes back; a recorded
+image no longer in a live album is forgotten, so the next publish uploads that photo afresh instead
+of replacing an id that is gone. It never renames, recreates, deletes or uploads anything. The same
+refresh, for one link, runs at the start of every publish, so a publish never replaces into a
+deleted image and never renders for a deleted album: a broken link stops it before the spool
+exists. Pressing ↻ runs it for every link.
+
+**Photos a remote album already holds** (`links.rs`, #26 and #27). Linking to an album that was
+filled by hand, or by an earlier install, would otherwise upload everything again. The matcher
+pairs local photos with remote images, strongest evidence first: the exact name publishing would
+give the photo; the source file's stem inside the remote name; the same capture time on the same
+camera model; and a perceptual hash of the thumbnails (`image_hasher` double-gradient, as
+`culling.rs` uses; edited-photo pairs measured 0–4 bits apart, different photos 36 or more). Each
+photo and each remote image is in at most one pair, and a tie pairs nothing. Only exact names are
+adopted unseen. Every other pair is shown side by side for the user to tick, because a wrong pair
+would make the next edit overwrite a different photo. An adopted image is recorded with the
+current fingerprints, as if just published.
+
 ### The trait
 
 ```rust
@@ -119,6 +161,8 @@ pub trait PublishDestination: Send + Sync {
     async fn auth_status(&self, ctx: &PublishContext) -> Result<AuthStatus, PublishError>;
     async fn begin_auth(&self, ctx: &PublishContext) -> Result<AuthChallenge, PublishError>;
     async fn complete_auth(&self, verifier: &str, ctx: &PublishContext) -> Result<(), PublishError>;
+    /// Forgets the access token only: consumer key, state and links survive.
+    async fn disconnect(&self, ctx: &PublishContext) -> Result<(), PublishError>;
 
     /// The remote album tree, a level at a time, for linking to an album that exists.
     async fn list_containers(&self, parent: Option<&RemoteNodeId>, ctx: &PublishContext)
@@ -126,10 +170,23 @@ pub trait PublishDestination: Send + Sync {
     /// Linking to a new album: find reports a same-named one, so create never reuses it.
     async fn find_container(&self, name: &str, ctx: &PublishContext)
         -> Result<Option<RemoteNode>, PublishError>;
+    /// With `ctx.new_container_privacy`.
     async fn create_container(&self, name: &str, ctx: &PublishContext)
         -> Result<RemoteNode, PublishError>;
     async fn container(&self, id: &RemoteContainerId, ctx: &PublishContext)
         -> Result<RemoteNode, PublishError>;
+
+    /// Read-only, for refresh: name and images now, or `None` when it is gone.
+    async fn inspect_container(&self, id: &RemoteContainerId, ctx: &PublishContext)
+        -> Result<Option<ContainerSnapshot>, PublishError>;
+    /// Read-only, for adopting photos a linked album already holds.
+    async fn list_container_images(&self, id: &RemoteContainerId, ctx: &PublishContext)
+        -> Result<Vec<RemoteImage>, PublishError>;
+    /// Thumbnail bytes for the review of possible pairs. Default: none.
+    async fn fetch_thumbnail(&self, image: &RemoteImage, ctx: &PublishContext)
+        -> Result<Option<Vec<u8>>, PublishError>;
+    /// Compares ids across listings; SmugMug strips the revision suffix (`-0`, `-1`).
+    fn image_identity(&self, image: &RemoteImageId) -> String;
 
     async fn publish_image(&self, item: &PublishItem<'_>, ctx: &PublishContext)
         -> Result<RemoteImageId, PublishError>;
@@ -156,7 +213,10 @@ pub struct PublishItem<'a> {
 `Content-MD5` and sends that buffer, which is its business. It buffers rather than streams: the
 project's `reqwest` has no `stream` feature, and three concurrent 5–25 MB buffers are cheap.
 `DestinationCapabilities` (`supports_replace`, `supports_reconcile`, `supports_nested_containers`,
-`max_bytes`, `accepted_mime_types`) means the session never special-cases on `id()`. `async-trait` is required: `dyn` async traits aren't
+`max_bytes`, `accepted_mime_types`, `supported_privacy`) means the session never special-cases on
+`id()`. `supported_privacy` lists the `ContainerPrivacy` levels (`Public`, `Unlisted`, `Private`;
+destination-neutral, each destination maps them onto its own terms) the manager offers for new
+albums. `async-trait` is required: `dyn` async traits aren't
 object-safe without boxing on Rust 1.98.
 
 The registry is a plain `Vec<Arc<dyn PublishDestination>>` with an explicit constructor, not
@@ -166,7 +226,7 @@ for the fork.
 ### Publish state
 
 `app_data_dir/publish/<destination_id>.json`, mirroring `albums/albums.json`
-(`file_management.rs:838-847`). Written atomically (temp + rename) after each success, so an
+(`file_management.rs`). Written atomically (temp + rename) after each success, so an
 interrupted publish resumes.
 
 ```jsonc
@@ -205,13 +265,24 @@ interrupted publish resumes.
 }
 ```
 
+**Settings live in a separate file**, `app_data_dir/publish/<destination_id>.settings.json`
+(`settings.rs`): the export preset id and the privacy of new albums, versioned on their own.
+Settings are a few bytes the user edits and state is large and machine-written, so neither
+rewrites the other. They stay out of `AppSettings` too, since only publishing reads them and that
+struct and its frontend mirror are busy upstream files. A missing file means the defaults, but an
+unreadable one is an error: quietly falling back to Public would publish more widely than chosen.
+
 `account` is `null` until the first publish, and `web_url` is `null` where SmugMug returns none.
 The account is read and written on its own (`PublishState::account_in` / `set_account_in`), so
 connecting never loads — or migrates — the image records.
 
 **Image records live under their link.** A photo in two RapidRAW albums is two uploads, one into
 each remote album, each replaced or skipped on its own. Relinking an album to a *different*
-remote album drops its records, which describe images in the old album.
+remote album drops its records, which describe images in the old album. Version 1 keyed image
+records on the virtual path alone, account-wide: a photo in two albums was skipped for the second
+album's gallery as already published, or, once edited, replaced the copy in the first gallery.
+Explicit linking would have made that common, which is why v2 nests the records (#16). A remote
+album belongs to at most one link, so two RapidRAW albums can never publish into the same one.
 
 **Pending uploads live under their link too**, so unlinking, or relinking elsewhere, drops them,
 and a link whose album has gone clears them. `pending` is omitted when empty, so adding it needed
@@ -220,7 +291,7 @@ image sidecar, which would drop an unknown field on the next edit and would carr
 ids into files that get synced and shared.
 
 **Key on the full virtual path**, not the source path — virtual copies use a `vc=` suffix
-(`export_processing.rs:937-942`, named `_VCnn` at `:1034-1038`) and are distinct publishable photos.
+(parsed in `export_images_impl`, which names them `_VCnn`) and are distinct publishable photos.
 
 **The fingerprint is Lightroom's `metadataThatTriggersRepublish`, split in two:**
 `edit_hash = blake3(source_mtime, source_size, adjustments_json)` and
@@ -233,7 +304,9 @@ marks them current without rendering. The settings come from the destination's e
 (`preset.rs`), never the Export panel's current values. `relevant_export_settings`
 (`state.rs`) leaves out `destination_type`, `subfolder`, `preserve_folders` and
 `filename_template`, which decide where a file lands, not what is in it — otherwise renaming the
-output template would re-upload the whole library.
+output template would re-upload the whole library. Border and padding, added to presets upstream
+after phase 1, count as settings but are left out of the hash while unset, so records made before
+they existed keep their hash rather than all turning "affected by settings".
 
 **Migration from version 1** (phase 1's `containers` plus path-keyed `images`) runs on load and is
 written as version 2 by the next save. Each container becomes a link. A v1 image record is copied
@@ -253,19 +326,26 @@ src-tauri/src/publish/
   commands.rs          Tauri commands, startup spool sweep
   session.rs           chunked render→upload driver, progress events, cancellation
   spool.rs             temp dir lifecycle, Drop guard, startup sweep
-  state.rs             links, per-link remote ID map, split fingerprints, v1 migration
+  state.rs             links, per-link remote ID map, split fingerprints, pending uploads,
+                       snapshots from refresh, v1 migration
+  settings.rs          <id>.settings.json: export preset id, new-album privacy
+  preset.rs            the destination's export preset → ExportSettings for the pipeline
+  links.rs             link/unlink, list links, match and adopt photos already in an album
   oauth1.rs            OAuth 1.0a signing — generic, no SmugMug specifics
   credential_store.rs  keyring access for consumer keys and tokens
-  smugmug/             mod.rs · auth.rs (OAuth flow) · api.rs (album lookup/create)
-                       upload.rs (raw-body POST, retry, reconcile) · model.rs
+  smugmug/             mod.rs · auth.rs (OAuth flow) · api.rs (album tree, lookup, create, listing)
+                       upload.rs (raw-body POST, retry, cancel, reconcile) · model.rs
 
 src/components/panel/right/publish/
   PublishPanel.tsx     tab shell: link flow, confirmations, the settings-change question
   DestinationSection.tsx · LinkedAlbumRow.tsx (status, row actions)
-  LinkAlbumFlow.tsx · RemoteAlbumBrowser.tsx · PublishSummary.tsx · PublishProgress.tsx
+  LinkAlbumFlow.tsx · RemoteAlbumBrowser.tsx · ExistingReview.tsx (pairs to adopt)
+  PublishSummary.tsx · PublishProgress.tsx
+  albumContextMenu.ts (Sources "Publish to ▸") · deletedAlbumNotice.tsx · publishRequests.ts
   output.ts (preset summary, format checks) · usePublishState.ts · publish.i18n.ts
   manager/             PublishManagerModal.tsx (portal, destination list, Save/Cancel)
                        SmugMugAccountSection.tsx · OutputSection.tsx · NewAlbumsSection.tsx
+                       ManagerSection.tsx
 ```
 
 ## OAuth flow
@@ -309,7 +389,7 @@ X-Smug-RetryCount:       <0, 1, 2, …>
 A separate **Publish** panel — not a third entry in the export destination dropdown. Publishing has
 state exporting doesn't (auth, album choice, "12 unchanged, 3 to update, 1 new"), and hiding that
 behind a select value makes the panel change shape drastically on one value. `destination_type`
-(`export_processing.rs:78`) stays for filesystem destinations.
+(`ExportSettings`) stays for filesystem destinations.
 
 Publish is a tab in RapidRAW's dockable panel system, `Panel.Publish`, after Export in the left
 dock. It drags between regions and persists in the saved workspace like every other panel, works
@@ -323,46 +403,107 @@ backend reports a session only through events and cannot be asked about one afte
 module-level zustand store with listeners registered once for the app's lifetime. This is the
 same reason `useTetheringStore` exists.
 
-The panel is built around **linked albums**, Lightroom's published collections. Set-up lives in
-the Publish Manager; the panel prompts for it when the destination is not connected or has no
-output preset, and publishing is disabled until both are in place. Each link shows a status from
-`publish_preview`, checked one album at a time while the tab is visible and again after a publish
-or an album change: up to date, N changed, N new, N affected by settings, not found on the
-destination, not published yet. Right-click or the row's menu publishes, opens the remote album,
-links to a different one or unlinks, each change confirmed. A link whose RapidRAW album was
-deleted can never be published again (album ids are never reused), so it is not listed: one line
-under the list counts such links and removes them, deleting nothing remotely.
+**The Publish Manager** (`manager/PublishManagerModal.tsx`) holds everything needed to set a
+destination up, in the shape of Lightroom Classic's Publishing Manager: destinations on the left
+with their status, collapsible sections on the right, Save and Cancel. It is a modal opened from
+the panel's ⚙, not a Settings category or in-panel pages (decision 11). Edits are a draft until
+Save; Escape or Cancel discards them, and focus returns to ⚙. Saving a different export preset
+first asks `publish_settings_impact` how many uploads used different settings, then asks whether to
+republish them next time or keep the existing uploads (`publish_keep_existing_uploads`).
+
+```
+┌ Publish Manager ──────────────────────────────────────────────┐
+│ SmugMug          │ ▾ Account      Connected as markallison     │
+│  markallison ●   │                [Reconnect] [Disconnect]     │
+│                  │ ▾ API key      •••••••• [Change]            │
+│                  │ ▾ Output       Export preset [Web 2560 ▾]   │
+│                  │                JPEG · q85 · 2560 px long    │
+│                  │ ▾ New galleries Privacy [Public ▾]          │
+│                  │                Applies only to galleries    │
+│                  │                RapidRAW creates.            │
+│                  │                          [Cancel] [Save]    │
+└──────────────────┴──────────────────────────────────────────────┘
+```
+
+Account connects, reconnects and disconnects; disconnecting keeps the key, links and history. API
+key links to SmugMug's developer page and says credentials live in the OS keyring. Output picks the
+preset, summarises it in a line, warns when its format is one the destination refuses, and links
+to the Export panel when there are no presets. New galleries sets the privacy of albums RapidRAW
+creates, from the destination's `supported_privacy`.
+
+**The panel** is built around **linked albums**, Lightroom's published collections. It prompts for
+set-up when the destination is not connected or has no usable output preset, and publishing is
+disabled until both are in place. Each link shows a status from `publish_preview`, checked one
+album at a time while the tab is visible and again after a publish or an album change: up to date,
+N changed, N new, N affected by settings, not found on the destination, not published yet. The row
+for the album selected in Sources is highlighted. Right-click or the row's menu publishes, opens
+the remote album, checks for photos already in it, links to a different one, creates a broken one
+again or unlinks, each change confirmed. ↻ refreshes every link from the destination. A link whose
+RapidRAW album was deleted can never be published again (album ids are never reused), so it is not
+listed: one line under the list counts such links and removes them, deleting nothing remotely.
+
+```
+┌ Publish ──────────────────── ↻  ⚙ ┐
+│ ▾ SmugMug · markallison          ● │
+│    Landscapes 2026     ✓ Up to date│
+│    Iceland             ↻ 4 changed │
+│    Portfolio           ○ 12 new    │
+│    Old Trip            ⚠ Not found │
+│    + Publish an album…             │
+│────────────────────────────────────│
+│ Iceland → SmugMug "Iceland 2026"   │
+│ 4 to update · 38 unchanged         │
+│ Preset: Web 2560 · q85             │
+│             [ Publish 4 ]          │
+└────────────────────────────────────┘
+```
 
 "Publish an album…" links first and uploads nothing: choose a RapidRAW album, then create a new
 remote album (its privacy stated before it is created, and an existing same-named album offered
-instead) or browse to one that exists. Publishing always requires a link and the destination's
-preset; nothing is found or created by name, and nothing falls back to the Export panel's
-settings. A publish whose album has settings-only changes asks first — republish them too, or
-only upload edited and new photos. Progress, per-image status including failed and ambiguous,
-and cancel follow. The spool is never surfaced.
+instead) or browse to one that exists (`RemoteAlbumBrowser.tsx`, folders and a breadcrumb; albums
+already linked are shown disabled with the album they belong to). Linking to an album that holds
+photos runs the matcher: exact pairs are adopted, and anything less is offered for review in
+`ExistingReview.tsx`, each local photo beside its remote match with the reasons. Publishing always
+requires a link and the destination's preset; nothing is found or created by name, and nothing
+falls back to the Export panel's settings. A publish whose album has settings-only changes asks
+first — republish them too, or only upload edited and new photos. Progress, per-image status
+including failed and ambiguous, and cancel follow. The spool is never surfaced.
+
+**From elsewhere in the app.** Right-clicking an album in Sources offers "Publish to ▸", which
+either publishes a linked album now or opens the link flow on an unlinked one
+(`albumContextMenu.ts`). It sends the request through `publishRequests.ts`, so the panel asks the
+same questions however a publish starts. Deleting an album, or a group holding albums, that was
+linked raises a persistent notice (`deletedAlbumNotice.tsx`) naming each remote album left behind,
+with a link to it (decision 17).
+
+**The destination's own words.** RapidRAW's albums are always *albums*; a destination's containers
+use its own term, SmugMug's being *gallery*. Strings that name a remote container have an i18next
+`context: destinationId` variant in `publish.i18n.ts` (`heading_smugmug: 'New galleries'`), so a
+second destination gets its own words without touching the components.
 
 ## Integration surface
 
-| File                                     | Change                                                                                                       | Lines | Conflict risk                  |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------ | ----- | ------------------------------ |
-| `src-tauri/Cargo.toml`                   | deps `async-trait`, `hmac`, `sha1`, `md-5`, `bytes`, `keyring`; dev-deps `tokio`, `wiremock` (with comments) | 21    | Low                            |
-| `src-tauri/src/lib.rs`                   | `mod publish;` + spool sweep in setup + registry init                                                        | 3     | Very low                       |
-| `src-tauri/src/lib.rs`                   | commands in `generate_handler![]`                                                                            | 10    | **Medium — both sides append** |
-| `src-tauri/src/app_state.rs`             | `publish_registry` field                                                                                     | 1     | Low                            |
-| `src/App.tsx`                            | import + `registerPublishResources()`; `case Panel.Publish` in `renderAppPanel`                              | 6     | Medium — busy file             |
-| `src/components/ui/AppProperties.tsx`    | `Panel.Publish` enum member                                                                                  | 1     | Low                            |
-| `src/components/panel/PanelSwitcher.tsx` | `Send` icon and tooltip key in `PANEL_ICONS` / `PANEL_TITLES`                                                | 3     | Low                            |
-| `src/store/useUIStore.ts`                | `Panel.Publish` in `ALL_PANELS`, default regions and both default layouts                                    | 10    | Low                            |
-| `src/store/useUIStore.ts`                | Android gating: `isPublishSupported` in the `allowedPanels` filter                                           | 15    | Low                            |
-| `src/hooks/useAppContextMenus.ts`        | import; `Publish to ▸` options for albums; deleted-link notice after an album delete                         | 3     | Low                            |
-| `i18next.config.ts`                      | `extract.ignore` for the publish directory                                                                   | 3     | Low                            |
-| `src/@types/i18next.d.ts`                | `PublishTranslations` in the type augmentation                                                               | 5     | Low                            |
-| **`src-tauri/src/export_processing.rs`** | **none**                                                                                                     | **0** | **None**                       |
-| `src/i18n/**`                            | **none**                                                                                                     | 0     | None                           |
+Against upstream `main` at `1cc99d56` (2026-10-06), from `scripts/check-fork-surface.sh main`:
 
-**~90 lines across 10 existing files** (90+/4− after #23; `scripts/check-fork-surface.sh` prints the live figure;
-`Cargo.lock` follows `Cargo.toml` and is not counted). Everything else is new, and new files never
-conflict.
+| File                                     | Change                                                                                                       | Lines    | Conflict risk                  |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------ | -------- | ------------------------------ |
+| `src-tauri/Cargo.toml`                   | deps `async-trait`, `hmac`, `sha1`, `md-5`, `bytes`, `keyring`; dev-deps `tokio`, `wiremock` (with comments) | +21      | Low                            |
+| `src-tauri/src/lib.rs`                   | `mod publish;` + spool sweep in setup + registry init                                                        | +3       | Very low                       |
+| `src-tauri/src/lib.rs`                   | 22 `publish_*` commands in `generate_handler![]`, between markers                                            | +24      | **Medium — both sides append** |
+| `src-tauri/src/app_state.rs`             | `publish_registry` field                                                                                     | +1       | Low                            |
+| `src/App.tsx`                            | imports + `registerPublishResources()`; `case Panel.Publish` in `renderAppPanel`                             | +6       | Medium — busy file             |
+| `src/components/ui/AppProperties.tsx`    | `Panel.Publish` enum member                                                                                  | +1       | Low                            |
+| `src/components/panel/PanelSwitcher.tsx` | `Send` icon and tooltip key in `PANEL_ICONS` / `PANEL_TITLES`                                                | +3       | Low                            |
+| `src/store/useUIStore.ts`                | `Panel.Publish` in `ALL_PANELS`, default regions and both default layouts; Android gating (`isPublishSupported` in the `allowedPanels` filter) | +25 −3   | Low                            |
+| `src/hooks/useAppContextMenus.ts`        | import; `Publish to ▸` options for albums; deleted-link notice after an album delete                         | +3       | Low                            |
+| `i18next.config.ts`                      | `extract.ignore` for the publish directory                                                                   | +3       | Low                            |
+| `src/@types/i18next.d.ts`                | `PublishTranslations` in the type augmentation                                                               | +4 −1    | Low                            |
+| **`src-tauri/src/export_processing.rs`** | **none**                                                                                                     | **0**    | **None**                       |
+| `src/i18n/**`                            | **none**                                                                                                     | 0        | None                           |
+
+**94 lines added and 4 removed, across 10 existing files** (`scripts/check-fork-surface.sh` prints
+the live figure; `Cargo.lock` follows `Cargo.toml` and is not counted). The whole branch is about
+20,900 lines across 50 files; everything outside the table is new, and new files never conflict.
 
 **i18n with zero locale edits:** `registerPublishResources()` in `publish.i18n.ts`, called once from
 `App.tsx`, runs `i18n.addResourceBundle(lang, 'translation', { publish: {…} }, true, true)` instead
@@ -371,7 +512,7 @@ fails CI's `i18next-cli extract --ci`, so `i18next.config.ts` ignores the publis
 `PublishTranslations` joins the `i18next.d.ts` augmentation so keys stay type-checked.
 
 **`generate_handler!`** is the one guaranteed recurring conflict: Tauri permits one
-`invoke_handler` and both sides append. Chosen: the eight `publish_*` commands in one contiguous
+`invoke_handler` and both sides append. Chosen: the 22 `publish_*` commands in one contiguous
 block between `// --- publish ---` and `// --- end publish ---`, one mechanical hunk per merge that
 `rerere` learns. Fallback if that
 proves painful: a single `publish_invoke(action, payload)` dispatch. Reversible.
@@ -424,14 +565,23 @@ for `oauth1.rs`, with a table-driven percent-encoding test. Property test for fi
 stability. Round-trip, migration and interrupted-write tests for the state file. Guard-runs-on-
 every-exit-path and sweep tests for the spool. `wiremock` fixtures for `api.rs`/`upload.rs` and the
 retry scenarios (500-then-success, 429 with `Retry-After`, timeout-then-found,
-timeout-then-absent) — no live network in CI. Manual end-to-end against a real account. The project
+timeout-then-absent, a stalled link, a dead connection) — no live network in CI. Tests for refresh
+snapshots, pending-upload settlement and the photo matcher. Manual end-to-end against a real
+account: phase 1 on 2026-09-13, and the full Publish Manager walk on Linux on 2026-10-06
+([#28](https://github.com/markallisongit/RapidRAW/issues/28)) and on Windows
+([#29](https://github.com/markallisongit/RapidRAW/issues/29)). The project
 had no Rust tests before this; `publish` founds the harness (`[dev-dependencies]`, `#[cfg(test)]`
 modules) rather than extending one. The export pipeline is untouched, not "still tested".
 
 ## Phasing
 
 1. Trait, registry, spool, state, OAuth, SmugMug upload, panel — the working feature. **Done.**
-2. `Group` → folder mirroring, keywords/captions from tags.
+   - **Publish Manager batch** (#14): publishing as a native panel tab, the Publish Manager,
+     explicit links with state v2, output from an export preset, new-album privacy, read-only
+     refresh, adopting photos a gallery already holds, the Sources "Publish to ▸" menu, notices for
+     deleted albums, and never uploading twice after an interrupted publish. **Done.**
+2. `Group` → folder mirroring, titles/captions/keywords from metadata
+   ([#32](https://github.com/markallisongit/RapidRAW/issues/32)).
 3. Delete sync, comment/rating pull, rename/reparent sync.
 4. A second destination. This matters more than its position suggests: an abstraction with one
    implementation hasn't been tested as an abstraction.
@@ -447,7 +597,7 @@ modules) rather than extending one. The export pipeline is untouched, not "still
 | `keyring` unavailable on some Linux setups                                                             | Explicit error, no plaintext fallback                                          |
 | SmugMug rate limits, undocumented                                                                      | Concurrency 3, honour `Retry-After`, log limit headers                         |
 
-Open questions, and where phase 1 left them:
+Open questions, and where they stand:
 
 - **Rating/colour filters** — not implemented; a publish sends the whole album. Leaning towards
   respecting the library view's filters, with the count shown first.
@@ -456,10 +606,13 @@ Open questions, and where phase 1 left them:
 - **Android** — settled: the panel is desktop-only, as there is no `keyring` backend.
 - **Tuning** — `RENDER_CHUNK_SIZE = 8` and `UPLOAD_CONCURRENCY = 3` (`session.rs`) are still
   guesses worth measuring.
-- **Album privacy** — new albums set none and inherit the account root's, which may be public.
-  Decided for #14: new-album privacy becomes a destination setting, default Public to match
-  SmugMug's own Lightroom plugin, shown before an album is created
-  ([#17](https://github.com/markallisongit/RapidRAW/issues/17)).
+- **New-album privacy** — settled: a destination setting, default Public to match SmugMug's own
+  Lightroom plugin, stated before an album is created and never applied to one that is linked
+  (decision 15, [#17](https://github.com/markallisongit/RapidRAW/issues/17)).
+- **Several accounts per destination** — deferred. One configuration per destination type; the
+  state file belongs to one account and refuses to publish under another.
+- **Downloading destination-only photos** — deferred. Photos found only on the destination are
+  left alone; RapidRAW neither imports nor deletes them.
 
 ## References
 
