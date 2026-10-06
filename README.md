@@ -60,6 +60,27 @@ RapidRAW is still in active development and isn't yet as polished as mature tool
 <details>
 <summary><strong>Recent Changes</strong></summary>
 
+- **2026-10-04:** Add pick and reject flags to quick filters and culling view, and improve export preset settings
+- **2026-10-03:** Embed sRGB ICC profiles in exports, calculate HSL hue in perceptual color space & improve lens EXIF detection
+- **2026-10-02:** Added Dutch language support and improved continuous RAW magenta highlight correction
+- **2026-09-29:** Optimize GPU texture uploads to reduce memory overhead and avoid unnecessary buffer copies
+- **2026-09-28:** Added Tool Focus mode to isolate and expand only active adjustment tools
+- **2026-09-27:** Tone curves now display inactive channels as colored overlay curves and reference markers
+- **2026-09-25:** Streamline adjustment panel customization and improve default tool visibility
+- **2026-09-23:** Added borders and aspect ratio padding to export options, plus reorderable and collapsible adjustment sections
+- **2026-09-22:** Added Apple RAW 9 decoding/denoising support and custom savable crop aspect ratios
+- **2026-09-21:** Implemented cancellable AI tasks with real-time UI tracking and backend preparation for cloud inpainting
+
+<details>
+<summary><strong>Expand further</strong></summary>
+
+- **2026-09-20:** Center-anchored crop resizing when holding Ctrl/Cmd on crop handles
+- **2026-09-19:** Added center mark composition guide overlay to the crop tool
+- **2026-09-17:** Rewrite vibrance & local contrast preserving highlights adjustment
+- **2026-09-16:** Add highlights color reconstruction & improve exposure shader
+- **2026-09-14:** Add neutral grey canvas toggle
+- **2026-09-13:** Improve RAW highlight recovery and color clipping
+- **2026-09-12:** Add Ctrl crop pan/zoom and optimize preview transform caching
 - **2026-09-09:** Add masonry thumbnail layout mode
 - **2026-09-09:** Add back and forward navigation history for library
 - **2026-09-06:** Support exporting to original folder with subfolder
@@ -70,10 +91,6 @@ RapidRAW is still in active development and isn't yet as polished as mature tool
 - **2026-08-31:** New edge-aware filter for ai masks, improved sharpening & mobile UI improvements
 - **2026-08-29:** Improved EXIF ​​metadata processing during export
 - **2026-08-29:** Implement folder-level EXIF caching and prevent redundant adjustment saves
-
-<details>
-<summary><strong>Expand further</strong></summary>
-
 - **2026-08-28:** Categorize mask creation panel
 - **2026-08-27:** Split thumbnail resolution settings into separate grid and editor preview sizes
 - **2026-08-26:** Introduced a retouch tool to effortlessly smooth skin
@@ -632,14 +649,16 @@ RapidRAW supports automatic lens profile detection, distortion, transverse chrom
 <details>
 <summary><strong>Supported Languages</strong></summary>
 
-RapidRAW is fully translated into the following 13 languages:
+RapidRAW is fully translated into the following 15 languages:
 
 - 🇬🇧 **English**
 - 🇪🇸 **Català**
+- 🇨🇿 **Čeština**
 - 🇩🇪 **Deutsch**
 - 🇪🇸 **Español**
 - 🇫🇷 **Français**
 - 🇮🇹 **Italiano**
+- 🇳🇱 **Nederlands**
 - 🇵🇱 **Polski**
 - 🇵🇹 **Português**
 - 🇷🇺 **Русский**

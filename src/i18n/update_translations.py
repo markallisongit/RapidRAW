@@ -6,118 +6,226 @@ LOCALES_DIR = Path("./locales")
 TRANSLATIONS = {
     "ca": {
         "settings": {
-            "general": {
-                "neutralGreyCanvas": "Llenç gris neutre",
-                "neutralGreyCanvasDesc": "Utilitzeu un llenç gris neutre per a una gradació de color i exposició més precisa sense canviar el tema de l'aplicació.",
-                "enableNeutralGreyCanvas": "Activa el fons gris neutre"
+            "processing": {
+                "ai": {
+                    "cloud": {
+                        "statuses": {
+                            "connecting": "Connectant…",
+                            "retry": "Tornar a intentar la connexió",
+                            "unsupported": "L'inici de sessió al núvol actualment només està disponible a l'escriptori."
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "cs": {
+        "settings": {
+            "processing": {
+                "ai": {
+                    "cloud": {
+                        "statuses": {
+                            "connecting": "Připojování…",
+                            "retry": "Opakovat připojení",
+                            "unsupported": "Přihlášení do cloudu je momentálně k dispozici pouze na počítači."
+                        }
+                    }
+                }
             }
         }
     },
     "de": {
         "settings": {
-            "general": {
-                "neutralGreyCanvas": "Neutralgraue Arbeitsfläche",
-                "neutralGreyCanvasDesc": "Verwenden Sie eine neutralgraue Arbeitsfläche für eine genauere Farb- und Belichtungskorrektur, ohne das App-Design zu ändern.",
-                "enableNeutralGreyCanvas": "Neutralgrauen Hintergrund aktivieren"
+            "processing": {
+                "ai": {
+                    "cloud": {
+                        "statuses": {
+                            "connecting": "Verbinden…",
+                            "retry": "Verbindung erneut versuchen",
+                            "unsupported": "Die Cloud-Anmeldung ist derzeit nur auf dem Desktop verfügbar."
+                        }
+                    }
+                }
             }
         }
     },
     "en": {
         "settings": {
-            "general": {
-                "neutralGreyCanvas": "Neutral Grey Canvas",
-                "neutralGreyCanvasDesc": "Use a neutral grey canvas for more accurate color and exposure grading without changing the app theme.",
-                "enableNeutralGreyCanvas": "Enable Neutral Grey Background"
+            "processing": {
+                "ai": {
+                    "cloud": {
+                        "statuses": {
+                            "connecting": "Connecting…",
+                            "retry": "Retry connection",
+                            "unsupported": "Cloud sign-in is currently only available on desktop."
+                        }
+                    }
+                }
             }
         }
     },
     "es": {
         "settings": {
-            "general": {
-                "neutralGreyCanvas": "Lienzo gris neutro",
-                "neutralGreyCanvasDesc": "Utiliza un lienzo gris neutro para una gradación de color y exposición más precisa sin cambiar el tema de la aplicación.",
-                "enableNeutralGreyCanvas": "Activar fondo gris neutro"
+            "processing": {
+                "ai": {
+                    "cloud": {
+                        "statuses": {
+                            "connecting": "Conectando…",
+                            "retry": "Reintentar conexión",
+                            "unsupported": "El inicio de sesión en la nube actualmente solo está disponible en escritorio."
+                        }
+                    }
+                }
             }
         }
     },
     "fr": {
         "settings": {
-            "general": {
-                "neutralGreyCanvas": "Toile gris neutre",
-                "neutralGreyCanvasDesc": "Utilisez une toile gris neutre pour un étalonnage des couleurs et de l'exposition plus précis sans modifier le thème de l'application.",
-                "enableNeutralGreyCanvas": "Activer le fond gris neutre"
+            "processing": {
+                "ai": {
+                    "cloud": {
+                        "statuses": {
+                            "connecting": "Connexion…",
+                            "retry": "Réessayer la connexion",
+                            "unsupported": "La connexion au cloud n'est actuellement disponible que sur ordinateur."
+                        }
+                    }
+                }
             }
         }
     },
     "it": {
         "settings": {
-            "general": {
-                "neutralGreyCanvas": "Tela grigio neutro",
-                "neutralGreyCanvasDesc": "Usa una tela grigio neutro per una correzione del colore e dell'esposizione più precisa senza cambiare il tema dell'app.",
-                "enableNeutralGreyCanvas": "Abilita sfondo grigio neutro"
+            "processing": {
+                "ai": {
+                    "cloud": {
+                        "statuses": {
+                            "connecting": "Connessione in corso…",
+                            "retry": "Riprova connessione",
+                            "unsupported": "L'accesso al cloud è attualmente disponibile solo su desktop."
+                        }
+                    }
+                }
             }
         }
     },
     "ja": {
         "settings": {
-            "general": {
-                "neutralGreyCanvas": "ニュートラルグレーのキャンバス",
-                "neutralGreyCanvasDesc": "アプリのテーマを変更せずに、より正確な色と露出のグレーディングを行うために、ニュートラルグレーのキャンバスを使用します。",
-                "enableNeutralGreyCanvas": "ニュートラルグレーの背景を有効にする"
+            "processing": {
+                "ai": {
+                    "cloud": {
+                        "statuses": {
+                            "connecting": "接続中…",
+                            "retry": "接続を再試行",
+                            "unsupported": "クラウドへのサインインは現在、デスクトップでのみ利用可能です。"
+                        }
+                    }
+                }
             }
         }
     },
     "ko": {
         "settings": {
-            "general": {
-                "neutralGreyCanvas": "뉴트럴 그레이 캔버스",
-                "neutralGreyCanvasDesc": "앱 테마를 변경하지 않고 더 정확한 색상 및 노출 보정을 위해 뉴트럴 그레이 캔버스를 사용합니다.",
-                "enableNeutralGreyCanvas": "뉴트럴 그레이 배경 활성화"
+            "processing": {
+                "ai": {
+                    "cloud": {
+                        "statuses": {
+                            "connecting": "연결 중…",
+                            "retry": "연결 재시도",
+                            "unsupported": "클라우드 로그인은 현재 데스크톱에서만 사용할 수 있습니다."
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "nl": {
+        "settings": {
+            "processing": {
+                "ai": {
+                    "cloud": {
+                        "statuses": {
+                            "connecting": "Verbinden…",
+                            "retry": "Verbinding opnieuw proberen",
+                            "unsupported": "Aanmelden bij de cloud is momenteel alleen beschikbaar op desktop."
+                        }
+                    }
+                }
             }
         }
     },
     "pl": {
         "settings": {
-            "general": {
-                "neutralGreyCanvas": "Neutralne szare płótno",
-                "neutralGreyCanvasDesc": "Użyj neutralnego, szarego płótna do dokładniejszej korekcji kolorów i ekspozycji bez zmiany motywu aplikacji.",
-                "enableNeutralGreyCanvas": "Włącz neutralne szare tło"
+            "processing": {
+                "ai": {
+                    "cloud": {
+                        "statuses": {
+                            "connecting": "Łączenie…",
+                            "retry": "Ponów próbę połączenia",
+                            "unsupported": "Logowanie w chmurze jest obecnie dostępne tylko na komputerach."
+                        }
+                    }
+                }
             }
         }
     },
     "pt": {
         "settings": {
-            "general": {
-                "neutralGreyCanvas": "Tela cinza neutro",
-                "neutralGreyCanvasDesc": "Use uma tela cinza neutro para uma gradação de cores e exposição mais precisa sem alterar o tema do aplicativo.",
-                "enableNeutralGreyCanvas": "Ativar fundo cinza neutro"
+            "processing": {
+                "ai": {
+                    "cloud": {
+                        "statuses": {
+                            "connecting": "Conectando…",
+                            "retry": "Tentar conexão novamente",
+                            "unsupported": "O login na nuvem está atualmente disponível apenas no desktop."
+                        }
+                    }
+                }
             }
         }
     },
     "ru": {
         "settings": {
-            "general": {
-                "neutralGreyCanvas": "Нейтрально-серый холст",
-                "neutralGreyCanvasDesc": "Используйте нейтрально-серый холст для более точной цветокоррекции и настройки экспозиции без изменения темы приложения.",
-                "enableNeutralGreyCanvas": "Включить нейтрально-серый фон"
+            "processing": {
+                "ai": {
+                    "cloud": {
+                        "statuses": {
+                            "connecting": "Подключение…",
+                            "retry": "Повторить попытку подключения",
+                            "unsupported": "Вход в облако в настоящее время доступен только на ПК."
+                        }
+                    }
+                }
             }
         }
     },
     "zh-CN": {
         "settings": {
-            "general": {
-                "neutralGreyCanvas": "中性灰画布",
-                "neutralGreyCanvasDesc": "使用中性灰画布，以便在不更改应用主题的情况下进行更准确的色彩和曝光分级。",
-                "enableNeutralGreyCanvas": "启用中性灰背景"
+            "processing": {
+                "ai": {
+                    "cloud": {
+                        "statuses": {
+                            "connecting": "正在连接…",
+                            "retry": "重试连接",
+                            "unsupported": "云端登录目前仅在桌面设备上可用。"
+                        }
+                    }
+                }
             }
         }
     },
     "zh-TW": {
         "settings": {
-            "general": {
-                "neutralGreyCanvas": "中性灰畫布",
-                "neutralGreyCanvasDesc": "使用中性灰畫布，以便在不更改應用程式主題的情況下進行更準確的色彩和曝光分級。",
-                "enableNeutralGreyCanvas": "啟用中性灰背景"
+            "processing": {
+                "ai": {
+                    "cloud": {
+                        "statuses": {
+                            "connecting": "連線中…",
+                            "retry": "重試連線",
+                            "unsupported": "雲端登入目前僅在桌面裝置上可用。"
+                        }
+                    }
+                }
             }
         }
     }
@@ -167,7 +275,7 @@ def main():
         print(f"Error: Locales directory '{LOCALES_DIR}' does not exist.")
         return
 
-    print("Starting translation updates for Neutral Grey Canvas settings...")
+    print("Starting translation updates for Cloud Statuses...")
     for lang, trans in TRANSLATIONS.items():
         file_path = LOCALES_DIR / f"{lang}.json"
         update_json_file(file_path, trans)

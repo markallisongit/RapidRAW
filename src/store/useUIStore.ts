@@ -7,18 +7,11 @@ import {
   CullingSuggestions,
   PanelRegion,
   WorkspaceState,
+  CollapsibleSectionsState,
 } from '../components/ui/AppProperties';
 import { useEditorStore } from './useEditorStore';
 
 export type SwitcherPlacement = 'bottom' | 'right' | 'left' | 'top';
-
-interface CollapsibleSectionsState {
-  basic: boolean;
-  color: boolean;
-  curves: boolean;
-  details: boolean;
-  effects: boolean;
-}
 
 export interface CropSectionsState {
   transform: boolean;
@@ -305,7 +298,7 @@ export const useUIStore = create<UIState>((set, get) => ({
   isWindowFullScreen: false,
   isInstantTransition: false,
   isLayoutReady: false,
-  uiVisibility: { filmstrip: true, leftPanel: true, rightPanel: true },
+  uiVisibility: { filmstrip: true, leftPanel: true, rightPanel: true, quickFilter: false },
   isLibraryExportPanelVisible: false,
   isSettingsOpen: false,
 
@@ -546,7 +539,7 @@ export const useUIStore = create<UIState>((set, get) => ({
       panelLayout: defaultWorkspace.panelLayout,
       activePanels: defaultWorkspace.activePanels,
       panelSwitcherPlacement: defaultWorkspace.panelSwitcherPlacement,
-      uiVisibility: { filmstrip: true, leftPanel: true, rightPanel: true },
+      uiVisibility: { filmstrip: true, leftPanel: true, rightPanel: true, quickFilter: false },
       activePanel: defaultWorkspace.activePanels.rightTop || null,
       renderedPanel: defaultWorkspace.activePanels.rightTop || null,
     });
