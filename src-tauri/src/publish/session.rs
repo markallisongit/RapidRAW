@@ -248,8 +248,28 @@ pub struct SessionSummary {
 pub enum SessionEvent {
     Progress(Progress),
     Complete(SessionSummary),
-    Error(String),
+    Error(SessionError),
     Cancelled(SessionSummary),
+}
+
+/// What `publish-error` carries. A broken link is named so the panel can word
+/// it for the destination; anything else is a message.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind")]
+pub enum SessionError {
+    LinkBroken,
+    Failed { message: String },
+}
+
+impl From<&PublishError> for SessionError {
+    fn from(error: &PublishError) -> Self {
+        match error {
+            PublishError::LinkBroken => Self::LinkBroken,
+            other => Self::Failed {
+                message: other.to_string(),
+            },
+        }
+    }
 }
 
 impl SessionEvent {
@@ -274,7 +294,7 @@ pub fn tauri_event_sink(app_handle: tauri::AppHandle) -> EventSink {
             SessionEvent::Complete(summary) | SessionEvent::Cancelled(summary) => {
                 app_handle.emit(name, summary)
             }
-            SessionEvent::Error(message) => app_handle.emit(name, message),
+            SessionEvent::Error(error) => app_handle.emit(name, error),
         };
     })
 }
@@ -374,7 +394,7 @@ impl<'a> PublishSession<'a> {
         (self.events)(match &result {
             Ok(summary) if summary.cancelled => SessionEvent::Cancelled(summary.clone()),
             Ok(summary) => SessionEvent::Complete(summary.clone()),
-            Err(error) => SessionEvent::Error(error.to_string()),
+            Err(error) => SessionEvent::Error(error.into()),
         });
         result
     }
@@ -438,13 +458,7 @@ impl<'a> PublishSession<'a> {
         }
 
         let container = match run.state.link(&request.album.album_id) {
-            Some(link) if link.broken => {
-                return Err(PublishError::Rejected(format!(
-                    "the linked album no longer exists on {}. Link \"{}\" to another album first",
-                    self.destination.display_name(),
-                    request.album.name
-                )));
-            }
+            Some(link) if link.broken => return Err(PublishError::LinkBroken),
             Some(link) => RemoteContainerId(link.remote_uri.clone()),
             // Never found or created by name: the user chooses where an album
             // goes, and sees the privacy of one RapidRAW creates, when linking.
@@ -1793,6 +1807,13 @@ mod tests {
         fn terminal_event(&self) -> &'static str {
             self.events.lock().unwrap().last().unwrap().name()
         }
+
+        fn terminal_error(&self) -> Option<SessionError> {
+            match self.events.lock().unwrap().last()? {
+                SessionEvent::Error(error) => Some(error.clone()),
+                _ => None,
+            }
+        }
     }
 
     fn set_writable(dir: &Path, writable: bool) {
@@ -2239,6 +2260,10 @@ mod tests {
         let error = result.expect_err("publishing requires a link");
         assert!(matches!(error, PublishError::Rejected(_)), "{error}");
         assert_eq!(harness.terminal_event(), "publish-error");
+        assert!(matches!(
+            harness.terminal_error(),
+            Some(SessionError::Failed { .. })
+        ));
         assert!(
             destination.log.lock().unwrap().is_empty(),
             "no album is found or created by name, and nothing uploads"
@@ -2269,11 +2294,16 @@ mod tests {
         .await;
 
         let error = result.expect_err("a deleted remote album stops the session");
-        assert!(matches!(error, PublishError::Rejected(_)), "{error}");
+        assert!(matches!(error, PublishError::LinkBroken), "{error}");
         assert!(harness.state().link(ALBUM).unwrap().broken);
         assert_eq!(pipeline.renders.load(Ordering::SeqCst), 0);
         assert!(destination.uploaded_names().is_empty());
         assert_eq!(harness.terminal_event(), "publish-error");
+        assert_eq!(
+            harness.terminal_error(),
+            Some(SessionError::LinkBroken),
+            "the panel words a broken link itself"
+        );
     }
 
     #[tokio::test]
@@ -2305,7 +2335,7 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
+        assert!(matches!(result, Err(PublishError::LinkBroken)));
         assert!(
             destination.log.lock().unwrap().is_empty(),
             "nothing is created in its place and nothing uploads"
@@ -2940,6 +2970,19 @@ mod tests {
         assert_eq!(
             names(&TemplatePipeline { sequence: false }),
             ["Trip.jpg", "Trip_1.jpg"]
+        );
+    }
+
+    #[test]
+    fn a_session_error_reaches_the_panel_as_a_kind() {
+        assert_eq!(
+            serde_json::to_value(SessionError::from(&PublishError::LinkBroken)).unwrap(),
+            serde_json::json!({ "kind": "LinkBroken" })
+        );
+        assert_eq!(
+            serde_json::to_value(SessionError::from(&PublishError::Network("down".into())))
+                .unwrap(),
+            serde_json::json!({ "kind": "Failed", "message": "network: down" })
         );
     }
 }

@@ -231,7 +231,7 @@ export default function PublishPanel() {
   };
 
   const renderBody = () => {
-    if (!isIdle) return <PublishProgress api={api} destinationName={destinationName} />;
+    if (!isIdle) return <PublishProgress api={api} destinationId={DESTINATION_ID} destinationName={destinationName} />;
 
     if (checkingLink && existing.check) {
       return (

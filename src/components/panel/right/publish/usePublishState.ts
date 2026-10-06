@@ -72,6 +72,9 @@ export type LinkError =
 /** What the commands that need the destination's output preset reject with. */
 export type PresetError = { kind: 'PresetMissing'; preset_id: string | null } | { kind: 'Failed'; message: string };
 
+/** Why a session stopped. A broken link is worded by the panel, for the destination. */
+export type SessionError = { kind: 'LinkBroken' } | { kind: 'Failed'; message: string };
+
 /** Why a photo was paired with a remote image. */
 export type MatchReason = 'PublishName' | 'OriginalFileName' | 'CaptureTime' | 'LooksTheSame';
 
@@ -162,7 +165,7 @@ export interface PublishSessionState {
   total: number;
   items: Array<{ file: string; state: ItemState }>;
   summary: SessionSummary | null;
-  error: string | null;
+  error: SessionError | null;
 }
 
 /** One link's last preview. A preview being checked again keeps the counts it had. */
@@ -347,7 +350,7 @@ const listenForSessionEvents = () => {
   });
   listen<SessionSummary>('publish-complete', finish('complete'));
   listen<SessionSummary>('publish-cancelled', finish('cancelled'));
-  listen<string>('publish-error', (event) => {
+  listen<SessionError>('publish-error', (event) => {
     updateSession((current) => ({ ...current, phase: 'error', error: event.payload }));
   });
 };
@@ -598,7 +601,11 @@ export function usePublishState(destinationId: string, isActive: boolean) {
         await invoke('publish_album', { destinationId, albumId, onSettingsChange });
         updateSession((current) => (current.phase === 'starting' ? { ...current, phase: 'running' } : current));
       } catch (error) {
-        updateSession(() => ({ ...IDLE_SESSION, phase: 'error', error: errorMessage(error) }));
+        updateSession(() => ({
+          ...IDLE_SESSION,
+          phase: 'error',
+          error: { kind: 'Failed', message: errorMessage(error) },
+        }));
       }
     },
     [destinationId],

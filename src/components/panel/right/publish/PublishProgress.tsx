@@ -29,10 +29,11 @@ const fileName = (path: string) => path.split(/[\\/]/).pop() || path;
 
 interface PublishProgressProps {
   api: PublishStateApi;
+  destinationId: string;
   destinationName: string;
 }
 
-export default function PublishProgress({ api, destinationName }: PublishProgressProps) {
+export default function PublishProgress({ api, destinationId, destinationName }: PublishProgressProps) {
   const { t } = useTranslation();
   const { phase, completed, total, items, summary, error } = api.session;
   const isRunning = phase === 'starting' || phase === 'running' || phase === 'cancelling';
@@ -98,7 +99,11 @@ export default function PublishProgress({ api, destinationName }: PublishProgres
         {error && (
           <div className="flex items-start gap-2 bg-red-500/10 rounded-md p-3">
             <AlertTriangle size={16} className="shrink-0 mt-0.5 text-red-400" />
-            <Text color={TextColors.error}>{displayError(error, t('publish.errors.localFile'))}</Text>
+            <Text color={TextColors.error}>
+              {error.kind === 'LinkBroken'
+                ? t('publish.summary.broken', { destination: destinationName, context: destinationId })
+                : displayError(error.message, t('publish.errors.localFile'))}
+            </Text>
           </div>
         )}
 

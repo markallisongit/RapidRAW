@@ -298,6 +298,9 @@ pub enum PublishError {
         file_name: String,
     },
     Rejected(String),
+    /// The album's link is marked broken: its remote album was not found, so
+    /// nothing is published into it until it is linked again.
+    LinkBroken,
     Cancelled,
     Io(String),
 }
@@ -315,6 +318,7 @@ impl PublishError {
             | Self::CredentialStorage(_)
             | Self::Ambiguous { .. }
             | Self::Rejected(_)
+            | Self::LinkBroken
             | Self::Cancelled
             | Self::Io(_) => false,
         }
@@ -332,6 +336,7 @@ impl std::fmt::Display for PublishError {
             Self::RateLimited { .. } => write!(f, "rate limited"),
             Self::Ambiguous { file_name } => write!(f, "ambiguous outcome for {file_name}"),
             Self::Rejected(detail) => write!(f, "rejected by destination: {detail}"),
+            Self::LinkBroken => write!(f, "the linked album no longer exists"),
             Self::Cancelled => write!(f, "cancelled"),
             Self::Io(detail) => write!(f, "io: {detail}"),
         }
