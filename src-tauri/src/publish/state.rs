@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Manager};
 
-use crate::export_processing::{ExportSettings, ResizeOptions, WatermarkSettings};
+use crate::export_processing::{
+    BorderOptions, ExportSettings, PadOptions, ResizeOptions, WatermarkSettings,
+};
 use crate::file_management::AlbumItem;
 use crate::publish::{
     ContainerSnapshot, PublishError, RemoteContainerId, RemoteImageId, RemoteNode, SnapshotImage,
@@ -202,6 +204,12 @@ pub struct RelevantExportSettings {
     pub output_format: String,
     pub jpeg_quality: u8,
     pub resize: Option<ResizeOptions>,
+    /// Left out of the hash when unset, so uploads recorded before borders
+    /// and padding existed are not all suddenly affected by settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border: Option<BorderOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pad: Option<PadOptions>,
     pub keep_metadata: bool,
     pub strip_gps: bool,
     pub watermark: Option<WatermarkSettings>,
@@ -214,6 +222,8 @@ impl RelevantExportSettings {
             output_format: output_format.to_string(),
             jpeg_quality: settings.jpeg_quality,
             resize: settings.resize.clone(),
+            border: settings.border.clone(),
+            pad: settings.pad.clone(),
             keep_metadata: settings.keep_metadata,
             strip_gps: settings.strip_gps,
             watermark: settings.watermark.clone(),
@@ -1177,7 +1187,9 @@ pub(crate) fn destination_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::export_processing::{ResizeMode, TiffBitDepth, WatermarkAnchor};
+    use crate::export_processing::{
+        BorderBasis, BorderOptions, PadOptions, ResizeMode, TiffBitDepth, WatermarkAnchor,
+    };
 
     /// A baseline `ExportSettings` for the fingerprint tests to vary one field
     /// of at a time.
@@ -1190,6 +1202,8 @@ mod tests {
                 value: 2048,
                 dont_enlarge: true,
             }),
+            border: None,
+            pad: None,
             keep_metadata: true,
             preserve_timestamps: false,
             strip_gps: true,
@@ -1952,6 +1966,8 @@ mod tests {
             output_format: "jpeg".into(),
             jpeg_quality: 90,
             resize: None,
+            border: None,
+            pad: None,
             keep_metadata: true,
             strip_gps: false,
             watermark: None,
@@ -2082,11 +2098,32 @@ mod tests {
         let base = fingerprints(a_time(), 1024, adjustments, &relevant());
         let mut smaller = export_settings();
         smaller.jpeg_quality = 60;
+        let mut bordered = export_settings();
+        bordered.border = Some(BorderOptions {
+            basis: BorderBasis::LongEdge,
+            horizontal_percent: 2.0,
+            vertical_percent: 2.0,
+            color: "#ffffff".into(),
+        });
+        let mut padded = export_settings();
+        padded.pad = Some(PadOptions {
+            ratio_width: 1.0,
+            ratio_height: 1.0,
+            color: "#ffffff".into(),
+        });
 
         for (settings, what) in [
             (
                 RelevantExportSettings::from_export_settings(&smaller, "jpeg"),
                 "a quality change",
+            ),
+            (
+                RelevantExportSettings::from_export_settings(&bordered, "jpeg"),
+                "adding a border",
+            ),
+            (
+                RelevantExportSettings::from_export_settings(&padded, "jpeg"),
+                "padding to a ratio",
             ),
             (
                 RelevantExportSettings::from_export_settings(&export_settings(), "png"),
@@ -2098,6 +2135,33 @@ mod tests {
             assert_ne!(base.legacy, changed.legacy, "{what}");
             assert_eq!(base.edit_hash, changed.edit_hash, "{what} is not an edit");
         }
+    }
+
+    #[test]
+    fn settings_without_a_border_or_pad_hash_as_they_did_before_either_existed() {
+        // Every upload recorded before borders and padding existed was hashed
+        // from exactly these fields. Hashing an absent border or pad as well
+        // would mark the whole library "affected by settings" for no change.
+        let before = serde_json::json!({
+            "output_format": "jpeg",
+            "jpeg_quality": 90,
+            "resize": { "mode": "longEdge", "value": 2048, "dontEnlarge": true },
+            "keep_metadata": true,
+            "strip_gps": true,
+            "watermark": {
+                "path": "/w/mark.png",
+                "anchor": "bottomRight",
+                "scale": 10.0,
+                "spacing": 2.0,
+                "opacity": 80.0
+            },
+            "export_masks": false
+        });
+
+        assert_eq!(
+            settings_hash(&relevant()),
+            hash_settings(&canonical_json(&before))
+        );
     }
 
     #[test]

@@ -10,7 +10,9 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::app_settings::ExportPreset;
-use crate::export_processing::{ExportSettings, ResizeOptions, TiffBitDepth, WatermarkSettings};
+use crate::export_processing::{
+    BorderOptions, ExportSettings, PadOptions, ResizeOptions, TiffBitDepth, WatermarkSettings,
+};
 use crate::publish::PublishError;
 use crate::publish::state::{PublishState, RelevantExportSettings, SettingsImpact, settings_hash};
 
@@ -90,6 +92,33 @@ pub fn from_preset(preset: &ExportPreset) -> Result<PublishOutput, PresetError> 
     } else {
         None
     };
+    // Fallbacks are the Export panel's own, for a preset saved with the option
+    // switched on but a value missing.
+    let border = if preset.enable_border.unwrap_or(false) {
+        Some(BorderOptions {
+            basis: match &preset.border_basis {
+                Some(basis) => parse(&preset.name, "border basis", Some(basis))?,
+                None => Default::default(),
+            },
+            horizontal_percent: preset.border_horizontal_percent.unwrap_or(2.0),
+            vertical_percent: preset.border_vertical_percent.unwrap_or(2.0),
+            color: preset
+                .border_color
+                .clone()
+                .unwrap_or_else(|| "#ffffff".into()),
+        })
+    } else {
+        None
+    };
+    let pad = if preset.enable_pad.unwrap_or(false) {
+        Some(PadOptions {
+            ratio_width: preset.pad_ratio_width.unwrap_or(1.0),
+            ratio_height: preset.pad_ratio_height.unwrap_or(1.0),
+            color: preset.pad_color.clone().unwrap_or_else(|| "#ffffff".into()),
+        })
+    } else {
+        None
+    };
     let watermark = match &preset.watermark_path {
         Some(path) if preset.enable_watermark && !path.is_empty() => Some(WatermarkSettings {
             path: path.clone(),
@@ -112,6 +141,8 @@ pub fn from_preset(preset: &ExportPreset) -> Result<PublishOutput, PresetError> 
             // such field, so this is the 16 the frontend falls back to.
             tiff_bit_depth: TiffBitDepth::default(),
             resize,
+            border,
+            pad,
             keep_metadata: preset.keep_metadata,
             // Not stored in a preset. Sets the local file's mtime, which
             // nothing about an upload reads.
@@ -224,6 +255,15 @@ mod tests {
             "resizeMode": "longEdge",
             "resizeValue": 3000,
             "dontEnlarge": false,
+            "enablePad": true,
+            "padRatioWidth": 4.0,
+            "padRatioHeight": 5.0,
+            "padColor": "#000000",
+            "enableBorder": true,
+            "borderBasis": "shortEdge",
+            "borderHorizontalPercent": 3.0,
+            "borderVerticalPercent": 5.0,
+            "borderColor": "#fafafa",
             "keepMetadata": true,
             "stripGps": true,
             "filenameTemplate": "{original_filename}_web",
@@ -270,6 +310,13 @@ mod tests {
                 "jpegQuality": 88,
                 "tiffBitDepth": 16,
                 "resize": { "mode": "longEdge", "value": 3000, "dontEnlarge": false },
+                "border": {
+                    "basis": "shortEdge",
+                    "horizontalPercent": 3.0,
+                    "verticalPercent": 5.0,
+                    "color": "#fafafa"
+                },
+                "pad": { "ratioWidth": 4.0, "ratioHeight": 5.0, "color": "#000000" },
                 "keepMetadata": true,
                 "preserveTimestamps": false,
                 "stripGps": true,
@@ -290,14 +337,18 @@ mod tests {
     }
 
     #[test]
-    fn resize_and_watermark_are_left_out_unless_enabled() {
+    fn resize_border_pad_and_watermark_are_left_out_unless_enabled() {
         let output = from_preset(&with(json!({
             "enableResize": false,
+            "enablePad": false,
+            "enableBorder": false,
             "enableWatermark": false,
         })))
         .unwrap();
         let settings = settings_json(&output);
         assert_eq!(settings["resize"], Value::Null);
+        assert_eq!(settings["border"], Value::Null);
+        assert_eq!(settings["pad"], Value::Null);
         assert_eq!(settings["watermark"], Value::Null);
 
         let no_path = from_preset(&with(json!({ "watermarkPath": "" }))).unwrap();
@@ -314,6 +365,8 @@ mod tests {
     fn missing_optional_fields_take_the_export_panels_defaults() {
         let mut json = preset_json();
         for key in [
+            "enablePad",
+            "enableBorder",
             "exportMasks",
             "preserveFolders",
             "destinationType",
@@ -324,10 +377,48 @@ mod tests {
 
         let settings = settings_json(&from_preset(&preset(json)).unwrap());
 
+        assert_eq!(
+            settings["border"],
+            Value::Null,
+            "presets saved before borders"
+        );
+        assert_eq!(settings["pad"], Value::Null);
         assert_eq!(settings["exportMasks"], false);
         assert_eq!(settings["preserveFolders"], false);
         assert_eq!(settings["destinationType"], "customFolder");
         assert_eq!(settings["subfolder"], "");
+    }
+
+    #[test]
+    fn an_enabled_border_or_pad_fills_in_the_export_panels_defaults() {
+        let mut json = preset_json();
+        for key in [
+            "padRatioWidth",
+            "padRatioHeight",
+            "padColor",
+            "borderBasis",
+            "borderHorizontalPercent",
+            "borderVerticalPercent",
+            "borderColor",
+        ] {
+            json.as_object_mut().unwrap().remove(key);
+        }
+
+        let settings = settings_json(&from_preset(&preset(json)).unwrap());
+
+        assert_eq!(
+            settings["border"],
+            json!({
+                "basis": "longEdge",
+                "horizontalPercent": 2.0,
+                "verticalPercent": 2.0,
+                "color": "#ffffff"
+            })
+        );
+        assert_eq!(
+            settings["pad"],
+            json!({ "ratioWidth": 1.0, "ratioHeight": 1.0, "color": "#ffffff" })
+        );
     }
 
     #[test]
@@ -356,10 +447,16 @@ mod tests {
             from_preset(&with(json!({ "watermarkAnchor": null }))),
             Err(PresetError::Failed { .. })
         ));
+        assert!(matches!(
+            from_preset(&with(json!({ "borderBasis": "diagonal" }))),
+            Err(PresetError::Failed { .. })
+        ));
         assert!(
             from_preset(&with(json!({
                 "resizeMode": "diagonal",
                 "enableResize": false,
+                "borderBasis": "diagonal",
+                "enableBorder": false,
                 "watermarkAnchor": null,
                 "enableWatermark": false,
             })))
