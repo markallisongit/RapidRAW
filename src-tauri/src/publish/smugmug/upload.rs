@@ -56,6 +56,17 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How much of an error body is worth quoting back.
 const ERROR_BODY_LIMIT: usize = 200;
 
+/// How often an upload in flight looks at the cancel flag.
+const CANCEL_POLL: Duration = Duration::from_millis(100);
+
+/// Completes once `cancel` is set. Polled rather than awaited because the
+/// flag is a plain `AtomicBool`, shared with the renderer, which is not async.
+async fn cancelled(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(CANCEL_POLL).await;
+    }
+}
+
 /// Waits for the given time. Injected so backoff is tested without a clock.
 pub type Sleep = Arc<dyn Fn(Duration) -> BoxFuture<'static, ()> + Send + Sync>;
 
@@ -180,7 +191,19 @@ impl SmugMugUploader {
                 });
             }
 
-            let error = match self.attempt(item, &body, &content_md5, retry).await {
+            // Dropping the request future cancels the request. Without this
+            // the flag is only seen between attempts, so cancelling during a
+            // stalled upload waits out that attempt's whole timeout — up to
+            // half an hour on the default policy.
+            let attempted = tokio::select! {
+                biased;
+                // Abandoned with the body already on its way: what the server
+                // did with it is the question `reconcile` exists to answer.
+                () = cancelled(cancel) => return Err(ambiguous()),
+                attempted = self.attempt(item, &body, &content_md5, retry) => attempted,
+            };
+
+            let error = match attempted {
                 Attempt::Uploaded(id) => return Ok(id),
                 Attempt::Failed {
                     error,
@@ -755,6 +778,40 @@ mod tests {
             waits[0] >= Duration::from_secs(2),
             "waited only {:?}",
             waits[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_abandons_an_upload_that_is_already_in_flight() {
+        let server = MockServer::start().await;
+        // A stalled link: the request is sent and the answer never comes.
+        Mock::given(method("POST"))
+            .respond_with(uploaded().set_delay(Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+        let spooled = spooled("DSC_1234.jpg");
+        let item = item(&spooled, None);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        let (sleep, _waits) = recording_sleep();
+        let started = Instant::now();
+        let result = uploader(&server, sleep, relaxed())
+            .upload(&item, &cancel)
+            .await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancel takes effect during the request, not after it: waited {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(&result, Err(PublishError::Ambiguous { file_name }) if file_name == "DSC_1234.jpg"),
+            "the bytes were already sent, so the upload may have landed: {result:?}"
         );
     }
 

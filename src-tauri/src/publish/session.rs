@@ -54,6 +54,15 @@ pub const RENDER_CHUNK_SIZE: usize = 8;
 /// nothing about an uplink or a destination's rate limits.
 pub const UPLOAD_CONCURRENCY: usize = 3;
 
+/// How many photos must fail in a row, on the transport rather than on their
+/// own merits, before the session stops instead of working through the rest.
+///
+/// A dead uplink otherwise costs every remaining photo its full retry
+/// schedule — seconds each, one at a time, for the whole batch — and each one
+/// only rediscovers what the last already proved. One full wave of concurrent
+/// uploads failing together is that proof.
+pub const OFFLINE_STREAK: usize = UPLOAD_CONCURRENCY;
+
 /// What the session asks of the renderer. The real one is [`ExportPipeline`];
 /// tests substitute one that renders nothing.
 #[async_trait]
@@ -228,6 +237,9 @@ pub struct SessionSummary {
     /// pending, so the next publish looks for them before uploading.
     pub ambiguous: Vec<String>,
     pub cancelled: bool,
+    /// Why the session gave up on the photos it never tried, when it stopped
+    /// itself rather than finishing or being cancelled.
+    pub stopped: Option<String>,
 }
 
 /// Mirrors the export path's `export-progress` / `export-complete` naming so
@@ -394,6 +406,7 @@ impl<'a> PublishSession<'a> {
             completed: 0,
             total: request.paths.len(),
             adopted: HashSet::new(),
+            transport_failures: 0,
         };
         // Before anything remote: another account's ids would name albums and
         // images it does not own.
@@ -480,6 +493,20 @@ impl<'a> PublishSession<'a> {
             // A render cut short by cancellation is not a render failure.
             if self.cancelled() {
                 run.summary.cancelled = true;
+                break;
+            }
+            // Whatever this chunk rendered is dropped with the spool: it was
+            // never journaled, so nothing on disk claims it was sent.
+            if run.link_down() {
+                run.summary.stopped = Some(format!(
+                    "Lost contact with {} — the remaining photos were not tried. \
+                     Publishing again picks up where this left off.",
+                    self.destination.display_name()
+                ));
+                log::warn!(
+                    "Publishing stopped: {OFFLINE_STREAK} photos in a row failed to reach {}",
+                    self.destination.display_name()
+                );
                 break;
             }
             for (work, error) in render_failures {
@@ -629,39 +656,62 @@ impl<'a> PublishSession<'a> {
     ) -> Result<(), PublishError> {
         let items = run.journal(spool, items)?;
         let mime = self.pipeline.mime();
+        // Set as soon as the streak is reached, so the photos still queued
+        // behind the ones in flight are never started.
+        let link_down = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&link_down);
         let mut outcomes = stream::iter(items)
-            .map(|rendered| async move {
-                // Checked per image, so cancelling stops a chunk part-way.
-                let outcome = if self.cancelled() {
-                    Err(PublishError::Cancelled)
-                } else {
-                    self.destination
-                        .publish_image(&rendered.item(container, mime), self.ctx)
-                        .await
-                };
-                (rendered, outcome)
+            .map(|rendered| {
+                let stop = Arc::clone(&stop);
+                async move {
+                    // Checked per image, so cancelling stops a chunk part-way.
+                    let outcome = if self.cancelled() || stop.load(Ordering::SeqCst) {
+                        Err(PublishError::Cancelled)
+                    } else {
+                        self.destination
+                            .publish_image(&rendered.item(container, mime), self.ctx)
+                            .await
+                    };
+                    (rendered, outcome)
+                }
             })
             .buffer_unordered(UPLOAD_CONCURRENCY);
 
         while let Some((rendered, outcome)) = outcomes.next().await {
             match outcome {
                 Ok(id) => {
+                    run.transport_worked();
                     // State first: a released file with no record would be
                     // uploaded again, as a duplicate, by the next publish.
                     run.succeed(&rendered.work, &id)?;
                     release(spool, &rendered.file);
                 }
-                Err(PublishError::Ambiguous { .. }) => ambiguous.push(rendered),
+                // No answer either way. A stalled link produces nothing but
+                // these, and each one costs a photo its whole retry schedule,
+                // so they count towards giving up exactly as refusals do.
+                Err(PublishError::Ambiguous { .. }) => {
+                    run.transport_failed();
+                    ambiguous.push(rendered);
+                }
                 // Anything but an ambiguity means the upload did not land.
                 Err(PublishError::Cancelled) => {
                     run.not_sent(&rendered.work);
                     release(spool, &rendered.file);
                 }
                 Err(error) => {
+                    if matches!(error, PublishError::Network(_)) {
+                        run.transport_failed();
+                    } else {
+                        // The destination answered, and refused this photo.
+                        run.transport_worked();
+                    }
                     run.not_sent(&rendered.work);
                     run.fail(&rendered.work.path, &error);
                     release(spool, &rendered.file);
                 }
+            }
+            if run.link_down() {
+                link_down.store(true, Ordering::SeqCst);
             }
         }
         Ok(())
@@ -757,6 +807,9 @@ struct Run<'s> {
     /// Photos the pre-publish refresh found already uploaded, which are
     /// reported as uploaded rather than skipped.
     adopted: HashSet<String>,
+    /// Consecutive photos whose upload failed on the transport. Reset by
+    /// anything that proves the connection still works.
+    transport_failures: usize,
 }
 
 impl Run<'_> {
@@ -877,6 +930,22 @@ impl Run<'_> {
             error: error.to_string(),
         });
         self.report(path, ItemState::Failed);
+    }
+
+    /// An upload that failed for a reason that says nothing about the photo
+    /// and everything about the connection.
+    fn transport_failed(&mut self) {
+        self.transport_failures += 1;
+    }
+
+    /// Anything that reached the destination and came back with an answer.
+    fn transport_worked(&mut self) {
+        self.transport_failures = 0;
+    }
+
+    /// Whether enough photos have failed in a row to call the link down.
+    fn link_down(&self) -> bool {
+        self.transport_failures >= OFFLINE_STREAK
     }
 
     fn unresolved(&mut self, work: &Work) {
@@ -1253,6 +1322,9 @@ mod tests {
     enum Scripted {
         Fail,
         Ambiguous,
+        /// A transport failure: what every upload returns once the uplink is
+        /// gone, after its own retries are exhausted.
+        Offline,
     }
 
     /// Records every call in one ordered log, and answers uploads as scripted
@@ -1510,6 +1582,7 @@ mod tests {
                 .and_then(VecDeque::pop_front);
             match scripted {
                 Some(Scripted::Fail) => Err(PublishError::Rejected("scripted failure".into())),
+                Some(Scripted::Offline) => Err(PublishError::Network("scripted offline".into())),
                 Some(Scripted::Ambiguous) => Err(PublishError::Ambiguous {
                     file_name: item.file_name.clone(),
                 }),
@@ -2319,6 +2392,94 @@ mod tests {
             .collect();
         assert_eq!(recorded, [true, true, false, true, true]);
         assert_eq!(harness.terminal_event(), "publish-complete");
+    }
+
+    #[tokio::test]
+    async fn a_run_of_transport_failures_stops_the_session() {
+        let harness = Harness::new();
+        let pipeline = StubPipeline::new(&harness.spool_base());
+        let photos = paths(1..=(RENDER_CHUNK_SIZE * 2));
+        let mut destination = StubDestination::new(&harness.spool_base());
+        for n in 1..=(RENDER_CHUNK_SIZE * 2) {
+            destination = destination.script(&file_name(n), vec![Scripted::Offline]);
+        }
+
+        let summary = harness.run(&destination, &pipeline, photos).await;
+
+        assert!(
+            summary.stopped.is_some(),
+            "the summary says the session gave up rather than reporting a clean finish"
+        );
+        let attempted = destination.uploaded_names();
+        assert!(
+            attempted.len() <= UPLOAD_CONCURRENCY * 2,
+            "a dead uplink costs a wave of photos, not the whole batch: {attempted:?}"
+        );
+        assert!(
+            !attempted.contains(&file_name(RENDER_CHUNK_SIZE + 1)),
+            "nothing past the first chunk is rendered or sent: {attempted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_of_unconfirmed_uploads_also_stops_the_session() {
+        let harness = Harness::new();
+        let pipeline = StubPipeline::new(&harness.spool_base());
+        let photos = paths(1..=(RENDER_CHUNK_SIZE * 2));
+        // A stalled link answers nothing at all, so every upload times out
+        // rather than being refused: the costlier half of going offline.
+        let mut destination = StubDestination::new(&harness.spool_base()).with_reconcile();
+        for n in 1..=(RENDER_CHUNK_SIZE * 2) {
+            destination = destination.script(&file_name(n), vec![Scripted::Ambiguous]);
+        }
+
+        let summary = harness.run(&destination, &pipeline, photos).await;
+
+        assert!(
+            summary.stopped.is_some(),
+            "uploads that are never confirmed are the destination not answering"
+        );
+        let attempted = destination.uploaded_names();
+        assert!(
+            attempted.len() <= UPLOAD_CONCURRENCY * 2,
+            "the batch stops after a wave, as it does for refused uploads: {attempted:?}"
+        );
+        assert!(
+            destination
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.starts_with("reconcile:")),
+            "what was sent is still reconciled: it is the only thing that can settle it"
+        );
+        assert_eq!(
+            summary.ambiguous.len(),
+            attempted.len(),
+            "every photo sent is reported as unconfirmed"
+        );
+    }
+
+    #[tokio::test]
+    async fn scattered_transport_failures_do_not_stop_the_session() {
+        let harness = Harness::new();
+        let pipeline = StubPipeline::new(&harness.spool_base());
+        let destination = StubDestination::new(&harness.spool_base())
+            .script(&file_name(2), vec![Scripted::Offline])
+            .script(&file_name(6), vec![Scripted::Offline]);
+
+        let summary = harness.run(&destination, &pipeline, paths(1..=8)).await;
+
+        assert!(
+            summary.stopped.is_none(),
+            "two failures with successes between them are not a dead uplink"
+        );
+        assert_eq!(
+            destination.uploaded_names().len(),
+            8,
+            "every photo is tried"
+        );
+        assert_eq!(summary.failed.len(), 2);
     }
 
     #[tokio::test]

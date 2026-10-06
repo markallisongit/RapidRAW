@@ -38,8 +38,12 @@ export default function PublishProgress({ api, destinationName }: PublishProgres
   const isRunning = phase === 'starting' || phase === 'running' || phase === 'cancelling';
   const percent = total > 0 ? (completed / total) * 100 : 0;
 
-  const heading =
-    phase === 'complete'
+  // A run that gave up finished neither cleanly nor by the user's choice.
+  const stopped = Boolean(summary?.stopped);
+
+  const heading = stopped
+    ? t('publish.progress.errorHeading')
+    : phase === 'complete'
       ? t('publish.progress.completeHeading')
       : phase === 'cancelled'
         ? t('publish.progress.cancelledHeading')
@@ -57,8 +61,8 @@ export default function PublishProgress({ api, destinationName }: PublishProgres
           </div>
           <div className="w-full bg-bg-tertiary rounded-full h-1.5 border border-border-color">
             <div
-              className={`h-1.5 rounded-full transition-all duration-500 ${phase === 'error' ? 'bg-red-500' : 'bg-accent'}`}
-              style={{ width: `${phase === 'complete' ? 100 : percent}%` }}
+              className={`h-1.5 rounded-full transition-all duration-500 ${phase === 'error' || stopped ? 'bg-red-500' : 'bg-accent'}`}
+              style={{ width: `${phase === 'complete' && !stopped ? 100 : percent}%` }}
             />
           </div>
           {isRunning && total === 0 && (
@@ -87,6 +91,7 @@ export default function PublishProgress({ api, destinationName }: PublishProgres
                 {t('publish.progress.ambiguous', { count: summary.ambiguous.length })}
               </Text>
             )}
+            {summary.stopped && <Text color={TextColors.error}>{summary.stopped}</Text>}
           </div>
         )}
 

@@ -150,6 +150,8 @@ export interface SessionSummary {
   failed: Array<{ path: string; error: string }>;
   ambiguous: string[];
   cancelled: boolean;
+  /** Why the session gave up on the photos it never tried, e.g. the connection dropped. */
+  stopped: string | null;
 }
 
 export type SessionPhase = 'idle' | 'starting' | 'running' | 'cancelling' | 'complete' | 'cancelled' | 'error';
